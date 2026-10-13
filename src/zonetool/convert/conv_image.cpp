@@ -1,0 +1,445 @@
+#include "../../common/log.h"
+#include "../dumpsrc/image_dump.h"
+#include "image_fmt.h"
+#include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace dumpimg
+{
+
+using namespace zt;
+
+namespace
+{
+
+// IW8 default enum values (IW-line; same as the legacy IW3-path defaults in asset_image.cpp).
+constexpr uint8_t IW8_IMG_CATEGORY_LOAD_FROM_FILE = 3; // GfxImageCategory
+constexpr uint8_t IW8_TS_COLOR_MAP = 2;                // TextureSemantic (2d color)
+
+// DXT FourCC magics found in an IW5 GfxImageLoadDef.format ("DXT1"/"DXT3"/"DXT5").
+constexpr int32_t FOURCC_DXT1 = 0x31545844; // 'DXT1'
+constexpr int32_t FOURCC_DXT3 = 0x33545844; // 'DXT3'
+constexpr int32_t FOURCC_DXT5 = 0x35545844; // 'DXT5'
+constexpr int32_t DXGI_BC1_UNORM = 71;
+constexpr int32_t DXGI_BC1_SRGB = 72;
+constexpr int32_t DXGI_BC2_UNORM = 74;
+constexpr int32_t DXGI_BC2_SRGB = 75;
+constexpr int32_t DXGI_BC3_UNORM = 77;
+constexpr int32_t DXGI_BC3_SRGB = 78;
+
+constexpr uint32_t IW8_FMT_BC1_SRGB = 34;
+constexpr uint32_t IW8_FMT_BC2_SRGB = 36;
+constexpr uint32_t IW8_FMT_BC3_SRGB = 38;
+
+// Map the IW5 LoadDef format to Replay's GfxPixelFormat values.
+bool mapIw5Format(int32_t iw5fmt, uint32_t &iw8fmt, bool &isBlock, uint32_t &unitBytes)
+{
+    isBlock = false;
+    unitBytes = 0;
+    switch (iw5fmt)
+    {
+    case FOURCC_DXT1:
+    case DXGI_BC1_UNORM:
+        iw8fmt = cvtimg::IW8_FMT_BC1_UNORM;
+        isBlock = true;
+        unitBytes = 8;
+        return true;
+    case DXGI_BC1_SRGB:
+        iw8fmt = IW8_FMT_BC1_SRGB;
+        isBlock = true;
+        unitBytes = 8;
+        return true;
+    case FOURCC_DXT3:
+    case DXGI_BC2_UNORM:
+        iw8fmt = cvtimg::IW8_FMT_BC2_UNORM;
+        isBlock = true;
+        unitBytes = 16;
+        return true;
+    case DXGI_BC2_SRGB:
+        iw8fmt = IW8_FMT_BC2_SRGB;
+        isBlock = true;
+        unitBytes = 16;
+        return true;
+    case FOURCC_DXT5:
+    case DXGI_BC3_UNORM:
+        iw8fmt = cvtimg::IW8_FMT_BC3_UNORM;
+        isBlock = true;
+        unitBytes = 16;
+        return true;
+    case DXGI_BC3_SRGB:
+        iw8fmt = IW8_FMT_BC3_SRGB;
+        isBlock = true;
+        unitBytes = 16;
+        return true;
+    // small numeric codes seen in dumps that clearly denote an uncompressed surface
+    case 20:
+    case 21: // RGB / ARGB-ish (D3DFMT_R8G8B8 / A8R8G8B8 family)
+        iw8fmt = cvtimg::IW8_FMT_R8G8B8A8_UNORM;
+        unitBytes = 4;
+        return true;
+    default:
+        return false; // unrecognised / stale
+    }
+}
+
+// Bytes for a single uncompressed RGBA8 mip level.
+uint32_t rgba8LevelBytes(uint32_t w, uint32_t h)
+{
+    if (!w)
+        w = 1;
+    if (!h)
+        h = 1;
+    return w * h * 4u;
+}
+
+bool round16(const size_t bytes, size_t &rounded)
+{
+    if (bytes > std::numeric_limits<size_t>::max() - 15)
+        return false;
+    rounded = (bytes + 15) & ~size_t{15};
+    return true;
+}
+
+bool sourceSubresourceBytes(const bool isBlock, const uint32_t unitBytes, const uint32_t width,
+                            const uint32_t height, const uint32_t depth, size_t &bytes)
+{
+    const uint64_t w = std::max(1u, width);
+    const uint64_t h = std::max(1u, height);
+    const uint64_t d = std::max(1u, depth);
+    const uint64_t rows = isBlock ? (h + 3) / 4 : h;
+    const uint64_t columns = isBlock ? (w + 3) / 4 : w;
+    const uint64_t value = columns * rows * d * unitBytes;
+    if (value > std::numeric_limits<size_t>::max())
+        return false;
+    bytes = static_cast<size_t>(value);
+    return true;
+}
+
+uint32_t residentSliceCount(const ImageDumpFile &in)
+{
+    const uint32_t elements = in.numElements ? in.numElements : 1u;
+    if (in.mapType == IW5_MAPTYPE_CUBE)
+        return elements * 6u;
+    if (in.mapType == IW5_MAPTYPE_2D)
+        return elements;
+    return 1;
+}
+
+bool residentPayloadSize(const ImageDumpFile &in, const bool isBlock, const uint32_t unitBytes,
+                         size_t &total)
+{
+    total = 0;
+    const uint32_t slices = residentSliceCount(in);
+    const uint32_t levels = in.mipLevels ? in.mipLevels : 1u;
+    for (uint32_t level = 0; level < levels; ++level)
+    {
+        const uint32_t width = std::max(1, in.width >> level);
+        const uint32_t height = std::max(1, in.height >> level);
+        const uint32_t depth = in.mapType == IW5_MAPTYPE_3D ? std::max(1, in.depth >> level) : 1;
+        size_t raw = 0, stride = 0;
+        if (!sourceSubresourceBytes(isBlock, unitBytes, width, height, depth, raw) || !round16(raw, stride) ||
+            (slices && stride > (std::numeric_limits<size_t>::max() - total) / slices))
+            return false;
+        total += stride * slices;
+    }
+    return true;
+}
+
+// DDS stores every array/cube slice's complete mip chain before the next slice. Replay's
+// Image_LoadPixels path consumes mip-major data, with each slice of each mip rounded to 16 bytes
+// (the same layout exercised by atian-cod-tools/scripts/mw19/image_test.cpp). Keep this transform
+// here so write_image.cpp only serializes an already-native resident payload.
+bool packResidentPixels(const ImageDumpFile &in, const bool isBlock, const uint32_t unitBytes,
+                        std::vector<uint8_t> &packed)
+{
+    if (in.pixels.empty() || !in.mipLevels || (in.mapType == IW5_MAPTYPE_CUBE && !in.ddsPayload))
+        return false;
+
+    const uint32_t slices = residentSliceCount(in);
+    if (!in.ddsPayload && slices != 1)
+        return false; // no source-side array/cube order is recorded for ffImg payloads
+
+    struct Level
+    {
+        size_t offset = 0;
+        size_t bytes = 0;
+        size_t stride = 0;
+    };
+    std::vector<Level> levels;
+    levels.reserve(static_cast<size_t>(slices) * in.mipLevels);
+
+    size_t sourceOffset = 0;
+    for (uint32_t slice = 0; slice < slices; ++slice)
+    {
+        for (uint32_t level = 0; level < in.mipLevels; ++level)
+        {
+            const uint32_t width = std::max(1, in.width >> level);
+            const uint32_t height = std::max(1, in.height >> level);
+            const uint32_t depth = in.mapType == IW5_MAPTYPE_3D ? std::max(1, in.depth >> level) : 1;
+            size_t raw = 0, stride = 0;
+            if (!sourceSubresourceBytes(isBlock, unitBytes, width, height, depth, raw) || !round16(raw, stride) ||
+                sourceOffset > in.pixels.size() || raw > in.pixels.size() - sourceOffset)
+                return false;
+            levels.push_back({sourceOffset, raw, stride});
+            sourceOffset += raw;
+        }
+    }
+    if (sourceOffset != in.pixels.size())
+        return false;
+
+    size_t outputSize = 0;
+    if (!residentPayloadSize(in, isBlock, unitBytes, outputSize))
+        return false;
+    packed.clear();
+    packed.reserve(outputSize);
+    for (uint32_t level = 0; level < in.mipLevels; ++level)
+    {
+        for (uint32_t slice = 0; slice < slices; ++slice)
+        {
+            const Level &source = levels[static_cast<size_t>(slice) * in.mipLevels + level];
+            packed.insert(packed.end(), in.pixels.begin() + source.offset,
+                          in.pixels.begin() + source.offset + source.bytes);
+            packed.resize(packed.size() + source.stride - source.bytes);
+        }
+    }
+    return packed.size() == outputSize;
+}
+
+// Rotating BC1/2/3 blocks needs no decompression or lossy recompression:
+// endpoints remain in their source block, while the 4x4 texel selectors move
+// to the corresponding clockwise positions in the destination block.
+void rotateSelectors(const uint8_t *source, uint8_t *destination, const unsigned bits,
+                     const unsigned selectorBytes, const unsigned localWidth,
+                     const unsigned localHeight)
+{
+    uint64_t packed = 0, rotated = 0;
+    std::memcpy(&packed, source, selectorBytes);
+    const uint64_t mask = (uint64_t{1} << bits) - 1;
+    for (unsigned y = 0; y < localHeight; ++y)
+        for (unsigned x = 0; x < localWidth; ++x)
+        {
+            const unsigned oldShift = bits * (y * 4 + x);
+            const unsigned newX = localHeight - 1 - y;
+            const unsigned newY = x;
+            const unsigned newShift = bits * (newY * 4 + newX);
+            rotated |= ((packed >> oldShift) & mask) << newShift;
+        }
+    std::memcpy(destination, &rotated, selectorBytes);
+}
+
+void rotateCompressedBlock(const uint8_t *source, uint8_t *destination,
+                           const uint32_t format, const unsigned localWidth,
+                           const unsigned localHeight)
+{
+    if (format == cvtimg::IW8_FMT_BC1_UNORM || format == IW8_FMT_BC1_SRGB)
+    {
+        std::memcpy(destination, source, 4);
+        rotateSelectors(source + 4, destination + 4, 2, 4, localWidth, localHeight);
+    }
+    else if (format == cvtimg::IW8_FMT_BC2_UNORM || format == IW8_FMT_BC2_SRGB)
+    {
+        rotateSelectors(source, destination, 4, 8, localWidth, localHeight);
+        std::memcpy(destination + 8, source + 8, 4);
+        rotateSelectors(source + 12, destination + 12, 2, 4, localWidth, localHeight);
+    }
+    else
+    {
+        std::memcpy(destination, source, 2);
+        rotateSelectors(source + 2, destination + 2, 3, 6, localWidth, localHeight);
+        std::memcpy(destination + 8, source + 8, 4);
+        rotateSelectors(source + 12, destination + 12, 2, 4, localWidth, localHeight);
+    }
+}
+
+void rotateCompassOnce(Iw8ImageDef &image)
+{
+    const bool rgba = image.format == cvtimg::IW8_FMT_R8G8B8A8_UNORM;
+    const bool bc1 = image.format == cvtimg::IW8_FMT_BC1_UNORM ||
+                     image.format == IW8_FMT_BC1_SRGB;
+    const bool bc2 = image.format == cvtimg::IW8_FMT_BC2_UNORM ||
+                     image.format == IW8_FMT_BC2_SRGB;
+    const bool bc3 = image.format == cvtimg::IW8_FMT_BC3_UNORM ||
+                     image.format == IW8_FMT_BC3_SRGB;
+    if (!rgba && !bc1 && !bc2 && !bc3)
+        throw std::runtime_error("compassRotation requires RGBA8 or BC1/BC2/BC3 pixels");
+    const unsigned blockBytes = bc1 ? 8 : 16;
+
+    std::vector<uint8_t> rotated(image.pixels.size());
+    size_t offset = 0;
+    for (unsigned level = 0; level < image.levelCount; ++level)
+    {
+        const unsigned width = std::max(1u, unsigned(image.width) >> level);
+        const unsigned height = std::max(1u, unsigned(image.height) >> level);
+        if (!rgba && ((width > 4 && width % 4) || (height > 4 && height % 4)))
+            throw std::runtime_error("compassRotation needs whole BC blocks at each mip level");
+        const unsigned blocksWide = (width + 3) / 4;
+        const unsigned blocksHigh = (height + 3) / 4;
+        const size_t bytes = rgba ? size_t(width) * height * 4
+                                  : size_t(blocksWide) * blocksHigh * blockBytes;
+        size_t stride = 0;
+        if (!round16(bytes, stride) || offset > image.pixels.size() ||
+            stride > image.pixels.size() - offset)
+            throw std::runtime_error("compassRotation has an incomplete resident mip chain");
+        if (rgba)
+        {
+            for (unsigned y = 0; y < height; ++y)
+                for (unsigned x = 0; x < width; ++x)
+                {
+                    const size_t source = offset + (size_t(y) * width + x) * 4;
+                    const size_t destination = offset +
+                        (size_t(x) * height + (height - 1 - y)) * 4;
+                    std::memcpy(rotated.data() + destination,
+                                image.pixels.data() + source, 4);
+                }
+        }
+        else
+        {
+            for (unsigned by = 0; by < blocksHigh; ++by)
+                for (unsigned bx = 0; bx < blocksWide; ++bx)
+                {
+                    const size_t source = offset + (size_t(by) * blocksWide + bx) * blockBytes;
+                    const unsigned destinationX = blocksHigh - 1 - by;
+                    const unsigned destinationY = bx;
+                    const size_t destination = offset +
+                        (size_t(destinationY) * blocksHigh + destinationX) * blockBytes;
+                    rotateCompressedBlock(image.pixels.data() + source,
+                                          rotated.data() + destination, image.format,
+                                          std::min(4u, width - bx * 4),
+                                          std::min(4u, height - by * 4));
+                }
+        }
+        offset += stride;
+    }
+    if (offset != image.pixels.size())
+        throw std::runtime_error("compassRotation has trailing resident pixel data");
+    image.pixels = std::move(rotated);
+    std::swap(image.width, image.height);
+}
+
+} // namespace
+
+Iw8ImageDef convertImage(const ImageDumpFile &in, const unsigned compassRotation)
+{
+    Iw8ImageDef out;
+    out.name = in.name;
+
+    // ---- geometry (HEADER fields — reliable even when the LoadDef is stale) ----
+    out.width = (uint16_t)(in.width > 0 ? in.width : 0);
+    out.height = (uint16_t)(in.height > 0 ? in.height : 0);
+    out.depth = (uint16_t)(in.depth > 0 ? in.depth : 1);
+    const uint32_t elements = in.numElements ? in.numElements : 1u;
+    out.numElements = static_cast<uint16_t>(elements);
+
+    // ---- semantic / category (carried; sane defaults when zero) ----
+    out.semantic = in.semantic ? in.semantic : IW8_TS_COLOR_MAP;
+    out.category = in.category ? in.category : IW8_IMG_CATEGORY_LOAD_FROM_FILE;
+
+    // ---- level count (LoadDef mipLevels is stale here -> default 1 unless plainly valid) ----
+    out.levelCount =
+        (in.mipLevels >= 1 && in.mipLevels <= 16 && !in.loadDefStale) ? in.mipLevels : 1;
+
+    // ---- format (the flagged-unresolved field) ----
+    uint32_t iw8fmt = cvtimg::IW8_FMT_R8G8B8A8_UNORM;
+    bool isBlock = false;
+    uint32_t unitBytes = 0;
+    const bool mapped = !in.loadDefStale && mapIw5Format(in.format, iw8fmt, isBlock, unitBytes);
+    if (!mapped)
+    {
+        // Stale or unrecognised LoadDef: use a dimensions-derived uncompressed format.
+        iw8fmt = cvtimg::IW8_FMT_R8G8B8A8_UNORM;
+        isBlock = false;
+        if (!in.loadDefStale)
+            warn("dumpimg: '%s' unrecognised LoadDef format %d -> RGBA8",
+                 in.name.c_str(), in.format);
+    }
+    out.format = iw8fmt;
+    // Shipped Replay compass images use the sRGB BC1 view. IW3's DXT1/DDS
+    // source can lack that color-space tag even when it is a HUD color image.
+    if (out.name.starts_with("compass_map_") && out.semantic == IW8_TS_COLOR_MAP &&
+        out.format == cvtimg::IW8_FMT_BC1_UNORM)
+        out.format = IW8_FMT_BC1_SRGB;
+
+    // ---- flags (IW8 GfxImageFlags). Resident map sidecar: no streaming flags. Carry nothing
+    // risky. ----
+    out.flags = in.mapType == IW5_MAPTYPE_CUBE
+                    ? 0x8000u | (elements > 1 ? 0x20000u : 0u)
+                    : in.mapType == IW5_MAPTYPE_3D ? 0x10000u : (elements > 1 ? 0x20000u : 0u);
+    out.streamedPartCount = 0; // fully resident — no xpak dependency we can't satisfy offline
+
+    // ---- pixels (inline resident) + totalSize ----
+    out.pixels = in.pixels; // verbatim dump payload (tiny for map sidecars)
+    bool residentPacked = false;
+    if (mapped && !out.pixels.empty())
+    {
+        std::vector<uint8_t> packed;
+        if (packResidentPixels(in, isBlock, unitBytes, packed))
+        {
+            out.pixels = std::move(packed);
+            residentPacked = true;
+        }
+        else
+            warn("dumpimg: '%s' payload layout is not a complete supported resident chain; preserving bytes",
+                 in.name.c_str());
+    }
+    if (!out.pixels.empty())
+    {
+        if (out.pixels.size() > UINT32_MAX)
+        {
+            warn("dumpimg: '%s' resident payload exceeds Replay totalSize", in.name.c_str());
+            out.pixels.clear();
+            out.totalSize = 0;
+        }
+        else
+            out.totalSize = static_cast<uint32_t>(out.pixels.size());
+    }
+    else
+    {
+        // no usable payload: declare a dims-derived totalSize so the field is defined (non-zero).
+        // (We do NOT fabricate pixels — the writer keeps pixels=null when empty.)
+        size_t residentSize = 0;
+        if (mapped && residentPayloadSize(in, isBlock, unitBytes, residentSize) && residentSize <= UINT32_MAX)
+        {
+            out.totalSize = static_cast<uint32_t>(residentSize);
+        }
+        else if (isBlock)
+        {
+            out.totalSize = cvtimg::iw3_total_size((in.format == FOURCC_DXT1)   ? cvtimg::IWI_DXT1
+                                                   : (in.format == FOURCC_DXT3) ? cvtimg::IWI_DXT3
+                                                                                : cvtimg::IWI_DXT5,
+                                                   out.width, out.height, out.levelCount);
+        }
+        else
+        {
+            out.totalSize = rgba8LevelBytes(out.width, out.height);
+        }
+    }
+
+    if (compassRotation)
+    {
+        if (compassRotation > 270 || compassRotation % 90)
+            throw std::runtime_error("compassRotation must be 0, 90, 180, or 270 clockwise");
+        if (!out.name.starts_with("compass_map_") || !residentPacked ||
+            in.mapType != IW5_MAPTYPE_2D)
+            throw std::runtime_error("compassRotation requires a complete 2D compass image");
+        if (out.numElements != 1 || out.depth != 1 || out.levelCount != in.mipLevels ||
+            out.pixels.empty())
+            throw std::runtime_error("compassRotation requires one complete resident image");
+        for (unsigned degrees = 0; degrees < compassRotation; degrees += 90)
+            rotateCompassOnce(out);
+        info("dumpimg: rotated compass '%s' %u degrees clockwise", out.name.c_str(),
+             compassRotation);
+    }
+
+    info("dumpimg: convert '%s' -> IW8 %ux%u d=%u elem=%u fmt=%u sem=%u cat=%u L=%u resident "
+         "px=%zu totalSize=%u",
+         out.name.c_str(), out.width, out.height, out.depth, out.numElements, out.format,
+         out.semantic, out.category, out.levelCount, out.pixels.size(), out.totalSize);
+    return out;
+}
+
+} // namespace dumpimg

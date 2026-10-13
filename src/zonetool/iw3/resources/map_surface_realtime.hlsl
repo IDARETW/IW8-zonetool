@@ -1,0 +1,297 @@
+// Replay static-world inputs. Metadata and lightmap UVs use separate vertex attributes.
+#define MW120R_ATLAS_VERTEX_V2 1
+#ifndef MAP_DEBUG_MODE
+#define MAP_DEBUG_MODE 0
+#endif
+#ifndef MAP_INDIRECT_GAIN
+#define MAP_INDIRECT_GAIN 1.0
+#endif
+#ifndef MAP_UNBAKED_GAIN
+#define MAP_UNBAKED_GAIN 1.0
+#endif
+#ifndef MAP_SOURCE_SUN_MASK
+#define MAP_SOURCE_SUN_MASK 0
+#endif
+#ifndef MAP_LIGHTING_ROWS
+#define MAP_LIGHTING_ROWS 84
+#endif
+struct Input {
+    float4 position : SV_POSITION;
+    float4 uv : TEXCOORDS0;
+    float2 lightmapUV : LMAPCOORDS0;
+    float3 normal : NORMAL0;
+    float4 tangent : TANGENT0;
+    float4 color : COLOR0;
+    nointerpolation float2 metadata : MAPDATA0;
+    nointerpolation float4 materialParameters : MATERIALPARMS0;
+    float3 relativePosition : WORLDPOS0;
+#ifdef MAP_ENTITY_VELOCITY
+    float4 clipPosition : CLIP_POS0;
+    float4 previousClipPosition : PREV_CLIP_POS0;
+#endif
+};
+#ifdef STATIC_MODEL
+Texture2D<float4> sourceAtlas : register(t0);
+#else
+Texture2D<float4> sourceAtlas : register(t1);
+#endif
+SamplerState colorSampler : register(s3);
+Texture2D<float4> sunVisibility : register(t85);
+#ifdef STATIC_MODEL
+// Replay's static-model forward shader binds the sun tile classifications at
+// t4. World surfaces use t5; sampling t5 here reads the wrong screen resource.
+StructuredBuffer<uint2> lightingTiles : register(t4);
+#else
+StructuredBuffer<uint2> lightingTiles : register(t5);
+#endif
+SamplerState shadowSampler : register(s5);
+// TECHNIQUE_LIT_FORWARDPLUS_BITMASK binds code image 0 to the GTAO slot.
+// The native Replay static-model pixel shader consumes that image at t95
+// with the point sampler s8. Keep this as an engine code image: GTAO is a
+// per-frame render target and is not a converted map asset.
+Texture2D<float4> gtaoImage : register(t95);
+SamplerState gtaoSampler : register(s8);
+cbuffer ReplayView : register(b2) {
+    float4 replayView[8];
+};
+cbuffer ReplayLighting : register(b7) {
+    float4 replayLighting[MAP_LIGHTING_ROWS];
+};
+
+#ifndef MAP_SOURCE_CHANNELS
+#define MAP_SOURCE_CHANNELS 0
+#endif
+#if MAP_SOURCE_CHANNELS
+#ifdef STATIC_MODEL
+Texture2D<float4> sourceNormalAtlas : register(t1);
+Texture2D<float4> sourceResponseAtlas : register(t2);
+#else
+Texture2D<float4> sourceNormalAtlas : register(t2);
+Texture2D<float4> sourceResponseAtlas : register(t3);
+#endif
+float3 SourceData(float3 value) {
+    return lerp(value * 12.92, 1.055 * pow(max(value, 0), 1.0 / 2.4) - .055, step(.0031308, value));
+}
+float3
+SourceWorldNormal(Input input, uint flags, float2 atlasUV, float lod, out float3 tangentNormal) {
+    tangentNormal = float3(0, 0, 1);
+    if ((flags & 32) != 0) {
+#ifdef STATIC_MODEL
+        float4 raw = sourceNormalAtlas.SampleBias(colorSampler, atlasUV, replayView[7].y);
+#else
+        float4 raw = sourceNormalAtlas.SampleLevel(colorSampler, atlasUV, lod);
+#endif
+        // The converter stores IW3 slopes as .xy; DXT5 sources (Y in RGB,
+        // X in alpha) are swizzled to that layout when they are loaded.
+        float2 slope = raw.rg * float2(4.08, 4.06451607) - float2(2.08, 2.06451607);
+        tangentNormal = normalize(float3(slope, 1));
+    }
+    float3 normal = normalize(input.normal);
+    float3 tangent = normalize(input.tangent.xyz);
+    float3 bitangent = normalize(cross(normal, tangent)) * input.tangent.w;
+    return normalize(tangentNormal.x * tangent + tangentNormal.y * bitangent +
+                     tangentNormal.z * normal);
+}
+float3 SourceIndirect(float2 uv, float3 first, float3 tangentNormal) {
+    float4 responseData = sourceResponseAtlas.SampleLevel(colorSampler, uv, 0);
+    float4 normalData = sourceNormalAtlas.SampleLevel(colorSampler, uv, 0);
+    first = float3(normalData.ba, responseData.a);
+    float3 second = responseData.rgb;
+    float2 raw = normalData.rg;
+    float2 slope = raw * float2(4.08, 4.06451607) - float2(2.08, 2.06451607);
+    float response = saturate(dot(normalize(float3(slope, 1)), tangentNormal));
+    return first * tangentNormal.z + second * response;
+}
+float3 SourceSunSpecular(Input input,
+                         uint flags,
+                         float2 uv,
+                         float lod,
+                         float3 normal,
+                         float3 sunDirection,
+                         float3 sun,
+                         float visibility) {
+    if ((flags & 64) == 0 || visibility <= 0)
+        return 0;
+#ifdef STATIC_MODEL
+    float4 raw = sourceResponseAtlas.SampleBias(colorSampler, uv, replayView[7].y);
+#else
+    float4 raw = sourceResponseAtlas.SampleLevel(colorSampler, uv, lod);
+#endif
+    float3 view = normalize(-input.relativePosition);
+    float3 reflected = reflect(-view, normal);
+    float exponent = exp2(raw.a * 9.3775177) + 7;
+    float lobe = saturate(exp((dot(reflected, sunDirection) - .99925) * exponent));
+    float fresnel = pow(saturate(1 - abs(dot(view, normal))), input.materialParameters.z);
+    float response = lerp(input.materialParameters.x, input.materialParameters.y, fresnel);
+    return raw.rgb * response * input.materialParameters.w * lobe * sun * visibility;
+}
+#endif
+
+#ifdef MAP_GLASS_SH
+// Linear radiance SH9 (RGB) averaged over the map's IW3 reflection captures.
+static const float3 glassSh[9] = MAP_GLASS_SH;
+float3 GlassEnvironment(float3 d) {
+    return max(0, glassSh[0] * 0.282095 + glassSh[1] * (0.488603 * d.y) +
+                      glassSh[2] * (0.488603 * d.z) + glassSh[3] * (0.488603 * d.x) +
+                      glassSh[4] * (1.092548 * d.x * d.y) + glassSh[5] * (1.092548 * d.y * d.z) +
+                      glassSh[6] * (0.315392 * (3 * d.z * d.z - 1)) +
+                      glassSh[7] * (1.092548 * d.x * d.z) +
+                      glassSh[8] * (0.546274 * (d.x * d.x - d.y * d.y)));
+}
+#endif
+
+float4 main(Input input) : SV_TARGET0 {
+    uint tile = (uint)input.metadata.x;
+    uint flags = (uint)input.metadata.y;
+    uint kind = flags % 4;
+    bool sky = kind == 1;
+    float2 mappedUv = input.uv.xy;
+#ifdef MAP_GLASS_UV_REMAP
+    // FxGlassDef has one UV basis for both intact and shattered materials.
+    // A linked IW3 shattered brush may use another affine mapping.
+    if (kind == 2)
+        mappedUv = float2(dot(input.uv.xy, MAP_GLASS_ROW0),
+                          dot(input.uv.xy, MAP_GLASS_ROW1)) + MAP_GLASS_OFFSET;
+#endif
+    float2 local = sky ? saturate(mappedUv) : frac(mappedUv);
+#ifdef STATIC_MODEL
+    // Replay's shipped static-model shaders use the material sampler, screen
+    // gradients and the view mip bias. Preserve the unwrapped model UV so the
+    // sampler can calculate gradients across repeating texture coordinates.
+    // Coverage passes bind no view mip bias and use the gradients alone.
+#ifndef MAP_MIP_BIAS
+#define MAP_MIP_BIAS replayView[7].y
+#endif
+    float lod = 0;
+    float2 sampleUV = input.uv.xy;
+    float4 texel = sourceAtlas.SampleBias(colorSampler, sampleUV, MAP_MIP_BIAS);
+#else
+    float2 cellSize = 4096.0 / ATLAS_COLUMNS;
+    // Derivatives must use the continuous UV, before frac introduces tile seams.
+    float footprint = max(length(ddx(mappedUv) * cellSize), length(ddy(mappedUv) * cellSize));
+    float lod = sky ? 0 : clamp(log2(max(1.0, footprint)), 0, log2(cellSize.x) - 2);
+    float border = .5 * exp2(ceil(lod));
+    float2 pixel = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize +
+                   clamp(.5 + local * (cellSize - 1), border, cellSize - border);
+    float2 sampleUV = pixel / 4096.0;
+    float4 texel = sourceAtlas.SampleLevel(colorSampler, sampleUV, lod);
+#endif
+    texel *= input.color;
+    uint alphaTest = (flags >> 3) & 3;
+    if (kind == 3 && alphaTest == 1)
+        texel.a = texel.a > 0 ? 1 : 0;
+    if (kind == 3 && alphaTest == 2)
+        texel.a = texel.a < .5 ? 1 : 0;
+    // The generated depth prepass uses this same sampling code and cutoff.
+    if (kind == 3)
+        clip(texel.a - .5);
+    float3 tangentNormal = float3(0, 0, 1);
+    float3 shadingNormal = normalize(input.normal);
+#if MAP_SOURCE_CHANNELS
+    shadingNormal = SourceWorldNormal(input, flags, sampleUV, lod, tangentNormal);
+#endif
+    // The stock forward pass uses these same scaled screen coordinates, sun
+    // direction, irradiance and sun visibility texture.
+    float2 screenPixel = input.position.xy * replayView[7].x;
+    float2 screenUV = screenPixel * replayView[6].zw;
+    float3 direction = replayLighting[56].xyz;
+    float3 sun = max(0, replayLighting[57].xyz);
+    bool nativeSun = replayLighting[56].w != 0;
+    float ndotl = nativeSun ? saturate(dot(shadingNormal, direction)) : 0;
+    float visibility = 1;
+    // Glass has no opaque depth coverage. Solid and masked surfaces both
+    // contribute matching depth and normals before the shadow resolve.
+    if (!sky && (kind == 0 || kind == 3)) {
+        if (nativeSun) {
+            // Replay's forward shader skips t85 for fully shadowed 8x8 tiles.
+            // The resolve can leave those texels unwritten; sampling them
+            // directly exposes stale data as camera-dependent blocks of light.
+            uint2 tilePosition = (uint2)screenPixel >> 3;
+            uint tileColumns = ((uint)replayLighting[54].x + 7) >> 3;
+            uint tileClass = lightingTiles[tilePosition.y * tileColumns + tilePosition.x].y >> 28;
+            if (replayLighting[83].w > 0 && tileClass == 11)
+                visibility = 0;
+            else
+                visibility = saturate(abs(sunVisibility.SampleLevel(shadowSampler, screenUV, 0).x));
+        }
+    }
+    // Soft hemispherical sky fill for props without a baked lightmap. Preserve
+    // authored lightmap occlusion on architecture instead of a global exposure lift.
+    float hemi = saturate(normalize(input.normal).z * .5 + .5);
+    float3 indirect = lerp(float3(.22, .23, .24), float3(.38, .41, .44), hemi) * MAP_UNBAKED_GAIN;
+    if ((flags & 4) != 0) {
+        float4 lm = sourceAtlas.SampleLevel(colorSampler, saturate(input.lightmapUV), 0);
+#if MAP_SOURCE_SUN_MASK
+        // The source profile preserves the direction used to bake this mask.
+        // Keep static occlusion at every distance; native shadows add moving
+        // casters and nearby detail without erasing the authored building shade.
+        visibility = min(visibility, lm.a);
+#endif
+        // CoD4 lightmap coefficients are linear bytes, but the shared color
+        // atlas is an sRGB image. Undo its hardware transfer for this data tile
+        // only; otherwise indirect lighting is incorrectly crushed toward black.
+        float3 baked = lerp(lm.rgb * 12.92, 1.055 * pow(max(lm.rgb, 0), 1.0 / 2.4) - .055,
+                            step(.0031308, lm.rgb));
+#if MAP_SOURCE_CHANNELS
+        indirect =
+            SourceIndirect(saturate(input.lightmapUV), baked, tangentNormal) * MAP_INDIRECT_GAIN;
+#else
+            indirect = baked * 2 * MAP_INDIRECT_GAIN;
+#endif
+    }
+    // The shipped world forward shader scales baked irradiance by cb7[43].z and
+    // occludes only that indirect term with GTAO, using the multi-bounce form
+    // ao / (1 - min(albedo, .85) * (1 - ao)). Direct sun is never occluded by AO.
+    float gtaoSample = saturate(gtaoImage.SampleLevel(gtaoSampler, screenUV, 0).x *
+                                replayLighting[47].y);
+    float gtao = lerp(1.0, gtaoSample, replayLighting[47].x);
+    float3 bounce = 1 - min(texel.rgb, .85) * (1 - gtao);
+    indirect *= replayLighting[43].z * gtao / max(bounce, 1e-3);
+    float3 light = indirect + visibility * ndotl * sun;
+    if (sky)
+        light = 1;
+    // Build-time diagnostics keep depth coverage and native postprocessing.
+#if MAP_DEBUG_MODE == 1
+    light = 1;
+#elif MAP_DEBUG_MODE == 2
+    light = indirect;
+#elif MAP_DEBUG_MODE == 3
+    texel.rgb = visibility;
+    light = 1;
+#elif MAP_DEBUG_MODE == 4
+    texel.rgb = shadingNormal * .5 + .5;
+    light = 1;
+#endif
+    float3 specular = 0;
+#if MAP_SOURCE_CHANNELS && MAP_DEBUG_MODE == 0
+    if (!sky && nativeSun)
+        specular = SourceSunSpecular(input, flags, sampleUV, lod, shadingNormal, direction,
+                                     sun, visibility);
+#endif
+    float3 color = texel.rgb * light + specular;
+    float alpha = kind == 2 ? texel.a : 1;
+#ifdef MAP_GLASS_SH
+    // IW3 clear glass is a nearly transparent colour map; its visibility comes
+    // from the envMapParms-weighted reflection. Translucent surfaces get no
+    // deferred probe reflection in Replay, so evaluate the map's captured
+    // environment here. Reflection adds coverage, as it does on real glass.
+    if (kind == 2)
+    {
+        float3 view = normalize(-input.relativePosition);
+        float fresnel = pow(1 - saturate(abs(dot(view, shadingNormal))),
+                            max(input.materialParameters.z, 1));
+        float response = 1;
+#if MAP_SOURCE_CHANNELS
+        if ((flags & 64) != 0)
+            response = sourceResponseAtlas.SampleLevel(colorSampler, sampleUV, lod).g;
+#endif
+        float reflectivity = saturate(response * input.materialParameters.w * lerp(.08, 1, fresnel));
+        float3 environment =
+            GlassEnvironment(reflect(-view, shadingNormal)) * replayLighting[43].z * 2;
+        float coverage = saturate(alpha + reflectivity * (1 - alpha));
+        color = (color * alpha + environment * reflectivity * (1 - alpha)) / max(coverage, 1e-3);
+        alpha = coverage;
+    }
+#endif
+    return float4(min(color * replayLighting[42].x, 32255.0), alpha);
+}

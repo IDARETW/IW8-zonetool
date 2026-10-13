@@ -1,0 +1,16 @@
+.xmake/
+xmake-out/
+build/
+test-output/
+*.user
+*.suo
+*.VC.db
+*.pdb
+__pycache__/
+*.pyc
+*.log
+.codex-link-dryrun.txt
+tools/weapon_editor/output/
+tools/weapon_editor/node_modules/
+tools/weapon_editor/workspace/
+tools/weapon_editor/config.local.json
