@@ -54,7 +54,8 @@ target("iw8-zonetool")
             "map_surface_realtime.hlsl",
             "replay_world_vertex.hlsl",
             "replay_model_vertex.hlsl",
-            "entity_techset_template.json"
+            "entity_techset_template.json",
+            "iw3_compat.gsc"
         }
         for _, name in ipairs(resources) do
             local resource = path.join(os.projectdir(), "src", "zonetool", "iw3", "resources", name)

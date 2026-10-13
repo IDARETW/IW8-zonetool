@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -218,6 +219,9 @@ struct PreparedMap
     replaysunshadow::Scene shadowScene;
     std::vector<iw8::DynamicEntity> dynamicEntities;
     iw8::navigation::Source navigation;
+    // IW8 GSC translated from the map's IW3 scripts (without the generated
+    // minimap function), compiled with gsc-tool at package time.
+    std::string mapScript;
 
     PreparedMap() = default;
     PreparedMap(const PreparedMap &) = delete;

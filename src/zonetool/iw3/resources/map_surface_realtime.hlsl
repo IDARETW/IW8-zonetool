@@ -166,14 +166,14 @@ float4 main(Input input) : SV_TARGET0 {
     float2 sampleUV = input.uv.xy;
     float4 texel = sourceAtlas.SampleBias(colorSampler, sampleUV, MAP_MIP_BIAS);
 #else
-    float2 cellSize = 4096.0 / ATLAS_COLUMNS;
+    float2 cellSize = ATLAS_SIZE.0 / ATLAS_COLUMNS;
     // Derivatives must use the continuous UV, before frac introduces tile seams.
     float footprint = max(length(ddx(mappedUv) * cellSize), length(ddy(mappedUv) * cellSize));
     float lod = sky ? 0 : clamp(log2(max(1.0, footprint)), 0, log2(cellSize.x) - 2);
     float border = .5 * exp2(ceil(lod));
     float2 pixel = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize +
                    clamp(.5 + local * (cellSize - 1), border, cellSize - border);
-    float2 sampleUV = pixel / 4096.0;
+    float2 sampleUV = pixel / ATLAS_SIZE.0;
     float4 texel = sourceAtlas.SampleLevel(colorSampler, sampleUV, lod);
 #endif
     texel *= input.color;

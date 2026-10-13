@@ -1979,7 +1979,18 @@ enum class TechniqueGeometry
     entity,
 };
 
-Json BuildTechset(const std::string &map, const unsigned columns, const TechniqueGeometry geometry,
+void ReplaceAtlasTokens(std::string &source, const unsigned columns, const unsigned atlasSize)
+{
+    for (const auto &[token, value] :
+         {std::pair<std::string_view, unsigned>{"ATLAS_COLUMNS", columns},
+          std::pair<std::string_view, unsigned>{"ATLAS_SIZE", atlasSize}})
+        for (std::size_t at = source.find(token); at != std::string::npos;
+             at = source.find(token, at + 1))
+            source.replace(at, token.size(), std::to_string(value));
+}
+
+Json BuildTechset(const std::string &map, const unsigned columns, const unsigned atlasSize,
+                  const TechniqueGeometry geometry,
                   const std::string &glassEnvironment)
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
@@ -1994,10 +2005,7 @@ Json BuildTechset(const std::string &map, const unsigned columns, const Techniqu
     if (model)
         pixelSource += "#define STATIC_MODEL 1\n";
     pixelSource += ResourceText(IDR_IW3_PIXEL_SHADER);
-    const std::string token = "ATLAS_COLUMNS";
-    for (std::size_t at = pixelSource.find(token); at != std::string::npos;
-         at = pixelSource.find(token, at + 1))
-        pixelSource.replace(at, token.size(), std::to_string(columns));
+    ReplaceAtlasTokens(pixelSource, columns, atlasSize);
     // Model coverage passes bind no view mip bias; sample with the gradients alone.
     const std::string coverageSource =
         model ? "#define MAP_MIP_BIAS 0\n" + pixelSource : pixelSource;
@@ -2338,6 +2346,202 @@ std::vector<std::uint8_t> MipChain(Image image, const unsigned levels, const boo
                 image = Downsample(image, color);
         }
     }
+    return output;
+}
+
+// Fast BC7 mode 6 block (one subset, 7-bit RGBA endpoints with p-bits,
+// 4-bit indices): principal-axis endpoints, all four p-bit pairs scored.
+// DirectXTex's reference BC7 search took hours for an 8192 atlas.
+void EncodeBc7Mode6Block(const std::uint8_t (&pixels)[16][4], std::uint8_t *out)
+{
+    static constexpr int weights[16]{0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+    float mean[4]{};
+    for (const auto &pixel : pixels)
+        for (int c = 0; c < 4; ++c)
+            mean[c] += pixel[c] / 16.0f;
+    float covariance[4][4]{};
+    for (const auto &pixel : pixels)
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b)
+                covariance[a][b] += (pixel[a] - mean[a]) * (pixel[b] - mean[b]);
+    float axis[4]{1, 1, 1, 1};
+    for (int iteration = 0; iteration < 8; ++iteration)
+    {
+        float next[4]{};
+        for (int a = 0; a < 4; ++a)
+            for (int b = 0; b < 4; ++b)
+                next[a] += covariance[a][b] * axis[b];
+        float length = 0;
+        for (const float value : next)
+            length = std::max(length, std::abs(value));
+        if (length < 1e-6f)
+            break;
+        for (int a = 0; a < 4; ++a)
+            axis[a] = next[a] / length;
+    }
+    float low = 1e30f, high = -1e30f;
+    for (const auto &pixel : pixels)
+    {
+        float t = 0;
+        for (int c = 0; c < 4; ++c)
+            t += (pixel[c] - mean[c]) * axis[c];
+        low = std::min(low, t);
+        high = std::max(high, t);
+    }
+    float axisLength = 0;
+    for (const float value : axis)
+        axisLength += value * value;
+    if (axisLength > 0)
+    {
+        low /= axisLength;
+        high /= axisLength;
+    }
+    float ends[2][4];
+    for (int c = 0; c < 4; ++c)
+    {
+        ends[0][c] = std::clamp(mean[c] + axis[c] * low, 0.0f, 255.0f);
+        ends[1][c] = std::clamp(mean[c] + axis[c] * high, 0.0f, 255.0f);
+    }
+    int bestError = INT_MAX;
+    int bestQ[2][4]{}, bestP[2]{};
+    std::uint8_t bestIndex[16]{};
+    for (int pbits = 0; pbits < 4; ++pbits)
+    {
+        const int p[2]{pbits & 1, pbits >> 1};
+        int q[2][4], value[2][4];
+        for (int e = 0; e < 2; ++e)
+            for (int c = 0; c < 4; ++c)
+            {
+                q[e][c] = std::clamp(static_cast<int>(std::lround((ends[e][c] - p[e]) / 2.0f)), 0, 127);
+                value[e][c] = q[e][c] * 2 + p[e];
+            }
+        int palette[16][4];
+        for (int i = 0; i < 16; ++i)
+            for (int c = 0; c < 4; ++c)
+                palette[i][c] = ((64 - weights[i]) * value[0][c] + weights[i] * value[1][c] + 32) >> 6;
+        int error = 0;
+        std::uint8_t index[16];
+        for (int pixel = 0; pixel < 16 && error < bestError; ++pixel)
+        {
+            int best = INT_MAX;
+            for (int i = 0; i < 16; ++i)
+            {
+                int d = 0;
+                for (int c = 0; c < 4; ++c)
+                {
+                    const int delta = palette[i][c] - pixels[pixel][c];
+                    d += delta * delta;
+                }
+                if (d < best)
+                {
+                    best = d;
+                    index[pixel] = static_cast<std::uint8_t>(i);
+                }
+            }
+            error += best;
+        }
+        if (error < bestError)
+        {
+            bestError = error;
+            std::memcpy(bestQ, q, sizeof(q));
+            bestP[0] = p[0];
+            bestP[1] = p[1];
+            std::memcpy(bestIndex, index, sizeof(index));
+        }
+    }
+    if (bestIndex[0] & 8)
+    {
+        // The anchor index stores only three bits: swap the endpoints.
+        for (int c = 0; c < 4; ++c)
+            std::swap(bestQ[0][c], bestQ[1][c]);
+        std::swap(bestP[0], bestP[1]);
+        for (auto &index : bestIndex)
+            index = static_cast<std::uint8_t>(15 - index);
+    }
+    std::memset(out, 0, 16);
+    unsigned position = 0;
+    const auto put = [&](const unsigned value, const unsigned bits) {
+        for (unsigned bit = 0; bit < bits; ++bit, ++position)
+            if (value >> bit & 1u)
+                out[position >> 3] |= static_cast<std::uint8_t>(1u << (position & 7));
+    };
+    put(1u << 6, 7); // mode 6
+    for (int c = 0; c < 4; ++c)
+    {
+        put(static_cast<unsigned>(bestQ[0][c]), 7);
+        put(static_cast<unsigned>(bestQ[1][c]), 7);
+    }
+    put(static_cast<unsigned>(bestP[0]), 1);
+    put(static_cast<unsigned>(bestP[1]), 1);
+    put(bestIndex[0], 3);
+    for (int pixel = 1; pixel < 16; ++pixel)
+        put(bestIndex[pixel], 4);
+}
+
+// BC7 encoding of a square RGBA8 mip chain laid out by MipChain.
+// Values pass through unchanged, so sRGB data stays sRGB for format 45.
+std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
+                                         const unsigned size, const unsigned levels,
+                                         const std::filesystem::path &cacheRoot)
+{
+    const auto inputDigest = Sha256(rgba);
+    const auto cacheFile =
+        cacheRoot.empty() ? std::filesystem::path{}
+                          : cacheRoot / ("atlas_" + Hex(std::span(inputDigest).first(16)) + ".bc7");
+    std::error_code cacheError;
+    if (!cacheFile.empty() && std::filesystem::is_regular_file(cacheFile, cacheError))
+        return ReadBytes(cacheFile);
+    struct Level
+    {
+        unsigned width;
+        std::size_t source;
+        std::size_t target;
+    };
+    std::vector<Level> table;
+    std::size_t source = 0, target = 0;
+    for (unsigned level = 0, width = size; level < levels; ++level, width = std::max(4u, width / 2))
+    {
+        if (width % 4)
+            throw std::runtime_error("BC7 atlas level is not a multiple of four");
+        table.push_back({width, source, target});
+        source += (std::size_t{width} * width * 4 + 15) & ~std::size_t{15};
+        target += std::size_t{width / 4} * (width / 4) * 16;
+    }
+    if (source != rgba.size())
+        throw std::runtime_error("BC7 atlas input does not match its mip chain");
+    std::vector<std::uint8_t> output(target);
+    std::vector<std::pair<unsigned, unsigned>> rows; // level, block row
+    for (unsigned level = 0; level < table.size(); ++level)
+        for (unsigned row = 0; row < table[level].width / 4; ++row)
+            rows.emplace_back(level, row);
+    std::atomic<std::size_t> next{0};
+    const auto encode = [&] {
+        std::uint8_t block[16][4];
+        for (std::size_t task; (task = next.fetch_add(1)) < rows.size();)
+        {
+            const Level &level = table[rows[task].first];
+            const unsigned blockY = rows[task].second;
+            const unsigned blocksWide = level.width / 4;
+            for (unsigned blockX = 0; blockX < blocksWide; ++blockX)
+            {
+                for (unsigned y = 0; y < 4; ++y)
+                    std::memcpy(block[y * 4],
+                                rgba.data() + level.source +
+                                    ((std::size_t{blockY} * 4 + y) * level.width + blockX * 4) * 4,
+                                16);
+                EncodeBc7Mode6Block(block, output.data() + level.target +
+                                               (std::size_t{blockY} * blocksWide + blockX) * 16);
+            }
+        }
+    };
+    const unsigned workerCount = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::thread> workers;
+    for (unsigned worker = 0; worker < workerCount; ++worker)
+        workers.emplace_back(encode);
+    for (auto &worker : workers)
+        worker.join();
+    if (!cacheFile.empty())
+        WriteBytes(cacheFile, output);
     return output;
 }
 
@@ -2717,10 +2921,15 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             {pair.at(1).at("width"), pair.at(1).at("height").get<unsigned>() / 2});
     }
     unsigned columns = 0, cell = 0;
+    // One 8192 BC7 atlas keeps 256-pixel material tiles where 287 Nuketown
+    // materials left 128 at 4096. Multiple IW3 lightmaps keep 4096: the native
+    // Replay lightmap below is copied 1:1 from the atlas pixels.
+    const unsigned atlasSize = lightmapDimensions.size() > 1 ? 4096u : 8192u;
+    plan.atlasSize = atlasSize;
     std::vector<bool> occupied;
     for (const unsigned candidate : {4u, 8u, 16u, 32u})
     {
-        const unsigned candidateCell = 4096 / candidate;
+        const unsigned candidateCell = atlasSize / candidate;
         std::vector<bool> candidateOccupied(static_cast<std::size_t>(candidate) * candidate);
         std::vector<LightmapRectangle> rectangles;
         bool fits = true;
@@ -2773,9 +2982,10 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     nextTile = 0;
     for (auto &[key, number] : tileNumbers)
         number = freeTiles[nextTile++];
-    std::array<Image, 3> atlases{Image{4096, 4096, std::vector<std::uint8_t>(4096ull * 4096 * 4)},
-                                 Image{4096, 4096, std::vector<std::uint8_t>(4096ull * 4096 * 4)},
-                                 Image{4096, 4096, std::vector<std::uint8_t>(4096ull * 4096 * 4)}};
+    const std::size_t atlasBytes = std::size_t{atlasSize} * atlasSize * 4;
+    std::array<Image, 3> atlases{Image{atlasSize, atlasSize, std::vector<std::uint8_t>(atlasBytes)},
+                                 Image{atlasSize, atlasSize, std::vector<std::uint8_t>(atlasBytes)},
+                                 Image{atlasSize, atlasSize, std::vector<std::uint8_t>(atlasBytes)}};
     struct AtlasTileMipSource
     {
         std::size_t tile;
@@ -3115,19 +3325,38 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             atlases[channel].mips.push_back(std::move(next));
         }
         auto chain = MipChain(std::move(atlases[channel]), mipCount, channel == 0);
+        if (atlasSize > 4096)
+        {
+            chain = EncodeBc7Chain(chain, atlasSize, mipCount, cacheRoot);
+            const std::string filename = map + "_atlas_" + std::to_string(channel) + ".bc7";
+            const std::string name = ImageName(map, channel, chain);
+            WriteBytes(mapDirectory / filename, chain);
+            material["textures"][channel]["image"] = name;
+            // Replay format table 0x1423E25F0: 44 BC7_UNORM, 45 BC7_UNORM_SRGB.
+            material["imageDefinitions"].push_back({{"name", name},
+                                                    {"width", atlasSize},
+                                                    {"height", atlasSize},
+                                                    {"bc7", filename},
+                                                    {"format", channel == 0 ? 45 : 44},
+                                                    {"mipCount", mipCount}});
+            continue;
+        }
         const std::string filename = map + "_atlas_" + std::to_string(channel) + ".rgba";
         const std::string name = ImageName(map, channel, chain);
         WriteBytes(mapDirectory / filename, chain);
         material["textures"][channel]["image"] = name;
         material["imageDefinitions"].push_back({{"name", name},
-                                                {"width", 4096},
-                                                {"height", 4096},
+                                                {"width", atlasSize},
+                                                {"height", atlasSize},
                                                 {"rgba8", filename},
                                                 {"format", channel == 0 ? 7 : 6},
                                                 {"mipCount", mipCount}});
     }
+    zt::info("iw3: source atlas %ux%u, %u columns, %u-pixel material tiles, %u mips", atlasSize,
+             atlasSize, columns, cell, mipCount);
     timing.lap("atlas mips");
-    Json techset = BuildTechset(map, columns, TechniqueGeometry::world, plan.glassEnvironment);
+    Json techset =
+        BuildTechset(map, columns, plan.atlasSize, TechniqueGeometry::world, plan.glassEnvironment);
     timing.lap("world techset");
     material["techset"] = techset.at("name");
     WriteJson(mapDirectory / plan.materialDefinition, material);
@@ -3424,7 +3653,8 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         auto modelInfo = Unhex(modelMaterialTemplate.at("info").get<std::string>());
         Put<std::uint32_t>(modelInfo, 0xC, entity ? 0x80014u : 589844u);
         modelMaterialTemplate["info"] = Hex(modelInfo);
-        Json modelTechset = BuildTechset(map, columns, geometry, plan.glassEnvironment);
+        Json modelTechset =
+            BuildTechset(map, columns, plan.atlasSize, geometry, plan.glassEnvironment);
         std::array<Json, 5> modelTechsets{};
         modelTechsets[static_cast<unsigned>(SurfaceKind::opaque)] = modelTechset;
 
@@ -3559,10 +3789,7 @@ std::string RegisterGlassUvRemap(RenderPlan &plan,
                          HlslNumber(uvAffine[3]) + ")\n#define MAP_GLASS_OFFSET float2(" +
                          HlslNumber(uvAffine[4]) + "," + HlslNumber(uvAffine[5]) + ")\n" +
                          ResourceText(IDR_IW3_PIXEL_SHADER);
-    constexpr std::string_view token = "ATLAS_COLUMNS";
-    for (std::size_t at = source.find(token); at != std::string::npos;
-         at = source.find(token, at + 1))
-        source.replace(at, token.size(), std::to_string(plan.columns));
+    ReplaceAtlasTokens(source, plan.columns, plan.atlasSize);
     const std::string key = material + '\n' + source;
     const auto keyBytes = std::span(reinterpret_cast<const std::uint8_t *>(key.data()), key.size());
     const auto digest = Sha256(keyBytes);

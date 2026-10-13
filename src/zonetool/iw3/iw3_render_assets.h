@@ -80,6 +80,8 @@ struct RenderPlan
     std::vector<LightmapRectangle> lightmaps;
     std::array<std::size_t, 6> skyTiles{};
     unsigned columns{};
+    // Pixel size of the square source atlas (ATLAS_SIZE in the shaders).
+    unsigned atlasSize{4096};
     bool hasCutout{};
     bool hasCutoutBias{};
     bool hasOpaqueBias{};

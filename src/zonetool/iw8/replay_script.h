@@ -16,4 +16,9 @@ std::vector<uint8_t> zlibStored(const std::vector<uint8_t> &input);
 void emitCompassStartup(ZoneWriter &writer, const std::string &assetName,
                         const std::string &mapName, float northwestX, float northwestY,
                         float southeastX, float southeastY);
+
+// Emits a ScriptFile from a gsc-tool iw8 .gscbin ("GSC\0", compressed stack
+// length, stack length, bytecode length, zlib stack, bytecode).
+void emitCompiledScript(ZoneWriter &writer, const std::string &assetName,
+                        const std::vector<uint8_t> &gscbin);
 } // namespace iw8::replay_script

@@ -162,4 +162,27 @@ void emitCompassStartup(ZoneWriter &writer, const std::string &assetName,
     writer.write(bytecode.data(), bytecode.size());
     writer.popStream();
 }
+void emitCompiledScript(ZoneWriter &writer, const std::string &assetName,
+                        const std::vector<uint8_t> &gscbin)
+{
+    if (assetName.empty())
+        throw std::invalid_argument("Replay script asset name is required");
+    if (gscbin.size() < 16 || std::memcmp(gscbin.data(), "GSC\0", 4) != 0)
+        throw std::invalid_argument("not a gsc-tool iw8 gscbin");
+    uint32_t compressed = 0, stack = 0, bytecode = 0;
+    std::memcpy(&compressed, gscbin.data() + 4, 4);
+    std::memcpy(&stack, gscbin.data() + 8, 4);
+    std::memcpy(&bytecode, gscbin.data() + 12, 4);
+    if (size_t(16) + compressed + bytecode != gscbin.size() || !stack || !bytecode)
+        throw std::invalid_argument("gscbin lengths do not match its payload");
+
+    writeScriptHeader(writer, compressed, stack, bytecode);
+    writer.pushStream(XFILE_BLOCK_VIRTUAL);
+    writer.writeStr(assetName);
+    writer.popStream();
+    writer.pushStream(XFILE_BLOCK_RUNTIME);
+    writer.write(gscbin.data() + 16, compressed);
+    writer.write(gscbin.data() + 16 + compressed, bytecode);
+    writer.popStream();
+}
 } // namespace iw8::replay_script

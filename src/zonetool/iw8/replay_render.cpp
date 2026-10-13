@@ -263,13 +263,16 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     const auto width = source.at("width").get<unsigned>();
     const auto height = source.at("height").get<unsigned>();
     const bool bc6h = image.format == 42;
-    const char *pixelField = bc6h ? "bc6h" : "rgba8";
+    const bool bc7 = image.format == 44 || image.format == 45;
+    const bool blocks = bc6h || bc7;
+    const char *pixelField = bc6h ? "bc6h" : bc7 ? "bc7" : "rgba8";
     const auto pixels = source.at(pixelField).get<std::string>();
     const uint32_t mapType = image.flags & 0x38000u;
     if (!image.name.starts_with("mw120r/") || image.name.size() > 128 || !width || !height ||
-        width > 4096 || height > 4096 || !depth || !numElements || depth > 4096 ||
+        width > (bc7 ? 8192u : 4096u) || height > (bc7 ? 8192u : 4096u) || !depth ||
+        !numElements || depth > 4096 ||
         numElements > 2048 || semantic > UINT8_MAX || category > UINT8_MAX || !image.mipCount ||
-        image.mipCount > 13 || (image.format != 6 && image.format != 7 && !bc6h) ||
+        image.mipCount > 14 || (image.format != 6 && image.format != 7 && !blocks) ||
         mapType != expectedMapType || std::filesystem::path(pixels).filename() != pixels ||
         pixels.find("..") != std::string::npos)
         throw std::runtime_error("Invalid resident Replay image definition");
@@ -286,7 +289,7 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     for (unsigned level = 0; level < image.mipCount; ++level)
     {
         const size_t subresource =
-            bc6h ? size_t((mipWidth + 3) / 4) * ((mipHeight + 3) / 4) * 16
+            blocks ? size_t((mipWidth + 3) / 4) * ((mipHeight + 3) / 4) * 16
                  : size_t(mipWidth) * mipHeight * 4;
         if (subresource > (SIZE_MAX - 15) ||
             ((subresource + 15) & ~size_t{15}) > (SIZE_MAX - length) / slices)
@@ -301,7 +304,7 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     std::error_code error;
     if (length > UINT32_MAX || !std::filesystem::is_regular_file(pixelPath, error) ||
         std::filesystem::file_size(pixelPath) != length)
-        throw std::runtime_error(std::string(bc6h ? "BC6H" : "RGBA8") +
+        throw std::runtime_error(std::string(blocks ? "block-compressed" : "RGBA8") +
                                  " image length does not match dimensions: " + image.name);
     image.width = static_cast<uint16_t>(width);
     image.height = static_cast<uint16_t>(height);
@@ -312,7 +315,7 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     image.pixels.resize(length);
     std::ifstream input(pixelPath, std::ios::binary);
     if (!input.read(reinterpret_cast<char *>(image.pixels.data()), length))
-        throw std::runtime_error(std::string("Cannot read ") + (bc6h ? "BC6H" : "RGBA8") +
+        throw std::runtime_error(std::string("Cannot read ") + (blocks ? "block-compressed" : "RGBA8") +
                                  " image pixels");
     return image;
 }

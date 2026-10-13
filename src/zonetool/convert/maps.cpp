@@ -539,13 +539,16 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
         for (const KeyValue &pair : entity)
         {
             const std::string key = lowercase(pair.key);
-            // IW3 destructible props carry keys for IW3's _destructible.gsc,
-            // which Replay does not run. Keep them out of Replay's own
-            // destructible/targetname script lookups.
-            if (key == "destructible_type" ||
-                (key == "targetname" && lowercase(pair.value) == "destructible"))
+            // IW3 destructibles, TVs and exploders are driven by the converted
+            // map script's IW3 compatibility layer. Rename their targetnames so
+            // Replay's own destructible/exploder scripts never adopt them.
+            std::string value = pair.value;
+            if (key == "targetname")
             {
-                continue;
+                const std::string lowered = lowercase(value);
+                if (lowered == "destructible" || lowered == "interactive_tv" ||
+                    lowered == "exploder")
+                    value = "mw120r_" + lowered;
             }
             uint32_t keyId = 0;
             if (!iw3KeyToIw8KeyId(key, keyId))
@@ -563,7 +566,7 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
             else if (trigger && keyId == 0x028C)
                 body += "?" + std::to_string(triggerIndex);
             else
-                body += pair.value;
+                body += value;
             body += "\"";
         }
 

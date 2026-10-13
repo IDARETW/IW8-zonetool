@@ -8,6 +8,7 @@
 #include "dumpsrc/material_dumpsrc.h"
 #include "dumpsrc/xmodel_dump.h"
 #include "iw3/iw3_fastfile.h"
+#include "iw3/iw3_scripts.h"
 #include "iw7/iw7_fastfile.h"
 #include "iw8/iw8_ffheader.h"
 #include "iw8/iw8_zone.h"
@@ -57,6 +58,7 @@ struct Args
     std::string lightingProfile = "source";
     float sunIntensityScale = 1.0f;
     bool navigation = true;
+    std::string gscTool;
 };
 
 struct MapMetadata
@@ -80,6 +82,7 @@ void printUsage()
                 "  iw8-zonetool inspect-iw7 <file.ff>\n"
                 "  iw8-zonetool inspect <file.ff>\n"
                 "  iw8-zonetool validate-output <map_output> <map>\n"
+                "  iw8-zonetool translate-iw3-script <maps/mp dir> <map> -o <out dir> [--gsc-tool <exe>]\n"
                 "options:\n"
                 "  --replay <game_dx12_ship_replay.exe>\n"
                 "  --collision <native collision input>\n"
@@ -91,6 +94,7 @@ void printUsage()
                 "  --lighting-profile source|aniyah-incursion\n"
                 "  --sun-intensity-scale <positive multiplier>\n"
                 "  --no-navigation  (skip generated bot aipaths/navmesh/tacgraph)\n"
+                "  --gsc-tool <gsc-tool.exe>  (compile converted IW3 map scripts; or IW8_GSC_TOOL)\n"
                 "  -v  -q\n");
 }
 
@@ -158,6 +162,10 @@ bool parseArgs(const int argc, char **argv, Args &args)
             {
                 return false;
             }
+        }
+        else if (value == "--gsc-tool" && index + 1 < argc)
+        {
+            args.gscTool = argv[++index];
         }
         else if (value == "--no-navigation")
         {
@@ -1106,7 +1114,54 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         if (assets.failures)
             throw std::runtime_error("failed to import " + std::to_string(assets.failures) +
                                      " map assets; first: " + assets.firstFailure);
-        if (assets.hasCompass && compassBounds)
+        std::string gscTool = args.gscTool;
+        if (gscTool.empty())
+            if (const char *value = std::getenv("IW8_GSC_TOOL"); value && *value)
+                gscTool = value;
+        bool scriptCompiled = false;
+        if (prepared && !prepared->mapScript.empty() && !gscTool.empty())
+        {
+            // Converted IW3 map scripts plus the IW3 compatibility layer, with
+            // the minimap call generated from the squared compass bounds.
+            // setminimap( material, x1, y1, x2, y2, 1, material ) is the
+            // argument order of the proven hand-assembled startup bytecode.
+            std::string generated = "iw3compat_minimap()\n{\n";
+            if (assets.hasCompass && compassBounds)
+            {
+                char line[320];
+                std::snprintf(line, sizeof(line),
+                              "    setminimap( \"compass_map_%s\", %.3f, %.3f, %.3f, %.3f, 1, "
+                              "\"compass_map_%s\" );\n",
+                              map.c_str(), compassBounds->northwestX, compassBounds->northwestY,
+                              compassBounds->southeastX, compassBounds->southeastY, map.c_str());
+                generated += line;
+            }
+            generated += "}\n";
+            const std::string scriptSource = prepared->mapScript + "\n" + generated;
+            const std::filesystem::path work =
+                std::filesystem::path(path_dir(outputDirectory)) / ".iw3-scripts" / map;
+            try
+            {
+                const auto gscbin = iw3::scripts::Compile(scriptSource, gscTool, work, map);
+                const std::string scriptName = "scripts/mp/maps/" + map + "/" + map + ".gsc";
+                writer.add(ASSET_TYPE_SCRIPTFILE, scriptName,
+                           [scriptName, gscbin](iw8::ZoneWriter &output) {
+                               iw8::replay_script::emitCompiledScript(output, scriptName, gscbin);
+                           });
+                scriptCompiled = true;
+                info("scripts: compiled converted map script (%zu bytes gscbin, source %s)",
+                     gscbin.size(), (work / (map + ".gsc")).string().c_str());
+            }
+            catch (const std::exception &error)
+            {
+                warn("scripts: converted map script did not compile, using the minimap-only "
+                     "startup script: %s", error.what());
+            }
+        }
+        else if (prepared && !prepared->mapScript.empty())
+            warn("scripts: pass --gsc-tool (or set IW8_GSC_TOOL) to compile the converted IW3 map "
+                 "scripts; using the minimap-only startup script");
+        if (!scriptCompiled && assets.hasCompass && compassBounds)
         {
             const std::string scriptName = "scripts/mp/maps/" + map + "/" + map + ".gsc";
             const convert::CompassBounds compass = *compassBounds;
@@ -1117,7 +1172,7 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
                                compass.northwestY, compass.southeastX, compass.southeastY);
                        });
         }
-        else if (assets.hasCompass)
+        else if (!scriptCompiled && assets.hasCompass)
         {
             warn("assets: compass image has no valid pair of IW3 minimap_corner entities");
         }
@@ -1244,6 +1299,27 @@ int buildMap(const Args &args, const iw3::PreparedMap *prepared = nullptr)
     {
         info("compass: northwest %.3f %.3f, southeast %.3f %.3f", compassBounds.northwestX,
              compassBounds.northwestY, compassBounds.southeastX, compassBounds.southeastY);
+        // IW3 compass images are square, uniformly scaled maps. IW3 stretched
+        // them over the minimap_corner rectangle, but Replay's map keeps the
+        // world aspect, so a non-square corner pair squashes the image (Nuketown:
+        // 6136 x 2904 units). Square the region around its center.
+        const float spanX = std::abs(compassBounds.southeastX - compassBounds.northwestX);
+        const float spanY = std::abs(compassBounds.northwestY - compassBounds.southeastY);
+        if (std::abs(spanX - spanY) > 1.0f)
+        {
+            const float half = std::max(spanX, spanY) * 0.5f;
+            const float centerX = (compassBounds.northwestX + compassBounds.southeastX) * 0.5f;
+            const float centerY = (compassBounds.northwestY + compassBounds.southeastY) * 0.5f;
+            const float signX = compassBounds.southeastX >= compassBounds.northwestX ? 1.0f : -1.0f;
+            const float signY = compassBounds.northwestY >= compassBounds.southeastY ? 1.0f : -1.0f;
+            compassBounds.northwestX = centerX - signX * half;
+            compassBounds.southeastX = centerX + signX * half;
+            compassBounds.northwestY = centerY + signY * half;
+            compassBounds.southeastY = centerY - signY * half;
+            info("compass: squared minimap region to northwest %.3f %.3f, southeast %.3f %.3f",
+                 compassBounds.northwestX, compassBounds.northwestY, compassBounds.southeastX,
+                 compassBounds.southeastY);
+        }
         // IW3 draws the compass image with northyaw up; Replay's minimap wants
         // it turned clockwise by northyaw (Office, default 90, was verified at 90).
         if (!metadata.compassRotationSet)
@@ -1539,6 +1615,45 @@ int buildIw3(const Args &args)
     return buildMap(build, &prepared);
 }
 
+int translateIw3Script(const Args &args)
+{
+    if (args.positional.size() != 2 || args.outputDirectory.empty())
+    {
+        printUsage();
+        return 2;
+    }
+    const std::filesystem::path directory = args.positional[0];
+    const std::string map = args.positional[1];
+    std::vector<iw3::scripts::Source> sources;
+    for (const auto &entry : std::filesystem::directory_iterator(directory))
+    {
+        if (!entry.is_regular_file() || entry.path().extension() != ".gsc")
+            continue;
+        std::string text;
+        if (!read_file_str(entry.path().string(), text))
+            return 1;
+        std::string name = entry.path().filename().string();
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        sources.push_back({"maps/mp/" + name, std::move(text)});
+    }
+    const auto translation = iw3::scripts::Translate(
+        map, sources, [](const std::string &) { return std::string{}; },
+        "iw3compat_generated()\n{\n    level.mw120r_models = [];\n}\n");
+    for (const auto &note : translation.notes)
+        info("translate: %s", note.c_str());
+    const std::string source = translation.gsc + "\niw3compat_minimap()\n{\n}\n";
+    std::filesystem::create_directories(args.outputDirectory);
+    if (!write_file_str(path_join(args.outputDirectory, map + ".gsc"), source))
+        return 1;
+    if (!args.gscTool.empty())
+    {
+        const auto gscbin = iw3::scripts::Compile(source, args.gscTool, args.outputDirectory, map);
+        info("translate: %s compiled to %zu bytes", map.c_str(), gscbin.size());
+    }
+    return 0;
+}
+
 int inspect(const Args &args)
 {
     if (args.positional.empty())
@@ -1641,6 +1756,10 @@ try
     if (args.command == "build-map")
     {
         return buildMap(args);
+    }
+    if (args.command == "translate-iw3-script")
+    {
+        return translateIw3Script(args);
     }
     if (args.command == "build-weapon")
     {

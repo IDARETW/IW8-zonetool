@@ -1,6 +1,7 @@
 #include "iw3_fastfile.h"
 #include "iw3_lightgrid.h"
 #include "iw3_render_assets.h"
+#include "iw3_scripts.h"
 
 #include "../convert/maps_convert.h"
 #include "../convert/xsurface_convert.h"
@@ -194,6 +195,14 @@ Vec3 Add(const Vec3 &a, const Vec3 &b)
 Vec3 Subtract(const Vec3 &a, const Vec3 &b)
 {
     return {a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+}
+
+std::string Lowercase(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(), [](const unsigned char letter) {
+        return static_cast<char>(std::tolower(letter));
+    });
+    return value;
 }
 
 Vec3 Multiply(const Vec3 &a, const float scale)
@@ -1825,10 +1834,23 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
             if (sourceSurface.at("deformed").get<bool>() && !placedStaticBindPose)
                 throw std::runtime_error("IW3 placed model requires skinning: " + modelName);
             Surface surface = ReadWorldSurface(sourceSurface);
+            // IW3 destructible base models hold every damage state and hide the
+            // damaged ones per bone; the converted models have one bone, so keep
+            // only the intact state (shattered glass, burnt panels removed).
+            if (modelName.find("_destructible") != std::string::npos)
+            {
+                const std::string material = Lowercase(surface.material);
+                if (material.find("shattered") != std::string::npos ||
+                    material.find("destroy") != std::string::npos ||
+                    material.ends_with("_dam"))
+                    continue;
+            }
             // IW3 and Replay XSurfaces use the same clockwise winding. World-surface
             // normal alignment would turn these native model faces inside out.
             lod.surfaces.push_back(std::move(surface));
         }
+        if (lod.surfaces.empty())
+            throw std::runtime_error("IW3 model has no intact surfaces: " + modelName);
         converted.lods.push_back(std::move(lod));
     }
     for (auto &lod : converted.lods)
@@ -2277,10 +2299,10 @@ Vec2 EncodedLightmap(const Vertex &vertex, const Surface &surface, const Materia
                                1.0f - 0.5f / rectangle.height)};
         x = (rectangle.x +
              std::clamp(vertex.lightmapUv[0] * rectangle.width, 0.5f, rectangle.width - 0.5f)) /
-            4096.0f;
+            static_cast<float>(plan.atlasSize);
         y = (rectangle.y +
              std::clamp(vertex.lightmapUv[1] * rectangle.height, 0.5f, rectangle.height - 0.5f)) /
-            4096.0f;
+            static_cast<float>(plan.atlasSize);
     }
     if (nativeWorld)
     {
@@ -2519,7 +2541,8 @@ struct PromotedScriptModel
 // model path (GPU static-model draw, sun shadows and static collision).
 // Gametype objects, exploders, old-school pickups and linked prefab members
 // remain entities for Replay's own scripts and the glass conversion.
-std::vector<PromotedScriptModel> TakeUnscriptedScriptModels(std::string &text)
+std::vector<PromotedScriptModel> TakeUnscriptedScriptModels(std::string &text,
+                                                            const std::set<std::string> &scripted)
 {
     std::vector<std::pair<std::size_t, std::size_t>> spans;
     const auto entities = ParseEntityFields(text, &spans);
@@ -2541,8 +2564,12 @@ std::vector<PromotedScriptModel> TakeUnscriptedScriptModels(std::string &text)
         if (!classname || *classname != "script_model" || !model || model->empty() ||
             model->front() == '*' || field("script_gameobjectname") || field("script_exploder"))
             continue;
+        // Entities the converted map script drives (by targetname) or the
+        // IW3 compatibility layer handles stay entities.
         if (const auto *name = field("targetname");
-            name && (*name == "exploder" || *name == "oldschool_pickup" || targeted.contains(*name)))
+            name && (*name == "exploder" || *name == "oldschool_pickup" ||
+                     *name == "destructible" || *name == "interactive_tv" ||
+                     targeted.contains(*name) || scripted.contains(*name)))
             continue;
         PromotedScriptModel placement;
         placement.model = *model;
@@ -6279,6 +6306,7 @@ PreparedMap::PreparedMap(PreparedMap &&other) noexcept
     , shadowScene(std::move(other.shadowScene))
     , dynamicEntities(std::move(other.dynamicEntities))
     , navigation(std::move(other.navigation))
+    , mapScript(std::move(other.mapScript))
 {
     other.scratch.clear();
 }
@@ -6309,6 +6337,7 @@ PreparedMap &PreparedMap::operator=(PreparedMap &&other) noexcept
         shadowScene = std::move(other.shadowScene);
         dynamicEntities = std::move(other.dynamicEntities);
         navigation = std::move(other.navigation);
+        mapScript = std::move(other.mapScript);
         other.scratch.clear();
     }
     return *this;
@@ -6616,11 +6645,73 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     std::vector<BrushModel> brushModels =
         ReadBrushModels(world, exportRoot, visibility, sourceStaticModels);
     SourceDynamicEntities sourceDynamicEntities = ReadDynamicEntities(collision, exportRoot);
-    AddPromotedStaticModels(world, exportRoot, TakeUnscriptedScriptModels(entities),
+    // IW3 map scripts: translate them first so the entities they drive stay
+    // entities, and so destroyed-state models can be converted and precached.
+    std::set<std::string> scriptStrings;
+    std::vector<std::string> scriptModels;
+    {
+        std::vector<scripts::Source> scriptSources;
+        const auto scriptDirectory = exportRoot / "maps" / "mp";
+        std::error_code scriptError;
+        if (std::filesystem::is_directory(scriptDirectory, scriptError))
+            for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory))
+            {
+                if (!entry.is_regular_file() || Lowercase(entry.path().extension().string()) != ".gsc")
+                    continue;
+                std::string text;
+                if (zt::read_file_str(entry.path().string(), text))
+                    scriptSources.push_back(
+                        {"maps/mp/" + Lowercase(entry.path().filename().string()), std::move(text)});
+            }
+        // Destroyed states of IW3 destructibles (<type>_destroyed, <model>_d).
+        std::set<std::string> extraModels;
+        for (const EntityFields &entity : ParseEntityFields(entities))
+        {
+            const auto type = entity.find("destructible_type");
+            if (type != entity.end())
+                extraModels.insert(type->second + "_destroyed");
+            const auto name = entity.find("targetname");
+            const auto model = entity.find("model");
+            if (name != entity.end() && name->second == "interactive_tv" && model != entity.end())
+                extraModels.insert(model->second + "_d");
+        }
+        std::string generated = "iw3compat_generated()\n{\n    level.mw120r_models = [];\n";
+        for (const auto &model : extraModels)
+        {
+            std::error_code missing;
+            if (!std::filesystem::is_regular_file(exportRoot / "xmodel" / (model + ".json"), missing))
+                continue;
+            scriptModels.push_back(model);
+            generated += "    precachemodel( \"" + model + "\" );\n    level.mw120r_models[\"" +
+                         model + "\"] = 1;\n";
+        }
+        generated += "}\n";
+        try
+        {
+            auto translation = scripts::Translate(
+                options.map, scriptSources, [](const std::string &) { return std::string{}; },
+                generated);
+            for (const auto &note : translation.notes)
+                zt::info("iw3: script translation: %s", note.c_str());
+            zt::info("iw3: translated %zu IW3 map script file(s) to IW8 GSC (%s main)",
+                     scriptSources.size(), translation.translatedMain ? "source" : "generated");
+            scriptStrings = std::move(translation.strings);
+            result.mapScript = std::move(translation.gsc);
+        }
+        catch (const std::exception &error)
+        {
+            zt::warn("iw3: map scripts were not translated: %s", error.what());
+        }
+    }
+    AddPromotedStaticModels(world, exportRoot, TakeUnscriptedScriptModels(entities, scriptStrings),
                             sourceStaticModels);
     timing.lap("read world");
     SourceStaticModels sourceEntityModels;
-    const auto keptEntityModelNames = convert::iw3ReplayEntityModels(entities);
+    auto keptEntityModelNames = convert::iw3ReplayEntityModels(entities);
+    for (const auto &model : scriptModels)
+        if (std::find(keptEntityModelNames.begin(), keptEntityModelNames.end(), model) ==
+            keptEntityModelNames.end())
+            keptEntityModelNames.push_back(model);
     sourceEntityModels.models.reserve(keptEntityModelNames.size());
     for (const auto &modelName : keptEntityModelNames)
         sourceEntityModels.models.push_back(ReadSourceModel(exportRoot, modelName));
