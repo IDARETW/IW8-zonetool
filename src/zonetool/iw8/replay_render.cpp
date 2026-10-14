@@ -264,8 +264,11 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     const auto height = source.at("height").get<unsigned>();
     const bool bc6h = image.format == 42;
     const bool bc7 = image.format == 44 || image.format == 45;
-    const bool blocks = bc6h || bc7;
-    const char *pixelField = bc6h ? "bc6h" : bc7 ? "bc7" : "rgba8";
+    // Replay format 39 is BC4_UNORM (table 0x1423E25F0): decal-volume masks.
+    const bool bc4 = image.format == 39;
+    const bool blocks = bc6h || bc7 || bc4;
+    const size_t blockBytes = bc4 ? 8 : 16;
+    const char *pixelField = bc6h ? "bc6h" : bc7 ? "bc7" : bc4 ? "bc4" : "rgba8";
     const auto pixels = source.at(pixelField).get<std::string>();
     const uint32_t mapType = image.flags & 0x38000u;
     if (!image.name.starts_with("mw120r/") || image.name.size() > 128 || !width || !height ||
@@ -289,7 +292,7 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     for (unsigned level = 0; level < image.mipCount; ++level)
     {
         const size_t subresource =
-            blocks ? size_t((mipWidth + 3) / 4) * ((mipHeight + 3) / 4) * 16
+            blocks ? size_t((mipWidth + 3) / 4) * ((mipHeight + 3) / 4) * blockBytes
                  : size_t(mipWidth) * mipHeight * 4;
         if (subresource > (SIZE_MAX - 15) ||
             ((subresource + 15) & ~size_t{15}) > (SIZE_MAX - length) / slices)

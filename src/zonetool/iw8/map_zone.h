@@ -9,6 +9,10 @@
 #include "replay_netconst.h"
 #include "replay_spawns.h"
 #include "replay_static_model_collision.h"
+
+#include <array>
+#include <string>
+#include <vector>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -868,21 +872,40 @@ inline void emitComWorldBody(ZoneBuffer &zb, const char *assetName, const MapSun
     zb.popStream();
 }
 
-// Required level NCS assets. The converter has no converted per-level asset names,
-// so entryCount/stringList are zero. Native ProcessNetConstStringMap accepts this.
-inline void emitLevelNetConstStrings(ZoneBuffer &zb, unsigned type)
+// Per-level NetConstStrings, indexed by replayncs type. Replay resolves a networked
+// entity's model (G_SetModel) and every script loadfx (G_EffectIndex) through these
+// tables: a map entity whose model is in no loaded "mdl" table spawns with model
+// index 0 and no DObj, and loadfx reports "Could not allocate/find effect ID".
+using LevelNetConstStrings = std::array<std::vector<std::string>, replayncs::Count>;
+
+// Required level NCS assets, one per type. Body (0x20, Load_NetConstStrings
+// 0x140DFDA50): name, stringType +8, sourceType +12, flags +16, entryCount +20,
+// stringList +24 = const char*[entryCount] (each inline) then the strings, all in
+// the name's stream. Empty tables are accepted (ProcessNetConstStringMap skips them).
+inline void emitLevelNetConstStrings(ZoneBuffer &zb, unsigned type,
+                                     const std::vector<std::string> &strings)
 {
     const std::string name = std::string("ncs_") + replayncs::Tags[type] + "_level";
     uint8_t body[replayncs::BodySize]{};
     stamp64(body, 0, PTR_FOLLOWS);
     stamp32(body, 8, type);
     stamp32(body, 12, replayncs::LevelSource);
+    stamp32(body, 20, static_cast<uint32_t>(strings.size()));
+    stamp64(body, 24, strings.empty() ? PTR_NULL : PTR_FOLLOWS);
     // ZoneWriter reserves the top-level DB_InsertPointer slot.
     zb.pushStream(XFILE_BLOCK_TEMP_PRELOAD);
     zb.align(7);
     zb.write(body, sizeof(body));
     zb.pushStream(XFILE_BLOCK_VIRTUAL);
     zb.writeStr(name.c_str());
+    if (!strings.empty())
+    {
+        zb.align(7);
+        for (size_t index = 0; index < strings.size(); ++index)
+            zb.writeT<uint64_t>(PTR_FOLLOWS);
+        for (const auto &value : strings)
+            zb.writeStr(value.c_str());
+    }
     zb.popStream();
     zb.popStream();
     zb.pushStream(XFILE_BLOCK_TEMP_POSTLOAD);
@@ -938,7 +961,8 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                                    const havok::BakeResult &collision,
                                    const uint32_t glassInitCount, const uint32_t glassPieceLimit,
                                    const uint32_t dynamicModelCount,
-                                   const uint32_t dynamicBrushCount, const bool lightDefInZone)
+                                   const uint32_t dynamicBrushCount, const bool lightDefInZone,
+                                   const LevelNetConstStrings &levelStrings = {})
 {
     const auto spawns = strings.spawns;
     const auto staticCollisionPlan = strings.staticCollisionPlan;
@@ -1038,7 +1062,9 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
     for (unsigned type = 0; type < replayncs::Count; ++type)
         writer.add(ASSET_TYPE_NET_CONST_STRINGS,
                    std::string("ncs_") + replayncs::Tags[type] + "_level",
-                   [type](ZoneWriter &output) { emitLevelNetConstStrings(output.buffer(), type); });
+                   [type, strings = levelStrings[type]](ZoneWriter &output) {
+                       emitLevelNetConstStrings(output.buffer(), type, strings);
+                   });
 }
 
 } // namespace iw8

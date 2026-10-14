@@ -8,6 +8,7 @@
 #include "dumpsrc/material_dumpsrc.h"
 #include "dumpsrc/xmodel_dump.h"
 #include "iw3/iw3_fastfile.h"
+#include "iw3/iw3_vision.h"
 #include "iw3/iw3_scripts.h"
 #include "iw7/iw7_fastfile.h"
 #include "iw8/iw8_ffheader.h"
@@ -19,6 +20,7 @@
 #include "iw8/replay_impact.h"
 #include "iw8/replay_navigation.h"
 #include "iw8/replay_rawfile.h"
+#include "iw8/replay_grading.h"
 #include "iw8/replay_render.h"
 #include "iw8/replay_script.h"
 #include "iw8/replay_vfx.h"
@@ -34,6 +36,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <regex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -69,6 +73,9 @@ struct MapMetadata
     std::string description;
     unsigned compassRotation{};
     bool compassRotationSet{};
+    // Contraction of the IW3 minimap region about its centre (see the compass
+    // bounds below); build-time only, not written to the package map.json.
+    float minimapScale{0.875f};
 };
 
 void printUsage()
@@ -280,6 +287,12 @@ bool readMetadata(const std::string &path, MapMetadata &metadata)
             if (metadata.compassRotation != 0 && metadata.compassRotation != 90 &&
                 metadata.compassRotation != 180 && metadata.compassRotation != 270)
                 throw std::runtime_error("compassRotation must be 0, 90, 180, or 270 clockwise");
+        }
+        if (const auto scale = data.find("minimapScale"); scale != data.end())
+        {
+            if (!scale->is_number() || scale->get<double>() < 0.5 || scale->get<double>() > 1.5)
+                throw std::runtime_error("minimapScale must be a number from 0.5 to 1.5");
+            metadata.minimapScale = scale->get<float>();
         }
         metadata.present = true;
     }
@@ -1059,10 +1072,26 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         replayrender::RegisterReflectionProbeImage(writer, renderMesh);
         if (glassInitCount)
             iw8::writePhysicsAsset(writer, glassPhysics);
+        // Models and effects this zone registers; only these go into the level
+        // NetConstStrings (stock names already sit in the common tables).
+        std::set<std::string> zoneModels, zoneEffects, scriptModels, scriptEffects;
         if (prepared)
         {
+            for (const auto &model : prepared->xmodels)
+                zoneModels.insert(model.model.name);
+            for (const auto &effect : prepared->vfxEffects)
+                zoneEffects.insert(effect.name);
+        }
+        if (prepared)
+        {
+            if (!prepared->gradingClutName.empty())
+                iw8::grading::RegisterGradingClut(writer, prepared->gradingClutName,
+                                                  iw3::GradingClutSize,
+                                                  prepared->gradingClutPixels);
             for (const auto &rawFile : prepared->rawFiles)
                 iw8::rawfile::Register(writer, rawFile.name, rawFile.data);
+            if (prepared->soundBank)
+                iw8::sound::RegisterBank(writer, *prepared->soundBank);
             for (const auto &model : prepared->xmodels)
             {
                 if (!model.physicsAsset.name.empty())
@@ -1138,6 +1167,19 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             }
             generated += "}\n";
             const std::string scriptSource = prepared->mapScript + "\n" + generated;
+            // Names the script resolves at runtime: precachemodel/setmodel through the
+            // model table, loadfx through the effect table.
+            static const std::regex scriptModel(R"re((?:precachemodel|setmodel)\s*\(\s*"([^"]+)")re",
+                                                std::regex::icase);
+            static const std::regex scriptEffect(R"re(loadfx\s*\(\s*"([^"]+)")re", std::regex::icase);
+            for (auto match = std::sregex_iterator(scriptSource.begin(), scriptSource.end(),
+                                                   scriptModel);
+                 match != std::sregex_iterator(); ++match)
+                scriptModels.insert((*match)[1].str());
+            for (auto match = std::sregex_iterator(scriptSource.begin(), scriptSource.end(),
+                                                   scriptEffect);
+                 match != std::sregex_iterator(); ++match)
+                scriptEffects.insert((*match)[1].str());
             const std::filesystem::path work =
                 std::filesystem::path(path_dir(outputDirectory)) / ".iw3-scripts" / map;
             try
@@ -1176,10 +1218,32 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         {
             warn("assets: compass image has no valid pair of IW3 minimap_corner entities");
         }
+        // Map entity models (MapEnts key 652 = "model"; '*' values are brush models).
+        iw8::LevelNetConstStrings levelStrings;
+        {
+            static const std::regex entityModel(R"re((?:^|[\s{])652 "([^"*][^"]*)")re");
+            std::set<std::string> models;
+            for (auto match = std::sregex_iterator(mapEntities.begin(), mapEntities.end(),
+                                                   entityModel);
+                 match != std::sregex_iterator(); ++match)
+                if (zoneModels.contains((*match)[1].str()))
+                    models.insert((*match)[1].str());
+            for (const auto &model : scriptModels)
+                if (zoneModels.contains(model))
+                    models.insert(model);
+            std::set<std::string> effects;
+            for (const auto &effect : scriptEffects)
+                if (zoneEffects.contains(effect))
+                    effects.insert(effect);
+            levelStrings[0].assign(models.begin(), models.end());  // "mdl"
+            levelStrings[6].assign(effects.begin(), effects.end()); // "vfx"
+            info("assets: level NetConstStrings: %zu model(s), %zu effect(s)", models.size(),
+                 effects.size());
+        }
         iw8::registerMapWorldAssets(
             writer, worldStrings, assetName, mapEntities, bounds, lighting, collision,
             glassInitCount, glassPieceLimit, dynamicCounts.models, dynamicCounts.brushes,
-            prepared && prepared->vfxLightDef == "light_point_linear");
+            prepared && prepared->vfxLightDef == "light_point_linear", levelStrings);
         timing.lap("asset registration");
         techsets.build();
         writer.build();
@@ -1319,6 +1383,26 @@ int buildMap(const Args &args, const iw3::PreparedMap *prepared = nullptr)
             info("compass: squared minimap region to northwest %.3f %.3f, southeast %.3f %.3f",
                  compassBounds.northwestX, compassBounds.northwestY, compassBounds.southeastX,
                  compassBounds.southeastY);
+        }
+        // Replay draws a converted IW3 minimap too large about the map centre:
+        // the player's position on it drifts toward the centre with distance.
+        // Calibrated on Nuketown (fixes-25): a player located from the scene at
+        // (1206, 630) was shown on the art for (1072, 545), i.e. at 0.86-0.89 of
+        // the true distance from the centre. Contracting the declared region by
+        // that factor puts the art under the player again; the centre (where
+        // the minimap already lined up) and the orientation are unchanged.
+        if (metadata.minimapScale != 1.0f)
+        {
+            const float centerX = (compassBounds.northwestX + compassBounds.southeastX) * 0.5f;
+            const float centerY = (compassBounds.northwestY + compassBounds.southeastY) * 0.5f;
+            const float scale = metadata.minimapScale;
+            compassBounds.northwestX = centerX + (compassBounds.northwestX - centerX) * scale;
+            compassBounds.southeastX = centerX + (compassBounds.southeastX - centerX) * scale;
+            compassBounds.northwestY = centerY + (compassBounds.northwestY - centerY) * scale;
+            compassBounds.southeastY = centerY + (compassBounds.southeastY - centerY) * scale;
+            info("compass: scaled minimap region by %.3f to northwest %.3f %.3f, southeast %.3f %.3f",
+                 scale, compassBounds.northwestX, compassBounds.northwestY,
+                 compassBounds.southeastX, compassBounds.southeastY);
         }
         // IW3 draws the compass image with northyaw up; Replay's minimap wants
         // it turned clockwise by northyaw (Office, default 90, was verified at 90).
@@ -1642,7 +1726,9 @@ int translateIw3Script(const Args &args)
         "iw3compat_generated()\n{\n    level.mw120r_models = [];\n}\n");
     for (const auto &note : translation.notes)
         info("translate: %s", note.c_str());
-    const std::string source = translation.gsc + "\niw3compat_minimap()\n{\n}\n";
+    // Standalone translation has no converted effects: stock stand-ins only.
+    const std::string source = translation.gsc + "\niw3compat_minimap()\n{\n}\n" +
+                               "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n}\n";
     std::filesystem::create_directories(args.outputDirectory);
     if (!write_file_str(path_join(args.outputDirectory, map + ".gsc"), source))
         return 1;

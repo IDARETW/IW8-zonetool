@@ -4,6 +4,8 @@
 //   maps\mp\_load::main()        -> iw3compat_load_main()
 //   maps\mp\_compass::*          -> handled by iw3compat_minimap() (generated)
 //   maps\mp\_utility::exploder() -> iw3compat_exploder()
+//   playsound / playloopsound / playsoundatpos / soundexists -> iw3compat_*,
+//   which play only the aliases converted into the map bank (iw3compat_sounds())
 // Builtin ids, argument orders and field tokens were checked against the
 // Replay 1.20 builtin tables and handlers. Effects come from common MP zones
 // (loadfx only accepts fx/ or vfx/ names). The converter renames IW3-only
@@ -38,15 +40,86 @@ iw3compat_load_main()
 
 iw3compat_precache()
 {
+    // Native glass gives 15% of unsupported shards a physics body instead of
+    // the scripted fall ("LLTLMSKMQ", the shard physics chance). On converted
+    // maps those shards stayed where the pane broke, floating in the frame;
+    // with the chance at 0 every unsupported shard takes the scripted fall.
+    setdvar( "LLTLMSKMQ", "0" );
+    iw3compat_sounds();
+    iw3compat_model_parts();
+    // Converted IW3 effects (generated per map). A slot loads its stock
+    // stand-in only when the IW3 effect did not convert, so each slot holds
+    // exactly one loaded effect.
+    iw3compat_iw3fx();
     level.mw120r_fx = [];
-    level.mw120r_fx["veh_smoke_light"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_hood_smoke" );
-    level.mw120r_fx["veh_smoke_heavy"] = loadfx( "vfx/iw8/veh/scriptables/vfx_smoke_heavy_ch" );
-    level.mw120r_fx["veh_fire"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_fire_engine_flareup" );
-    level.mw120r_fx["veh_fire_linger"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_fire_linger_med" );
-    level.mw120r_fx["veh_explosion"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_explosion_civ" );
-    level.mw120r_fx["veh_glass"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_glass_windshield" );
-    level.mw120r_fx["glass_shatter"] = loadfx( "vfx/code/glass/glass_shatter_32x32" );
-    level.mw120r_fx["sparks"] = loadfx( "vfx/iw8_mp/equipment/flashbang/vfx_spark_crack_npop" );
+    level.mw120r_fx["veh_smoke_light"] = iw3compat_fx( "smoke/car_damage_whitesmoke", "vfx/iw8/veh/scriptables/vfx_veh_hood_smoke" );
+    level.mw120r_fx["veh_smoke_heavy"] = iw3compat_fx( "smoke/car_damage_blacksmoke", "vfx/iw8/veh/scriptables/vfx_smoke_heavy_ch" );
+    level.mw120r_fx["veh_fire"] = iw3compat_fx( "smoke/car_damage_blacksmoke_fire", "vfx/iw8/veh/scriptables/vfx_veh_fire_engine_flareup" );
+    level.mw120r_fx["veh_explosion"] = iw3compat_fx( "explosions/small_vehicle_explosion", "vfx/iw8/veh/scriptables/vfx_veh_explosion_civ" );
+    level.mw120r_fx["glass_shatter"] = iw3compat_fx( "impacts/small_glass", "vfx/code/glass/glass_shatter_32x32" );
+    level.mw120r_fx["sparks"] = iw3compat_fx( "impacts/small_metalhit_1", "vfx/iw8_mp/equipment/flashbang/vfx_spark_crack_npop" );
+    // IW3's own explosion carries its fire; only the stock stand-in needs one.
+    if ( !iw3compat_has_iw3fx( "explosions/small_vehicle_explosion" ) )
+        level.mw120r_fx["veh_fire_linger"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_fire_linger_med" );
+}
+
+iw3compat_has_iw3fx( iw3name )
+{
+    return isdefined( level.mw120r_iw3fx ) && isdefined( level.mw120r_iw3fx[iw3name] );
+}
+
+iw3compat_fx( iw3name, stock )
+{
+    if ( iw3compat_has_iw3fx( iw3name ) )
+        return level.mw120r_iw3fx[iw3name];
+    return loadfx( stock );
+}
+
+// ---------------------------------------------------------------------------
+// Sounds: level.mw120r_sounds[alias] is 1 for a one-shot, 2 for a loop.
+// ---------------------------------------------------------------------------
+iw3compat_sound_kind( alias )
+{
+    if ( !isdefined( level.mw120r_sounds ) )
+        iw3compat_sounds();
+    if ( !isdefined( alias ) || !isdefined( level.mw120r_sounds[alias] ) )
+        return 0;
+    return level.mw120r_sounds[alias];
+}
+
+iw3compat_playsound( alias, unused1, unused2 )
+{
+    if ( iw3compat_sound_kind( alias ) == 1 )
+        self playsound( alias );
+}
+
+iw3compat_playloopsound( alias, unused1 )
+{
+    if ( iw3compat_sound_kind( alias ) == 2 )
+        self playloopsound( alias );
+}
+
+iw3compat_stoploopsound( unused1 )
+{
+    self stoploopsound();
+}
+
+iw3compat_playsoundatpos( origin, alias )
+{
+    if ( isdefined( origin ) && iw3compat_sound_kind( alias ) == 1 )
+        playsoundatpos( origin, alias );
+}
+
+iw3compat_playsoundinspace( alias, origin, unused1 )
+{
+    if ( !isdefined( origin ) )
+        origin = self.origin;
+    iw3compat_playsoundatpos( origin, alias );
+}
+
+iw3compat_soundexists( alias )
+{
+    return iw3compat_sound_kind( alias ) != 0;
 }
 
 // IW3 deleted every game object its gametype did not use. Replay's own
@@ -101,9 +174,60 @@ iw3compat_exploder( number )
 // ---------------------------------------------------------------------------
 // Destructible vehicles (IW3 maps\mp\_destructible_types vehicle_80s_* stages):
 // 250 damage -> hood smoke, +200 -> heavy smoke, +100 -> fire that drains
-// 300 health at 12 per 0.2s, then the explosion (375 radius, 300..20 damage).
+// 12 per 0.2s through the next 300 + 400, then the explosion (375 radius,
+// 300..20 damage). IW3 plays a state's effects when the state runs out.
 // Melee never damages a vehicle ("no_melee").
+// IW3 _destructible scales splash damage by 2.75 and, because the vehicle's
+// first five states share its model, applies each splash hit to all five,
+// less 0.4 * the distance from the explosion. A grenade beside a car sets it
+// straight to its explosion, as in IW3.
+// The converted model keeps the IW3 skeleton, so parts (glass, lights,
+// mirrors) break by bone as in IW3: see iw3compat_vehicle_parts_init().
 // ---------------------------------------------------------------------------
+iw3compat_is_splash( type )
+{
+    if ( !isdefined( type ) )
+        return 0;
+    type = tolower( type );
+    return type == "mod_grenade" || type == "mod_grenade_splash" || type == "mod_projectile" ||
+           type == "mod_projectile_splash" || type == "mod_explosive" || type == "splash";
+}
+
+// IW3 getDamageType(): melee, splash, impact, or bullet (everything else).
+iw3compat_damage_kind( type )
+{
+    if ( !isdefined( type ) )
+        return "bullet";
+    type = tolower( type );
+    if ( type == "mod_melee" || type == "mod_crush" || type == "melee" )
+        return "melee";
+    if ( iw3compat_is_splash( type ) )
+        return "splash";
+    if ( type == "mod_impact" )
+        return "impact";
+    return "bullet";
+}
+
+iw3compat_vehicle_splash( amount, point )
+{
+    if ( !isdefined( point ) )
+        point = self.origin;
+    hit = amount * 2.75 - distance( point, self.origin ) * 0.4;
+    if ( hit <= 0 )
+        return 0;
+    return hit * 5;
+}
+
+// Replay kills a damageable script entity whose health runs out (ending these
+// threads on "death"); IW3 destructibles count their own damage instead.
+iw3compat_make_damageable()
+{
+    self.maxhealth = 1000000;
+    self.health = 1000000;
+    self setcandamage( 1 );
+    self setcanradiusdamage( 1 );
+}
+
 iw3compat_destructible_vehicles()
 {
     vehicles = getentarray( "mw120r_destructible", "targetname" );
@@ -117,7 +241,8 @@ iw3compat_destructible_vehicles()
 iw3compat_vehicle_think()
 {
     self endon( "death" );
-    self setcandamage( 1 );
+    self iw3compat_make_damageable();
+    self iw3compat_vehicle_parts_init();
     self.mw120r_destroyed_model = iw3compat_known_model( self.destructible_type + "_destroyed" );
     self.mw120r_stage = 0;
     self.mw120r_damage = 0;
@@ -126,16 +251,32 @@ iw3compat_vehicle_think()
     thresholds[0] = 250;
     thresholds[1] = 450;
     thresholds[2] = 550;
-    thresholds[3] = 850;
+    thresholds[3] = 1250;
 
     for (;;)
     {
         self waittill( "damage", amount, attacker, direction, point, type );
-        if ( isdefined( type ) && issubstr( tolower( type ), "melee" ) )
-            continue;
-
+        self.health = 1000000;
+        kind = iw3compat_damage_kind( type );
         if ( isdefined( attacker ) )
             self.mw120r_attacker = attacker;
+        if ( kind == "splash" )
+        {
+            self iw3compat_vehicle_parts_splash( amount, point );
+            amount = self iw3compat_vehicle_splash( amount, point );
+        }
+        else
+        {
+            // A hit goes to the part it struck; the body takes what IW3 passes
+            // on (alsoDamageParent), or the whole hit when no part was struck.
+            tag = self iw3compat_vehicle_hit_part( point );
+            if ( isdefined( tag ) )
+                amount = self iw3compat_vehicle_damage_part( tag, amount, kind );
+            // The body itself ignores melee and impacts ("no_melee").
+            if ( kind == "melee" || kind == "impact" )
+                amount = 0;
+        }
+
         self.mw120r_damage = self.mw120r_damage + amount;
 
         while ( self.mw120r_stage < 4 && self.mw120r_damage >= thresholds[self.mw120r_stage] )
@@ -147,6 +288,9 @@ iw3compat_vehicle_think()
                 self thread iw3compat_vehicle_loopfx( "veh_smoke_heavy", 2, 0.4 );
             else if ( self.mw120r_stage == 3 )
             {
+                // IW3 fire state: flare-up plus the burning loop until the explosion.
+                self iw3compat_playsound( "fire_vehicle_flareup_med" );
+                self iw3compat_playloopsound( "fire_vehicle_med" );
                 self thread iw3compat_vehicle_loopfx( "veh_fire", 3, 0.4 );
                 self thread iw3compat_vehicle_drain();
             }
@@ -167,7 +311,7 @@ iw3compat_vehicle_drain()
     {
         wait 0.2;
         self.mw120r_damage = self.mw120r_damage + 12;
-        if ( self.mw120r_damage >= 850 )
+        if ( self.mw120r_damage >= 1250 )
         {
             // The damage loop is blocked in waittill; wake it with a zero hit.
             self notify( "damage", 0, self.mw120r_attacker, ( 0, 0, 0 ), self.origin, "MOD_EXPLOSIVE" );
@@ -181,13 +325,18 @@ iw3compat_vehicle_hood()
     return self.origin + anglestoforward( self.angles ) * 64 + ( 0, 0, 40 );
 }
 
+// IW3 destructible_loopfx( "tag_hood_fx", fx, rate ): playfxontag each period.
 iw3compat_vehicle_loopfx( name, stage, rate )
 {
     self endon( "death" );
     self endon( "mw120r_exploded" );
+    ontag = isdefined( self gettagorigin( "tag_hood_fx", 1 ) );
     while ( self.mw120r_stage == stage )
     {
-        playfx( level.mw120r_fx[name], self iw3compat_vehicle_hood() );
+        if ( ontag )
+            playfxontag( level.mw120r_fx[name], self, "tag_hood_fx" );
+        else
+            playfx( level.mw120r_fx[name], self iw3compat_vehicle_hood() );
         wait rate;
     }
 }
@@ -196,9 +345,15 @@ iw3compat_vehicle_explode()
 {
     self notify( "mw120r_exploded" );
     self setcandamage( 0 );
-    center = self.origin + ( 0, 0, 32 );
-    playfx( level.mw120r_fx["veh_explosion"], center );
-    playfx( level.mw120r_fx["veh_glass"], self.origin + ( 0, 0, 48 ) );
+    self stoploopsound();
+    self iw3compat_playsound( "car_explode" );
+    // IW3: the explosion effect at tag_death_fx facing up, and the radius
+    // damage 80 units above the origin.
+    fxorigin = self gettagorigin( "tag_death_fx", 1 );
+    if ( !isdefined( fxorigin ) )
+        fxorigin = self.origin + ( 0, 0, 32 );
+    playfx( level.mw120r_fx["veh_explosion"], fxorigin, ( 0, 0, 1 ), ( 1, 0, 0 ) );
+    center = self.origin + ( 0, 0, 80 );
 
     attacker = self.mw120r_attacker;
     if ( isdefined( attacker ) )
@@ -212,7 +367,9 @@ iw3compat_vehicle_explode()
     if ( isdefined( self.mw120r_destroyed_model ) )
         self setmodel( self.mw120r_destroyed_model );
 
-    self thread iw3compat_vehicle_burn( 12 );
+    // IW3's own explosion carries its fire; the stock stand-in needs a burn.
+    if ( !iw3compat_has_iw3fx( "explosions/small_vehicle_explosion" ) )
+        self thread iw3compat_vehicle_burn( 12 );
 }
 
 iw3compat_vehicle_burn( seconds )
@@ -223,6 +380,200 @@ iw3compat_vehicle_burn( seconds )
     {
         playfx( level.mw120r_fx["veh_fire_linger"], self.origin + ( 0, 0, 24 ) );
         wait 0.5;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle parts (IW3 destructible_part, vehicle_80s_* values). A part's damaged
+// state (tag_*_d) starts hidden. Glass cracks at its first health and shatters
+// at its second (effect and sound at tag_*_fx); lights break once and show
+// their damaged state; mirrors are knocked off. Doors, hood, trunk and the
+// front bumper pass hits on to the body; wheels and the rear bumper absorb
+// them. Parts only exist when the model has their bones.
+// ---------------------------------------------------------------------------
+iw3compat_vehicle_parts_init()
+{
+    self.mw120r_parts = [];
+    self.mw120r_part_min = undefined;
+    self.mw120r_part_max = undefined;
+    if ( isdefined( self.model ) && isdefined( level.mw120r_part_min ) && isdefined( level.mw120r_part_min[self.model] ) )
+    {
+        self.mw120r_part_min = level.mw120r_part_min[self.model];
+        self.mw120r_part_max = level.mw120r_part_max[self.model];
+    }
+    self iw3compat_vehicle_part( "tag_glass_front", 40, "tag_glass_front_d", 60, "tag_glass_front_fx", "props/car_glass_large", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_glass_back", 40, "tag_glass_back_d", 60, "tag_glass_back_fx", "props/car_glass_large", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_glass_left_front", 20, "tag_glass_left_front_d", 60, "tag_glass_left_front_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_glass_right_front", 20, "tag_glass_right_front_d", 60, "tag_glass_right_front_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_glass_left_back", 20, "tag_glass_left_back_d", 60, "tag_glass_left_back_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_glass_right_back", 20, "tag_glass_right_back_d", 60, "tag_glass_right_back_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
+    self iw3compat_vehicle_part( "tag_light_left_front", 20, "tag_light_left_front_d", undefined, "tag_light_left_front", "props/car_glass_headlight", "veh_glass_break_small", 0.5 );
+    self iw3compat_vehicle_part( "tag_light_right_front", 20, "tag_light_right_front_d", undefined, "tag_light_right_front", "props/car_glass_headlight", "veh_glass_break_small", 0.5 );
+    self iw3compat_vehicle_part( "tag_light_left_back", 20, "tag_light_left_back_d", undefined, "tag_light_left_back", "props/car_glass_brakelight", "veh_glass_break_small", undefined );
+    self iw3compat_vehicle_part( "tag_light_right_back", 20, "tag_light_right_back_d", undefined, "tag_light_right_back", "props/car_glass_brakelight", "veh_glass_break_small", undefined );
+    self iw3compat_vehicle_part( "tag_mirror_left", 40, undefined, undefined, undefined, undefined, undefined, undefined );
+    self iw3compat_vehicle_part( "tag_mirror_right", 40, undefined, undefined, undefined, undefined, undefined, undefined );
+    self iw3compat_vehicle_part( "tag_hood", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_trunk", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_door_left_front", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_door_left_back", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_door_right_front", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_door_right_back", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_bumper_front", undefined, undefined, undefined, undefined, undefined, undefined, 1 );
+    self iw3compat_vehicle_part( "tag_bumper_back", undefined, undefined, undefined, undefined, undefined, undefined, undefined );
+    // Wheel meshes ride the wheel joints, which IW3 never damages.
+    self iw3compat_vehicle_part( "left_wheel_01_jnt", undefined, undefined, undefined, undefined, undefined, undefined, undefined );
+    self iw3compat_vehicle_part( "left_wheel_02_jnt", undefined, undefined, undefined, undefined, undefined, undefined, undefined );
+    self iw3compat_vehicle_part( "right_wheel_01_jnt", undefined, undefined, undefined, undefined, undefined, undefined, undefined );
+    self iw3compat_vehicle_part( "right_wheel_02_jnt", undefined, undefined, undefined, undefined, undefined, undefined, undefined );
+}
+
+// gettagorigin( tag, 1 ) returns undefined instead of raising a script error
+// when the model lacks the tag (GScr_UpdateTagInternal).
+iw3compat_vehicle_part( tag, health, dtag, dhealth, fxtag, fx, sound, parent )
+{
+    if ( !isdefined( self gettagorigin( tag, 1 ) ) )
+        return;
+    part = spawnstruct();
+    part.tag = tag;
+    part.visible = tag;
+    part.stage = 0;
+    part.health = health;
+    part.dhealth = dhealth;
+    part.fx = fx;
+    part.sound = sound;
+    part.parent = parent;
+    if ( isdefined( dtag ) && isdefined( self gettagorigin( dtag, 1 ) ) )
+    {
+        part.dtag = dtag;
+        self hidepart( dtag );
+    }
+    part.fxtag = tag;
+    if ( isdefined( fxtag ) && isdefined( self gettagorigin( fxtag, 1 ) ) )
+        part.fxtag = fxtag;
+    self.mw120r_parts[tag] = part;
+}
+
+// The part whose current bind-pose box (iw3compat_model_parts(), model space)
+// holds the hit point; the smallest box wins, so glass beats its door.
+iw3compat_vehicle_hit_part( point )
+{
+    if ( !isdefined( point ) || !isdefined( self.mw120r_part_min ) )
+        return undefined;
+    delta = point - self.origin;
+    x = vectordot( delta, anglestoforward( self.angles ) );
+    y = 0 - vectordot( delta, anglestoright( self.angles ) );
+    z = vectordot( delta, anglestoup( self.angles ) );
+    best = undefined;
+    bestsize = 0;
+    tags = getarraykeys( self.mw120r_parts );
+    foreach ( tag in tags )
+    {
+        visible = self.mw120r_parts[tag].visible;
+        if ( !isdefined( visible ) || !isdefined( self.mw120r_part_min[visible] ) )
+            continue;
+        lo = self.mw120r_part_min[visible] - ( 2, 2, 2 );
+        hi = self.mw120r_part_max[visible] + ( 2, 2, 2 );
+        if ( x < lo[0] || y < lo[1] || z < lo[2] || x > hi[0] || y > hi[1] || z > hi[2] )
+            continue;
+        size = ( hi[0] - lo[0] ) * ( hi[1] - lo[1] ) * ( hi[2] - lo[2] );
+        if ( !isdefined( best ) || size < bestsize )
+        {
+            best = tag;
+            bestsize = size;
+        }
+    }
+    return best;
+}
+
+// IW3 destructible_update_part(): returns the damage passed on to the body.
+// Melee and impacts break a part outright; leftover damage carries into the
+// next state.
+iw3compat_vehicle_damage_part( tag, amount, kind )
+{
+    part = self.mw120r_parts[tag];
+    parent = 0;
+    if ( kind != "splash" && isdefined( part.parent ) )
+        parent = int( amount * part.parent );
+    if ( !isdefined( part.health ) || part.stage >= 2 )
+        return parent;
+    if ( kind == "melee" || kind == "impact" )
+        amount = 100000;
+    while ( part.stage < 2 )
+    {
+        part.health = part.health - amount;
+        if ( part.health > 0 )
+            break;
+        amount = 0 - part.health;
+        self iw3compat_vehicle_break_part( part );
+    }
+    return parent;
+}
+
+iw3compat_vehicle_break_part( part )
+{
+    if ( part.stage == 0 )
+    {
+        self hidepart( part.tag );
+        part.visible = undefined;
+        if ( isdefined( part.dtag ) )
+        {
+            self showpart( part.dtag );
+            part.visible = part.dtag;
+            if ( isdefined( part.dhealth ) )
+            {
+                part.stage = 1;
+                part.health = part.dhealth;
+                return;
+            }
+        }
+    }
+    else
+    {
+        self hidepart( part.dtag );
+        part.visible = undefined;
+    }
+    part.stage = 2;
+    if ( isdefined( part.fx ) )
+    {
+        fx = level.mw120r_fx["glass_shatter"];
+        if ( iw3compat_has_iw3fx( part.fx ) )
+            fx = level.mw120r_iw3fx[part.fx];
+        // IW3 bolts this to the tag; a light's tag is hidden at the same time,
+        // so play it once at the tag's pose instead.
+        angles = self gettagangles( part.fxtag );
+        playfx( fx, self gettagorigin( part.fxtag ), anglestoforward( angles ), anglestoup( angles ) );
+    }
+    if ( isdefined( part.sound ) )
+        iw3compat_playsoundatpos( self gettagorigin( part.fxtag ), part.sound );
+}
+
+// IW3 destructible_splash_damage(): every intact part takes the splash less
+// 1.4 * its distance beyond the nearest part (the body counts, at its origin).
+iw3compat_vehicle_parts_splash( amount, point )
+{
+    if ( !isdefined( point ) || !isdefined( amount ) || amount <= 0 )
+        return;
+    damage = amount * 2.75;
+    closest = distance( point, self.origin );
+    distances = [];
+    tags = getarraykeys( self.mw120r_parts );
+    foreach ( tag in tags )
+    {
+        visible = self.mw120r_parts[tag].visible;
+        if ( !isdefined( visible ) )
+            continue;
+        distances[tag] = distance( point, self gettagorigin( visible ) );
+        if ( distances[tag] < closest )
+            closest = distances[tag];
+    }
+    foreach ( tag in tags )
+    {
+        if ( !isdefined( distances[tag] ) )
+            continue;
+        hit = damage - ( distances[tag] * 1.4 - closest );
+        if ( hit > 0 )
+            self iw3compat_vehicle_damage_part( tag, hit, "splash" );
     }
 }
 
@@ -239,7 +590,7 @@ iw3compat_destructables()
 iw3compat_destructable_think()
 {
     self endon( "death" );
-    self setcandamage( 1 );
+    self iw3compat_make_damageable();
     total = 0;
     for (;;)
     {
@@ -267,11 +618,15 @@ iw3compat_interactive_tvs()
 iw3compat_tv_think()
 {
     self endon( "death" );
-    self setcandamage( 1 );
+    self iw3compat_make_damageable();
     if ( isdefined( self.model ) )
         self.mw120r_destroyed_model = iw3compat_known_model( self.model + "_d" );
     self waittill( "damage", amount, attacker, direction, point );
     self setcandamage( 0 );
+    // The screen bone (IW3 tag_fx) when the model has it, else the hit point.
+    screen = self gettagorigin( "tag_fx", 1 );
+    if ( isdefined( screen ) )
+        point = screen;
     if ( !isdefined( point ) )
         point = self.origin + ( 0, 0, 16 );
 

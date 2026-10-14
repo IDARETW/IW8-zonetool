@@ -1887,13 +1887,14 @@ BakeResult BakeCollision(const BakeInput &input)
 
 PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
                                const std::uint32_t useCategory,
-                               const std::uint32_t simulationCategory)
+                               const std::uint32_t simulationCategory, const bool keyframedBody)
 {
     if (!g_preparedHavok)
         throw std::runtime_error("PrepareCollisionBaker must be called before model physics");
     if (name.empty() || source.vertices.size() < 3 || source.triangles.empty() ||
         source.vertices.size() > std::numeric_limits<std::int32_t>::max() ||
         source.triangles.size() > std::numeric_limits<std::int32_t>::max() || !source.contents ||
+        source.surfaceType > 63 ||
         !((useCategory == 0 && simulationCategory == 0) ||
           (useCategory == 3 && simulationCategory == 1) ||
           (useCategory == 7 && simulationCategory == 9)))
@@ -1927,11 +1928,19 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
         throw std::runtime_error("Native model physics has no non-degenerate triangles");
 
     auto &havok = *g_preparedHavok;
-    const std::vector<std::uint16_t> triangleTags(mesh.triangles.size(), 0);
+    // Model meshes resolve tags through the global MapEnts codec (shape +56 is
+    // -1), where tag 0 is the first world tag: a player clip (0x30200) that
+    // bullets, ragdolls and items ignore. Shipped model meshes store no tag
+    // (0xFFFF), so the body or static-model instance filter applies, and carry
+    // the surface type in hknpShape::m_userData (+0x28), which the hit
+    // surfaceFlags fall back to (16172E0).
+    const std::vector<std::uint16_t> triangleTags(mesh.triangles.size(), 0xFFFF);
     auto *shape = BuildCompressedMesh(havok, mesh, triangleTags);
     if (!HasCompressedMeshTriangleTree(shape))
         shape = BuildCompressedMesh(havok, mesh, triangleTags, nullptr, 0, true);
     RequireCompressedMeshTriangleTree(shape, name, "build");
+    const std::uint64_t shapeUserData = std::uint64_t{source.surfaceType} << 19;
+    Write(static_cast<std::uint8_t *>(shape) + 0x28, shapeUserData);
     auto setArray = [&](std::uint8_t *field, void *data, const std::uint32_t count) {
         Write(field, reinterpret_cast<std::uintptr_t>(data));
         Write(field + 8, count);
@@ -1952,6 +1961,11 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
     // The two event name arrays contain one empty hkStringPtr, as shipped assets do.
     const bool staticModel = useCategory == 0 && simulationCategory == 0;
     const bool glass = useCategory == 7 && simulationCategory == 9;
+    if (keyframedBody && (staticModel || glass))
+        throw std::runtime_error("Keyframed model physics needs the entity categories");
+    // Shipped KeyframedEntity assets (mp_backlot2 bike_frame_hook) keep the
+    // dynamic-entity lookups but serialize the body like a static model.
+    const bool serializedBodyPolicy = glass || staticModel || keyframedBody;
     const std::uint32_t bodyQualityNameCrc =
         staticModel ? 0xD0452309u : glass ? 0x98996C20u : 0x7923E35Cu;
     const std::uint32_t materialNameCrc = glass ? 0xF728E572u : 0x4B02BC9Du;
@@ -1996,10 +2010,10 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
     Write(body + 0x14, std::uint16_t{0});
     Write(body + 0x16, std::uint8_t{0});
     Write(body + 0x88, std::uint16_t{0});
-    if (glass || staticModel)
+    if (serializedBodyPolicy)
     {
-        // Shipped static-model and glass assets retain the body collision
-        // filter and Havok sentinel IDs in their serialized bodies.
+        // Shipped static-model, script-model and glass assets retain the body
+        // collision filter and Havok sentinel IDs in their serialized bodies.
         Write(body + 0x10, source.contents);
         Write(body + 0x14, std::uint16_t{0xFFFF});
         Write(body + 0x16, std::uint8_t{0xFF});
@@ -2027,12 +2041,16 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
     RequireCompressedMeshTriangleTree(
         reinterpret_cast<const void *>(Read<std::uintptr_t>(reinterpret_cast<void *>(loadedBodies))),
         result.name, "round trip");
+    if (Read<std::uint64_t>(reinterpret_cast<std::uint8_t *>(
+                                Read<std::uintptr_t>(reinterpret_cast<void *>(loadedBodies))) +
+                            0x28) != shapeUserData)
+        throw std::runtime_error("Native model physics round trip lost its surface type");
     const auto loadedName = Read<std::uintptr_t>(reinterpret_cast<void *>(loadedBodies + 0x18)) &
                             ~std::uintptr_t{1};
     if (!loadedName || std::memcmp(reinterpret_cast<void *>(loadedName), bodyNameData,
                                    bodyName.size() + 1) != 0)
         throw std::runtime_error("Native physics round trip lost its trace body name");
-    if (glass || staticModel)
+    if (serializedBodyPolicy)
     {
         const auto *loadedBody = reinterpret_cast<const std::uint8_t *>(loadedBodies);
         if (Read<std::uint32_t>(loadedBody + 0x10) != source.contents ||
@@ -2195,9 +2213,10 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
         throw std::runtime_error(
             "Native model physics did not use Replay's compact type-compendium format");
 
-    zt::info("collision: baked native PhysicsAsset '%s' (%zu vertices, %zu triangles, %zu bytes)",
+    zt::info("collision: baked native PhysicsAsset '%s' (%zu vertices, %zu triangles, surface "
+             "%u, %zu bytes)",
              result.name.c_str(), mesh.vertices.size(), mesh.triangles.size(),
-             result.havokData.size());
+             source.surfaceType, result.havokData.size());
     return result;
 }
 

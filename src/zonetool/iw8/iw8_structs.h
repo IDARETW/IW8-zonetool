@@ -21,7 +21,8 @@ enum IW8_XAssetType : int32_t
     ASSET_TYPE_PIXELSHADER = 17,
     ASSET_TYPE_TECHSET = 18,
     ASSET_TYPE_IMAGE = 19, // <- focus
-    ASSET_TYPE_SOUNDBANK = 21,
+    ASSET_TYPE_SOUNDBANK = 21, // SndBankResident
+    ASSET_TYPE_SOUNDBANK_TRANSIENT = 22,
     ASSET_TYPE_COL_MAP = 23,   // clipMap_t          <- focus (maps)
     ASSET_TYPE_COM_MAP = 24,   // ComWorld
     ASSET_TYPE_GLASS_MAP = 25, // GlassWorld
@@ -47,6 +48,7 @@ enum IW8_XAssetType : int32_t
     ASSET_TYPE_STRINGTABLE = 54,
     ASSET_TYPE_NET_CONST_STRINGS = 61,
     ASSET_TYPE_LUAFILE = 62,
+    ASSET_TYPE_STREAMKEY = 102,
     ASSET_TYPE_DECAL_VOLUME_MATERIAL = 111,
     ASSET_TYPE_DYNENTITYLIST = 113,
     ASSET_TYPE_EDGELIST = 116,
@@ -119,6 +121,12 @@ inline const char *type_name(int t)
         return "gfx_map";
     case ASSET_TYPE_LIGHTDEF:
         return "lightdef";
+    case ASSET_TYPE_GRADINGCLUT:
+        return "gradingclut";
+    case ASSET_TYPE_SOUNDBANK:
+        return "soundbank";
+    case ASSET_TYPE_STREAMKEY:
+        return "streamkey";
     case ASSET_TYPE_IMPACT_FX:
         return "impactfx";
     case ASSET_TYPE_SURFACE_FX:

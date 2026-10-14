@@ -80,6 +80,8 @@ struct PhysicsMesh
     std::vector<std::array<float, 3>> vertices;
     std::vector<std::array<std::uint32_t, 3>> triangles;
     std::uint32_t contents{1};
+    // Replay surface type (0..63) reported by bullet and footstep traces.
+    std::uint32_t surfaceType{};
 };
 
 struct PhysicsAsset
@@ -94,8 +96,11 @@ struct PhysicsAsset
 void PrepareCollisionBaker(const std::filesystem::path &replayExecutable);
 bool FindOpaqueString(std::string_view value, std::uint32_t &id);
 BakeResult BakeCollision(const BakeInput &input);
+// keyframedBody stores the body contents and sentinel motion ids in the
+// serialized body, as shipped KeyframedEntity (script model) assets do.
 PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &mesh,
                               std::uint32_t useCategory = 3,
-                              std::uint32_t simulationCategory = 1);
+                              std::uint32_t simulationCategory = 1,
+                              bool keyframedBody = false);
 
 } // namespace iw8::havok

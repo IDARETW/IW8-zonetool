@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -77,6 +78,8 @@ struct RenderPlan
 {
     std::unordered_map<std::string, MaterialPlan> materials;
     std::unordered_map<std::string, std::string> fxMaterialAliases;
+    // IW3 distortion materials; elements drawn with them are left out of effects.
+    std::set<std::string> fxDistortionMaterials;
     std::vector<LightmapRectangle> lightmaps;
     std::array<std::size_t, 6> skyTiles{};
     unsigned columns{};
@@ -112,11 +115,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot,
                                const std::vector<std::filesystem::path> &sourcePaths,
                                const std::filesystem::path &mapDirectory,
                                const std::string &map,
-                               const std::filesystem::path &cacheRoot = {});
+                               const std::filesystem::path &cacheRoot = {},
+                               const std::string &surfaceShaderDefines = {});
 
-std::string RegisterGlassUvRemap(RenderPlan &plan,
-                                 const std::filesystem::path &mapDirectory,
-                                 const std::string &map,
-                                 const std::string &material,
-                                 const std::array<float, 6> &uvAffine);
 } // namespace iw3

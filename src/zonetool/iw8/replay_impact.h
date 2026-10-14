@@ -15,6 +15,9 @@ struct EffectOverride
     std::size_t direction{};
     bool flesh{};
     std::size_t index{};
+    // Pack 0 is the primary effect; pack 1 is a second effect played with it
+    // (1730090 reads both: entry + 8 * index and entry + 696 + 8 * index).
+    std::size_t pack{};
     // An empty effect deliberately clears the corresponding source slot.
     std::string effect;
 };

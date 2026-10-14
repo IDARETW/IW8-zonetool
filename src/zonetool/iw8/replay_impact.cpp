@@ -60,7 +60,8 @@ std::string_view EffectName(const size_t impactType, const size_t direction,
     const auto overridden = std::find_if(
         overrides.begin(), overrides.end(), [&](const EffectOverride &candidate) {
             return candidate.impactType == impactType && candidate.direction == direction &&
-                   pack == 0 && candidate.flesh == flesh && candidate.index == index;
+                   candidate.pack == pack && candidate.flesh == flesh &&
+                   candidate.index == index;
         });
     if (overridden != overrides.end())
         return overridden->effect;

@@ -15,6 +15,14 @@
 #ifndef MAP_LIGHTING_ROWS
 #define MAP_LIGHTING_ROWS 84
 #endif
+#ifndef MAP_MAX_ANISO
+#define MAP_MAX_ANISO 8
+#endif
+// Slight sharpening for Replay's temporal anti-aliasing; the same value in
+// every pass keeps alpha-tested coverage identical between depth and colour.
+#ifndef MAP_COLOR_LOD_BIAS
+#define MAP_COLOR_LOD_BIAS -0.5
+#endif
 struct Input {
     float4 position : SV_POSITION;
     float4 uv : TEXCOORDS0;
@@ -146,13 +154,6 @@ float4 main(Input input) : SV_TARGET0 {
     uint kind = flags % 4;
     bool sky = kind == 1;
     float2 mappedUv = input.uv.xy;
-#ifdef MAP_GLASS_UV_REMAP
-    // FxGlassDef has one UV basis for both intact and shattered materials.
-    // A linked IW3 shattered brush may use another affine mapping.
-    if (kind == 2)
-        mappedUv = float2(dot(input.uv.xy, MAP_GLASS_ROW0),
-                          dot(input.uv.xy, MAP_GLASS_ROW1)) + MAP_GLASS_OFFSET;
-#endif
     float2 local = sky ? saturate(mappedUv) : frac(mappedUv);
 #ifdef STATIC_MODEL
     // Replay's shipped static-model shaders use the material sampler, screen
@@ -167,14 +168,40 @@ float4 main(Input input) : SV_TARGET0 {
     float4 texel = sourceAtlas.SampleBias(colorSampler, sampleUV, MAP_MIP_BIAS);
 #else
     float2 cellSize = ATLAS_SIZE.0 / ATLAS_COLUMNS;
+    float2 tileOrigin = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize;
+    float maxLod = log2(cellSize.x) - 2;
     // Derivatives must use the continuous UV, before frac introduces tile seams.
-    float footprint = max(length(ddx(mappedUv) * cellSize), length(ddy(mappedUv) * cellSize));
-    float lod = sky ? 0 : clamp(log2(max(1.0, footprint)), 0, log2(cellSize.x) - 2);
+    float2 uvDx = ddx(mappedUv);
+    float2 uvDy = ddy(mappedUv);
+    float lengthX = length(uvDx * cellSize);
+    float lengthY = length(uvDy * cellSize);
+    float footprint = max(lengthX, lengthY);
+    // Isotropic level for the normal and response channels.
+    float lod = sky ? 0 : clamp(log2(max(1.0, footprint)), 0, maxLod);
     float border = .5 * exp2(ceil(lod));
-    float2 pixel = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize +
-                   clamp(.5 + local * (cellSize - 1), border, cellSize - border);
+    float2 pixel = tileOrigin + clamp(.5 + local * (cellSize - 1), border, cellSize - border);
     float2 sampleUV = pixel / ATLAS_SIZE.0;
-    float4 texel = sourceAtlas.SampleLevel(colorSampler, sampleUV, lod);
+    // Colour uses anisotropic filtering, as IW3 did: the minor axis of the
+    // screen footprint picks the mip and taps spread along the major axis.
+    // Hardware anisotropy would read neighbouring atlas tiles, so every tap
+    // wraps and clamps inside this material's tile. Ground seen at a grazing
+    // angle otherwise drops to a mip that is several levels too blurry.
+    float ratio = sky ? 1 : clamp(footprint / max(min(lengthX, lengthY), 1e-6), 1, MAP_MAX_ANISO);
+    float colorLod = sky ? 0 : clamp(log2(max(1.0, footprint / ratio)) + MAP_COLOR_LOD_BIAS,
+                                     0, maxLod);
+    float colorBorder = .5 * exp2(ceil(colorLod));
+    uint taps = (uint)ceil(ratio - .01);
+    float2 axis = lengthX >= lengthY ? uvDx : uvDy;
+    float4 texel = 0;
+    for (uint tap = 0; tap < taps; ++tap)
+    {
+        float2 tapUv = mappedUv + axis * ((tap + .5) / taps - .5);
+        float2 tapLocal = sky ? saturate(tapUv) : frac(tapUv);
+        float2 tapPixel = tileOrigin +
+                          clamp(.5 + tapLocal * (cellSize - 1), colorBorder, cellSize - colorBorder);
+        texel += sourceAtlas.SampleLevel(colorSampler, tapPixel / ATLAS_SIZE.0, colorLod);
+    }
+    texel /= taps;
 #endif
     texel *= input.color;
     uint alphaTest = (flags >> 3) & 3;
@@ -291,6 +318,18 @@ float4 main(Input input) : SV_TARGET0 {
         float coverage = saturate(alpha + reflectivity * (1 - alpha));
         color = (color * alpha + environment * reflectivity * (1 - alpha)) / max(coverage, 1e-3);
         alpha = coverage;
+    }
+#endif
+#if defined(MAP_FOG) && MAP_DEBUG_MODE == 0
+    // IW3 setExpFog: saturate(exp(-density * (distance - start))), with density
+    // ln2 / halfway, blended toward the fog colour in CoD4's gamma-encoded
+    // framebuffer. The sky is not fogged in IW3.
+    if (!sky)
+    {
+        float fogFactor = saturate(exp(-MAP_FOG_DENSITY *
+                                       (length(input.relativePosition) - MAP_FOG_START)));
+        float3 encoded = pow(max(color, 0), 1.0 / 2.2);
+        color = pow(lerp(MAP_FOG_COLOR, encoded, fogFactor), 2.2);
     }
 #endif
     return float4(min(color * replayLighting[42].x, 32255.0), alpha);

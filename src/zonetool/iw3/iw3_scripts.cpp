@@ -51,21 +51,39 @@ std::string CompatText()
 }
 
 // IW3 builtins whose IW8 counterparts exist but must not run with IW3 data
-// (sound aliases, renderer dvars, fog/vision/ambience owned by the converter
-// or the Replay gametype), plus IW3-only builtins.
+// (renderer dvars, fog/vision/ambience owned by the converter or the Replay
+// gametype), plus IW3-only builtins.
 const std::set<std::string> &DroppedBuiltins()
 {
     static const std::set<std::string> names{
         "ambientplay",        "ambientstop",       "setexpfog",          "setculldist",
         "visionsetnaked",     "visionsetnight",    "setdvar",            "setsaveddvar",
-        "makedvarserverinfo", "setsunlight",       "resetsunlight",      "playsound",
-        "playloopsound",      "stoploopsound",     "playsoundatpos",     "playsoundinspace",
-        "playsoundasmaster",  "soundexists",       "precacheshader",     "precachestring",
-        "precacheitem",       "precacherumble",    "precacheturret",     "precachevehicle",
-        "precachemenu",       "precacheheadicon",  "precachestatusicon", "setmapcenter",
-        "setteamradar",       "logstring",         "println",            "setclientnamemode",
+        "makedvarserverinfo", "setsunlight",       "resetsunlight",      "precacheshader",
+        "precachestring",     "precacheitem",      "precacherumble",     "precacheturret",
+        "precachevehicle",    "precachemenu",      "precacheheadicon",   "precachestatusicon",
+        "setmapcenter",       "setteamradar",      "logstring",          "println",
+        "setclientnamemode",
     };
     return names;
+}
+
+// IW3 sound builtins play through the compatibility layer, which only passes
+// aliases the converter built (level.mw120r_sounds): Replay raises a script
+// error for an unknown alias, for playsound on a looping alias and for
+// playloopsound on a one-shot.
+std::string CompatBuiltin(const std::string &name)
+{
+    static const std::map<std::string, std::string> names{
+        {"playsound", "iw3compat_playsound"},
+        {"playsoundasmaster", "iw3compat_playsound"},
+        {"playloopsound", "iw3compat_playloopsound"},
+        {"stoploopsound", "iw3compat_stoploopsound"},
+        {"playsoundatpos", "iw3compat_playsoundatpos"},
+        {"playsoundinspace", "iw3compat_playsoundinspace"},
+        {"soundexists", "iw3compat_soundexists"},
+    };
+    const auto found = names.find(name);
+    return found != names.end() ? found->second : std::string{};
 }
 
 // Functions IW3 maps call in its common scripts.
@@ -75,6 +93,8 @@ std::string CommonFunction(const std::string &file, const std::string &name)
         return "iw3compat_load_main";
     if (file == "maps/mp/_utility" && name == "exploder")
         return "iw3compat_exploder";
+    if (file == "maps/mp/_utility" && name == "playsoundinspace")
+        return "iw3compat_playsoundinspace";
     return {};
 }
 
@@ -419,6 +439,8 @@ class Translator
             if (auto common = CommonFunction(include, name); !common.empty())
                 return common;
         }
+        if (auto compat = CompatBuiltin(name); !compat.empty())
+            return compat;
         if (DroppedBuiltins().contains(name))
         {
             Note("IW3 builtin " + name + " dropped");

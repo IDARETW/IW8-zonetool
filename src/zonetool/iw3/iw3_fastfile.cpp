@@ -2,6 +2,8 @@
 #include "iw3_lightgrid.h"
 #include "iw3_render_assets.h"
 #include "iw3_scripts.h"
+#include "iw3_sound.h"
+#include "iw3_vision.h"
 
 #include "../convert/maps_convert.h"
 #include "../convert/xsurface_convert.h"
@@ -16,6 +18,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cfloat>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -31,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 
 namespace iw3
@@ -62,6 +67,8 @@ struct Surface
     std::uint32_t visibilityGroup{UINT32_MAX};
     std::vector<Vertex> vertices;
     std::vector<std::uint32_t> indices;
+    // Source bone per vertex for skinned entity models (empty: one root bone).
+    std::vector<std::uint8_t> vertexBones;
 };
 
 struct BrushModel
@@ -77,11 +84,23 @@ struct SourceStaticModelLod
     std::vector<Surface> surfaces;
 };
 
+// A bind-pose bone from an IW3 XMODEL_EXPORT: model-space origin and axes.
+struct SourceBone
+{
+    std::string name;
+    int parent{-1};
+    Vec3 origin{};
+    std::array<Vec3, 3> axis{};
+};
+
 struct SourceStaticModel
 {
     std::string name;
     std::size_t collisionLod{SIZE_MAX};
     std::vector<SourceStaticModelLod> lods;
+    // IW3 skeleton of a scripted model that hides, shows, or plays effects on
+    // parts by bone (destructible vehicles); empty keeps one tag_origin bone.
+    std::vector<SourceBone> bones;
 };
 
 struct SourceStaticModelInstance
@@ -363,17 +382,24 @@ std::filesystem::path MakeScratchDirectory(const std::filesystem::path &scratchR
 void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &options,
                  const std::filesystem::path &output,
                  const std::filesystem::path &sourceFastfile = {},
-                 const bool supplementalAssets = false)
+                 const bool supplementalAssets = false, const bool skeletons = false)
 {
     std::vector<std::wstring> arguments{unlinker.wstring(),
                                         L"--no-color",
                                         L"--image-format",
                                         L"DDS",
                                         L"--model-format",
-                                        L"OBJ",
+                                        skeletons ? L"XMODEL_EXPORT" : L"OBJ",
                                         L"-o",
                                         output.wstring()};
-    if (supplementalAssets)
+    if (skeletons)
+    {
+        // XMODEL_EXPORT keeps the bind skeleton and each vertex's bone, which
+        // the OBJ extraction drops.
+        arguments.push_back(L"--include-assets");
+        arguments.push_back(L"xmodel");
+    }
+    else if (supplementalAssets)
     {
         arguments.push_back(L"--include-assets");
         arguments.push_back(L"xmodel,material,image,fx,impactfx");
@@ -416,7 +442,8 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
     const auto loadFastfile =
         inputFastfile.parent_path() / (inputFastfile.stem().wstring() + L"_load.ff");
     std::error_code error;
-    if (!supplementalAssets && std::filesystem::is_regular_file(loadFastfile, error))
+    if (!supplementalAssets && !skeletons &&
+        std::filesystem::is_regular_file(loadFastfile, error))
     {
         arguments.push_back(std::filesystem::absolute(loadFastfile).wstring());
     }
@@ -431,8 +458,9 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
         commandLine += Quote(argument);
     }
 
-    const auto logPath =
-        output / (supplementalAssets ? "unlinker-supplemental.log" : "unlinker.log");
+    const auto logPath = output / (skeletons            ? "unlinker-skeleton.log"
+                                   : supplementalAssets ? "unlinker-supplemental.log"
+                                                        : "unlinker.log");
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
     HANDLE log = CreateFileW(logPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &security,
                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -457,7 +485,7 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
         throw std::runtime_error("cannot start OpenAssetTools Unlinker");
     }
 
-    const DWORD timeoutMinutes = supplementalAssets ? 30u : 10u;
+    const DWORD timeoutMinutes = supplementalAssets || skeletons ? 30u : 10u;
     const DWORD wait = WaitForSingleObject(process.hProcess, timeoutMinutes * 60u * 1000u);
     DWORD exitCode = 1;
     if (wait == WAIT_TIMEOUT)
@@ -1173,6 +1201,58 @@ std::vector<PreparedFx> ReadPreparedFx(const std::filesystem::path &root)
     return effects;
 }
 
+// Placeholder for an IW3 effect name in translated GSC; replaced with the
+// converted Replay VFX (or a stock stand-in) once effects are converted.
+constexpr std::string_view kScriptEffectMarker = "@mw120r_iw3fx@";
+
+// IW3 maps\mp\_destructible_types vehicle sounds: the fire state's flare-up and
+// burning loop, and the explosion (its secondaries chain the close, boom and
+// debris layers). IW3 MP has no alias for the glass and tire sounds.
+constexpr const char *kIw3VehicleDestructibleSounds[] = {
+    "fire_vehicle_flareup_med", "fire_vehicle_med", "car_explode", "veh_glass_break_large",
+    "veh_glass_break_small"};
+
+// IW3 maps\mp\_destructible_types vehicle effects (sedan, wagon, hatchback, ...).
+constexpr const char *kIw3VehicleDestructibleEffects[] = {
+    "smoke/car_damage_whitesmoke",    "smoke/car_damage_blacksmoke",
+    "smoke/car_damage_blacksmoke_fire", "explosions/small_vehicle_explosion",
+    "props/car_glass_large",          "props/car_glass_med",
+    "props/car_glass_headlight",      "props/car_glass_brakelight",
+};
+
+// IW3 effects the compatibility layer plays for TVs and destructable pieces in
+// place of stock stand-ins (converted with the map's impact effects).
+constexpr const char *kIw3CompatPropEffects[] = {"impacts/small_glass",
+                                                 "impacts/small_metalhit_1"};
+
+// loadfx( "name" ) literals in the map's own IW3 scripts.
+std::set<std::string> ReadScriptEffectNames(const std::filesystem::path &scriptDirectory)
+{
+    std::set<std::string> names;
+    std::error_code error;
+    if (!std::filesystem::is_directory(scriptDirectory, error))
+        return names;
+    static const std::regex call(R"re(\bloadfx\s*\(\s*"([^"]+)"\s*\))re", std::regex::icase);
+    for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory, error))
+    {
+        if (entry.path().extension() != ".gsc")
+            continue;
+        std::string text;
+        if (!zt::read_file_str(entry.path().string(), text))
+            continue;
+        for (auto match = std::sregex_iterator(text.begin(), text.end(), call);
+             match != std::sregex_iterator(); ++match)
+        {
+            std::string name = (*match)[1].str();
+            std::replace(name.begin(), name.end(), '\\', '/');
+            std::transform(name.begin(), name.end(), name.begin(),
+                           [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            names.insert(name);
+        }
+    }
+    return names;
+}
+
 std::set<std::string> ReadDeclaredFx(const std::filesystem::path &zoneFile)
 {
     std::ifstream input(zoneFile);
@@ -1258,6 +1338,10 @@ std::vector<PreparedRawFile> ReadPreparedRawFiles(const std::filesystem::path &r
             ++sourceScripts;
             continue;
         }
+        // IW3 vision text (r_film*, r_glow*) is not Replay's 218-field vision
+        // format; PrepareFastfile emits a converted vision file instead.
+        if (std::filesystem::path(name).extension() == ".vision")
+            continue;
         PreparedRawFile rawFile;
         rawFile.name = name;
         if (!zt::read_file((root / std::filesystem::path(name)).string(), rawFile.data))
@@ -1785,8 +1869,242 @@ float ReplayLodDistance(const float distance)
                                                      kReplayNeverCulled);
 }
 
+// One LOD of an OpenAssetTools XMODEL_EXPORT (version 6): the model's bind
+// skeleton and, per object (one per source XSurface, in order), each
+// triangle's corners as model-space position and dominant bone.
+struct SourceSkeletonLod
+{
+    struct Corner
+    {
+        Vec3 position{};
+        std::uint8_t bone{};
+    };
+    std::vector<SourceBone> bones;
+    std::vector<std::vector<std::array<Corner, 3>>> objects;
+};
+
+SourceSkeletonLod ReadXModelExport(const std::filesystem::path &path)
+{
+    std::ifstream stream(path);
+    if (!stream)
+        throw std::runtime_error("cannot read IW3 skeleton export " + path.string());
+    std::vector<std::string> lines;
+    for (std::string line; std::getline(stream, line);)
+    {
+        std::ranges::replace(line, ',', ' ');
+        if (line.find_first_not_of(" \t\r") != std::string::npos && !line.starts_with("//"))
+            lines.push_back(std::move(line));
+    }
+    std::size_t next = 0;
+    const auto fail = [&path](const std::string &what) {
+        return std::runtime_error("malformed IW3 skeleton export " + path.filename().string() +
+                                  ": " + what);
+    };
+    // The fields after the next line's keyword, which must be `keyword`.
+    const auto read = [&](const std::string &keyword) {
+        if (next >= lines.size())
+            throw fail("missing " + keyword);
+        std::istringstream fields(lines[next++]);
+        std::string word;
+        fields >> word;
+        if (word != keyword)
+            throw fail("expected " + keyword + ", found " + word);
+        return fields;
+    };
+    const auto seek = [&](const std::string &keyword) {
+        while (next < lines.size() && !lines[next].starts_with(keyword + ' '))
+            ++next;
+        return read(keyword);
+    };
+    const auto readCount = [&](std::istringstream fields, const std::size_t limit) {
+        std::size_t count = 0;
+        fields >> count;
+        if (!fields || count > limit)
+            throw fail("invalid count");
+        return count;
+    };
+    const auto readVector = [&](const std::string &keyword) {
+        auto fields = read(keyword);
+        Vec3 value{};
+        fields >> value[0] >> value[1] >> value[2];
+        if (!fields || !std::isfinite(value[0]) || !std::isfinite(value[1]) ||
+            !std::isfinite(value[2]))
+            throw fail("invalid " + keyword);
+        return value;
+    };
+
+    SourceSkeletonLod result;
+    const std::size_t boneCount = readCount(seek("NUMBONES"), 128);
+    if (!boneCount)
+        throw fail("no bones");
+    result.bones.resize(boneCount);
+    for (std::size_t index = 0; index < boneCount; ++index)
+    {
+        auto fields = read("BONE");
+        std::size_t number = 0;
+        int parent = 0;
+        std::string name;
+        fields >> number >> parent >> std::quoted(name);
+        // Single-bone exports name their bone "".
+        if (!fields || number != index || parent < -1 || parent >= static_cast<int>(index))
+            throw fail("invalid bone " + std::to_string(index));
+        result.bones[index].name = std::move(name);
+        result.bones[index].parent = parent;
+    }
+    for (std::size_t index = 0; index < boneCount; ++index)
+    {
+        if (readCount(read("BONE"), boneCount) != index)
+            throw fail("bone poses out of order");
+        SourceBone &bone = result.bones[index];
+        bone.origin = readVector("OFFSET");
+        const Vec3 scale = readVector("SCALE");
+        if (std::abs(scale[0] - 1.0f) > 1.0e-3f || std::abs(scale[1] - 1.0f) > 1.0e-3f ||
+            std::abs(scale[2] - 1.0f) > 1.0e-3f)
+            throw fail("scaled bone " + bone.name);
+        bone.axis[0] = readVector("X");
+        bone.axis[1] = readVector("Y");
+        bone.axis[2] = readVector("Z");
+    }
+
+    const std::size_t vertexCount = readCount(seek("NUMVERTS"), 1u << 24);
+    std::vector<SourceSkeletonLod::Corner> vertices(vertexCount);
+    for (std::size_t index = 0; index < vertexCount; ++index)
+    {
+        if (readCount(read("VERT"), vertexCount) != index)
+            throw fail("vertices out of order");
+        vertices[index].position = readVector("OFFSET");
+        const std::size_t weights = readCount(read("BONES"), 16);
+        if (!weights)
+            throw fail("unweighted vertex");
+        float strongest = -1.0f;
+        for (std::size_t weight = 0; weight < weights; ++weight)
+        {
+            auto fields = read("BONE");
+            std::size_t bone = 0;
+            float value = 0.0f;
+            fields >> bone >> value;
+            if (!fields || bone >= boneCount || !std::isfinite(value))
+                throw fail("invalid vertex weight");
+            if (value > strongest)
+            {
+                strongest = value;
+                vertices[index].bone = static_cast<std::uint8_t>(bone);
+            }
+        }
+    }
+
+    const std::size_t faceCount = readCount(seek("NUMFACES"), 1u << 24);
+    for (std::size_t face = 0; face < faceCount; ++face)
+    {
+        auto fields = read("TRI");
+        std::size_t object = 0;
+        fields >> object;
+        if (!fields || object > UINT16_MAX)
+            throw fail("invalid face object");
+        if (result.objects.size() <= object)
+            result.objects.resize(object + 1);
+        std::array<SourceSkeletonLod::Corner, 3> triangle{};
+        for (auto &corner : triangle)
+        {
+            const std::size_t vertex = readCount(read("VERT"), vertexCount);
+            if (vertex >= vertexCount)
+                throw fail("face references a missing vertex");
+            corner = vertices[vertex];
+            read("NORMAL");
+            read("COLOR");
+            read("UV");
+        }
+        result.objects[object].push_back(triangle);
+    }
+    return result;
+}
+
+// Every LOD of `modelName` from the skeleton export, when the model has more
+// than one bone. Without an export the model keeps a single root bone.
+std::vector<SourceSkeletonLod> ReadSourceSkeleton(const std::filesystem::path &skeletonRoot,
+                                                  const std::string &modelName,
+                                                  const std::size_t lodCount)
+{
+    if (skeletonRoot.empty())
+        return {};
+    std::error_code error;
+    const auto modelPath =
+        SafeChild(skeletonRoot, std::filesystem::path("xmodel") / (modelName + ".json"));
+    if (!std::filesystem::is_regular_file(modelPath, error))
+    {
+        zt::warn("iw3: no skeleton export for entity model %s; it keeps one bone",
+                 modelName.c_str());
+        return {};
+    }
+    const Json model = ReadJson(modelPath);
+    if (!model.contains("lods") || !model.at("lods").is_array() ||
+        model.at("lods").size() != lodCount)
+        throw std::runtime_error("IW3 skeleton export does not match the model LODs: " +
+                                 modelName);
+    std::vector<SourceSkeletonLod> lods;
+    for (const auto &lod : model.at("lods"))
+        lods.push_back(ReadXModelExport(
+            SafeChild(skeletonRoot, std::filesystem::path(lod.at("file").get<std::string>()))));
+    if (lods.front().bones.size() < 2)
+        return {};
+    for (const auto &bone : lods.front().bones)
+        if (bone.name.empty())
+            throw std::runtime_error("IW3 skeleton export has an unnamed bone: " + modelName);
+    for (const auto &lod : lods)
+    {
+        const bool same = std::ranges::equal(
+            lod.bones, lods.front().bones, [](const SourceBone &a, const SourceBone &b) {
+                return a.name == b.name && a.parent == b.parent;
+            });
+        if (!same)
+            throw std::runtime_error("IW3 model LODs have different skeletons: " + modelName);
+    }
+    return lods;
+}
+
+// Gives each vertex of source surface `object` its IW3 bone. OpenAssetTools
+// writes one object per XSurface with that surface's triangles in order, so
+// triangle t is face t of the object; corners match by position because the
+// export merges vertices that share a position and weights.
+bool AssignSourceBones(const SourceSkeletonLod &skeleton, const std::size_t object,
+                       Surface &surface)
+{
+    if (object >= skeleton.objects.size())
+        return false;
+    const auto &triangles = skeleton.objects[object];
+    if (triangles.empty() || triangles.size() * 3 != surface.indices.size())
+        return false;
+    constexpr std::uint8_t unassigned = UINT8_MAX;
+    surface.vertexBones.assign(surface.vertices.size(), unassigned);
+    for (std::size_t triangle = 0; triangle < triangles.size(); ++triangle)
+        for (std::size_t corner = 0; corner < 3; ++corner)
+        {
+            const auto index = surface.indices[triangle * 3 + corner];
+            if (index >= surface.vertices.size())
+                return false;
+            const Vec3 &position = surface.vertices[index].position;
+            const auto match =
+                std::ranges::find_if(triangles[triangle], [&position](const auto &source) {
+                    return std::abs(source.position[0] - position[0]) < 1.0e-3f &&
+                           std::abs(source.position[1] - position[1]) < 1.0e-3f &&
+                           std::abs(source.position[2] - position[2]) < 1.0e-3f;
+                });
+            if (match == triangles[triangle].end())
+                return false;
+            if (surface.vertexBones[index] == unassigned)
+                surface.vertexBones[index] = match->bone;
+        }
+    // Vertices no triangle uses follow the surface's first bone.
+    const std::uint8_t fallback = surface.vertexBones[surface.indices.front()];
+    for (auto &bone : surface.vertexBones)
+        if (bone == unassigned)
+            bone = fallback;
+    return true;
+}
+
 SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::string &modelName,
-                                  const bool placedStaticBindPose = false)
+                                  const bool placedStaticBindPose = false,
+                                  const std::filesystem::path &skeletonRoot = {})
 {
     const auto modelPath = SafeChild(root, std::filesystem::path("xmodel") / (modelName + ".json"));
     const Json model = ReadJson(modelPath);
@@ -1814,6 +2132,9 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
     if (geometry.value("schema", 0) != 1 || geometry.at("name") != modelName ||
         !geometry.at("lods").is_array() || geometry.at("lods").size() != model.at("lods").size())
         throw std::runtime_error("IW3 model geometry does not match its LOD table: " + modelName);
+    const auto skeleton = ReadSourceSkeleton(skeletonRoot, modelName, model.at("lods").size());
+    if (!skeleton.empty())
+        converted.bones = skeleton.front().bones;
     float previousDistance = 0.0f;
     for (const auto &sourceLod : model.at("lods"))
     {
@@ -1826,8 +2147,10 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
         if (geometryLod.at("distance").get<float>() != lod.distance ||
             !geometryLod.at("surfaces").is_array() || geometryLod.at("surfaces").empty())
             throw std::runtime_error("IW3 model has an empty render LOD: " + modelName);
+        std::size_t sourceObject = 0;
         for (const auto &sourceSurface : geometryLod.at("surfaces"))
         {
+            const std::size_t object = sourceObject++;
             // OAT's IW3 model exporter writes verts0.xyz directly. Its GLTF bind
             // pose uses each baseMat and its inverse, so a placed static model's
             // deformed vertices have these exact model-space positions at rest.
@@ -1835,9 +2158,16 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
                 throw std::runtime_error("IW3 placed model requires skinning: " + modelName);
             Surface surface = ReadWorldSurface(sourceSurface);
             // IW3 destructible base models hold every damage state and hide the
-            // damaged ones per bone; the converted models have one bone, so keep
-            // only the intact state (shattered glass, burnt panels removed).
-            if (modelName.find("_destructible") != std::string::npos)
+            // damaged ones per bone. With the source skeleton every state stays
+            // (scripts hide and show the parts); a one-bone conversion keeps only
+            // the intact state (shattered glass, burnt panels removed).
+            if (!converted.bones.empty())
+            {
+                if (!AssignSourceBones(skeleton[converted.lods.size()], object, surface))
+                    throw std::runtime_error(
+                        "IW3 model skeleton export does not match its geometry: " + modelName);
+            }
+            else if (modelName.find("_destructible") != std::string::npos)
             {
                 const std::string material = Lowercase(surface.material);
                 if (material.find("shattered") != std::string::npos ||
@@ -2700,6 +3030,82 @@ Vec4 QuaternionFromBasis(const Vec3 &x, const Vec3 &y, const Vec3 &z)
     return quaternion;
 }
 
+Vec4 QuaternionMultiply(const Vec4 &a, const Vec4 &b)
+{
+    return {a[3] * b[0] + a[0] * b[3] + a[1] * b[2] - a[2] * b[1],
+            a[3] * b[1] - a[0] * b[2] + a[1] * b[3] + a[2] * b[0],
+            a[3] * b[2] + a[0] * b[1] - a[1] * b[0] + a[2] * b[3],
+            a[3] * b[3] - a[0] * b[0] - a[1] * b[1] - a[2] * b[2]};
+}
+
+Vec4 QuaternionConjugate(const Vec4 &quaternion)
+{
+    return {-quaternion[0], -quaternion[1], -quaternion[2], quaternion[3]};
+}
+
+Vec3 QuaternionRotate(const Vec4 &quaternion, const Vec3 &value)
+{
+    const Vec3 axis{quaternion[0], quaternion[1], quaternion[2]};
+    const Vec3 twice = Multiply(Cross(axis, value), 2.0f);
+    return Add(Add(value, Multiply(twice, quaternion[3])), Cross(axis, twice));
+}
+
+// IW8 keeps each bone's world bind pose in baseMat and every child bone
+// relative to its parent: world = parent * local, with the local translation in
+// the parent's frame (checked against shipped multi-bone XModels).
+void SetSourceSkeleton(const std::vector<SourceBone> &bones,
+                       convert::xmodel::Iw8XModelRecord &model)
+{
+    std::size_t roots = 0;
+    while (roots < bones.size() && bones[roots].parent < 0)
+        ++roots;
+    if (!roots || bones.size() > 128)
+        throw std::runtime_error("IW3 skeleton has an unsupported bone layout");
+    for (std::size_t index = roots; index < bones.size(); ++index)
+        if (bones[index].parent < 0 || bones[index].parent >= static_cast<int>(index))
+            throw std::runtime_error("IW3 skeleton bones are not ordered after their parents");
+    model.numBones = static_cast<std::uint8_t>(bones.size());
+    model.numRootBones = static_cast<std::uint8_t>(roots);
+    model.boneNames.clear();
+    model.skeleton = {};
+    std::vector<Vec4> world(bones.size());
+    for (std::size_t index = 0; index < bones.size(); ++index)
+    {
+        const SourceBone &bone = bones[index];
+        Vec4 rotation =
+            QuaternionFromBasis(Unit(bone.axis[0]), Unit(bone.axis[1]), Unit(bone.axis[2]));
+        const float length = std::sqrt(std::inner_product(rotation.begin(), rotation.end(),
+                                                          rotation.begin(), 0.0f));
+        if (!std::isfinite(length) || length < 0.5f)
+            throw std::runtime_error("IW3 skeleton has an invalid bone basis: " + bone.name);
+        const float sign = rotation[3] < 0.0f ? -1.0f : 1.0f;
+        for (float &component : rotation)
+            component *= sign / length;
+        world[index] = rotation;
+        model.boneNames.push_back(bone.name);
+        model.skeleton.partClassification.push_back(0);
+        // transWeight is 2 / |quat|^2 for the unit bind rotation.
+        model.skeleton.baseMat.push_back({rotation, bone.origin, 2.0f});
+        if (index < roots)
+            continue;
+        const auto parent = static_cast<std::size_t>(bone.parent);
+        const Vec4 inverseParent = QuaternionConjugate(world[parent]);
+        Vec4 local = QuaternionMultiply(inverseParent, rotation);
+        if (local[3] < 0.0f)
+            for (float &component : local)
+                component = -component;
+        std::array<std::int16_t, 4> packed{};
+        for (std::size_t component = 0; component < 4; ++component)
+            packed[component] = static_cast<std::int16_t>(
+                std::clamp(std::lround(local[component] * 32767.0f), -32767l, 32767l));
+        model.skeleton.parentList.push_back(static_cast<std::uint8_t>(index - parent));
+        model.skeleton.quats.push_back(packed);
+        model.skeleton.trans.push_back(
+            QuaternionRotate(inverseParent, Subtract(bone.origin, bones[parent].origin)));
+    }
+    model.skeleton.boneInfo.assign(bones.size(), {});
+}
+
 std::uint32_t PackIw3UnitVector(const Vec3 &source)
 {
     const Vec3 value = Unit(source);
@@ -2713,13 +3119,16 @@ std::uint32_t PackIw3UnitVector(const Vec3 &source)
     return packed | 0x7F000000u;
 }
 
+unsigned NativeSurfaceMaterial(std::uint32_t sourceBits);
+
 void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPlan &plan,
                                const std::string &map, const std::string &assetPrefix,
                                std::vector<PreparedXModel> &xmodels,
                                replayrender::StaticModels &staticModels, const bool nativePhysics,
                                const bool entityDraw, const bool preserveSourceNames = false,
                                std::vector<iw8::staticmodelcollision::Model> *collisionModels =
-                                   nullptr)
+                                   nullptr,
+                               const bool scriptModelPhysics = false)
 {
     constexpr std::uint32_t rootBonePartBit = 0x80000000u;
 
@@ -2734,8 +3143,21 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                                                                 "_" + std::to_string(modelIndex);
         PreparedXModel prepared;
         prepared.model.name = assetName;
-        prepared.model.numBones = 1;
-        prepared.model.numRootBones = 1;
+        const bool skinned = sourceModel.bones.size() > 1;
+        if (skinned)
+            SetSourceSkeleton(sourceModel.bones, prepared.model);
+        else
+        {
+            prepared.model.numBones = 1;
+            prepared.model.numRootBones = 1;
+            prepared.model.boneNames = {"tag_origin"};
+            prepared.model.skeleton.partClassification = {0};
+            // DObjAnimMat.transWeight is 2 / |quat|^2; shipped identity bind poses store 2.
+            prepared.model.skeleton.baseMat = {{{0, 0, 0, 1}, {0, 0, 0}, 2}};
+        }
+        // Bind-space bounds of each bone's LOD0 vertices (skinned models).
+        std::vector<replaybounds::Accumulator> boneBounds(skinned ? sourceModel.bones.size() : 0);
+        std::vector<bool> boneUsed(boneBounds.size());
         prepared.model.collLod = sourceModel.collisionLod == SIZE_MAX
                                      ? UINT8_MAX
                                      : static_cast<std::uint8_t>(sourceModel.collisionLod);
@@ -2743,10 +3165,6 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
         prepared.model.flags = 0;
         prepared.model.contents = 1;
         prepared.model.scale = 1.0f;
-        prepared.model.boneNames = {"tag_origin"};
-        prepared.model.skeleton.partClassification = {0};
-        // DObjAnimMat.transWeight is 2 / |quat|^2; shipped identity bind poses store 2.
-        prepared.model.skeleton.baseMat = {{{0, 0, 0, 1}, {0, 0, 0}, 2}};
 
         replayrender::StaticModel staticModel;
         staticModel.name = assetName;
@@ -2758,7 +3176,8 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             dumpsrc::XseFile xse;
             xse.loaded = true;
             xse.name = assetName + "_lod" + std::to_string(lodIndex);
-            xse.modelSurfPartBits[0] = rootBonePartBit;
+            if (!skinned)
+                xse.modelSurfPartBits[0] = rootBonePartBit;
             std::vector<const MaterialPlan *> surfaceMaterials;
             for (const Surface &surface : sourceLod.surfaces)
             {
@@ -2788,13 +3207,42 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                                              sourceModel.name);
                 }
 
+                for (const std::uint32_t index : renderSurface->indices)
+                    if (index >= renderSurface->vertices.size())
+                        throw std::runtime_error(
+                            "IW3 static-model triangle references a missing vertex");
+                if (skinned && renderSurface->vertexBones.size() != renderSurface->vertices.size())
+                    throw std::runtime_error("IW3 skinned model surface lacks vertex bones: " +
+                                             sourceModel.name);
+                const auto boneOf = [&](const std::uint32_t vertex) -> std::uint8_t {
+                    return skinned ? renderSurface->vertexBones[vertex] : std::uint8_t{0};
+                };
+                // Rigid runs need each bone's vertices contiguous, so order the
+                // vertices and triangles by bone (a triangle follows its first vertex).
+                std::vector<std::uint32_t> vertexOrder(renderSurface->vertices.size());
+                std::iota(vertexOrder.begin(), vertexOrder.end(), 0u);
+                std::vector<std::size_t> triangleOrder(renderSurface->indices.size() / 3);
+                std::iota(triangleOrder.begin(), triangleOrder.end(), std::size_t{0});
+                if (skinned)
+                {
+                    std::ranges::stable_sort(vertexOrder, {}, boneOf);
+                    std::ranges::stable_sort(triangleOrder, {}, [&](const std::size_t triangle) {
+                        return boneOf(renderSurface->indices[triangle * 3]);
+                    });
+                }
+                std::vector<std::uint32_t> remap(vertexOrder.size());
+                for (std::size_t position = 0; position < vertexOrder.size(); ++position)
+                    remap[vertexOrder[position]] = static_cast<std::uint32_t>(position);
+
                 dumpsrc::XseSurface converted;
-                converted.partBits[0] = rootBonePartBit;
+                if (!skinned)
+                    converted.partBits[0] = rootBonePartBit;
                 converted.vertCount = static_cast<std::uint32_t>(renderSurface->vertices.size());
                 converted.triCount = static_cast<std::uint32_t>(renderSurface->indices.size() / 3);
                 converted.verticies.reserve(renderSurface->vertices.size());
-                for (const Vertex &vertex : renderSurface->vertices)
+                for (const std::uint32_t sourceVertex : vertexOrder)
                 {
+                    const Vertex &vertex = renderSurface->vertices[sourceVertex];
                     const Vec3 normal = Unit(vertex.normal);
                     Vec3 tangent =
                         Subtract(vertex.tangent, Multiply(normal, Dot(vertex.tangent, normal)));
@@ -2819,20 +3267,51 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                     output.tangent = PackIw3UnitVector(tangent);
                     converted.verticies.push_back(output);
                     if (lodIndex == 0)
+                    {
                         modelBounds.Add(vertex.position);
+                        if (skinned)
+                        {
+                            const auto &pose =
+                                prepared.model.skeleton.baseMat[boneOf(sourceVertex)];
+                            boneBounds[boneOf(sourceVertex)].Add(
+                                QuaternionRotate(QuaternionConjugate(pose.quat),
+                                                 Subtract(vertex.position, pose.trans)));
+                            boneUsed[boneOf(sourceVertex)] = true;
+                        }
+                    }
                 }
                 converted.triIndices.reserve(renderSurface->indices.size());
-                for (const std::uint32_t index : renderSurface->indices)
+                for (const std::size_t triangle : triangleOrder)
+                    for (std::size_t corner = 0; corner < 3; ++corner)
+                        converted.triIndices.push_back(static_cast<std::uint16_t>(
+                            remap[renderSurface->indices[triangle * 3 + corner]]));
+                // One rigid run per bone: the matrix offset is bone * 64.
+                for (std::size_t vertexStart = 0, triangleStart = 0;
+                     vertexStart < vertexOrder.size();)
                 {
-                    if (index >= renderSurface->vertices.size())
-                        throw std::runtime_error(
-                            "IW3 static-model triangle references a missing vertex");
-                    converted.triIndices.push_back(static_cast<std::uint16_t>(index));
+                    const std::uint8_t bone = boneOf(vertexOrder[vertexStart]);
+                    std::size_t vertexEnd = vertexStart;
+                    while (vertexEnd < vertexOrder.size() && boneOf(vertexOrder[vertexEnd]) == bone)
+                        ++vertexEnd;
+                    std::size_t triangleEnd = triangleStart;
+                    while (triangleEnd < triangleOrder.size() &&
+                           boneOf(renderSurface->indices[triangleOrder[triangleEnd] * 3]) == bone)
+                        ++triangleEnd;
+                    converted.rigidVertLists.push_back(
+                        {static_cast<std::uint16_t>(bone * 64),
+                         static_cast<std::uint16_t>(vertexEnd - vertexStart),
+                         static_cast<std::uint16_t>(triangleStart),
+                         static_cast<std::uint16_t>(triangleEnd - triangleStart)});
+                    if (skinned)
+                    {
+                        const auto bit = static_cast<std::int32_t>(0x80000000u >> (bone % 32));
+                        converted.partBits[bone / 32] |= bit;
+                        xse.modelSurfPartBits[bone / 32] |= bit;
+                    }
+                    vertexStart = vertexEnd;
+                    triangleStart = triangleEnd;
                 }
-                converted.vertListCount = 1;
-                converted.rigidVertLists.push_back(
-                    {0, static_cast<std::uint16_t>(converted.vertCount), 0,
-                     static_cast<std::uint16_t>(converted.triCount)});
+                converted.vertListCount = static_cast<std::uint32_t>(converted.rigidVertLists.size());
                 xse.surfaces.push_back(std::move(converted));
                 surfaceMaterials.push_back(&material);
             }
@@ -2897,7 +3376,8 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             lod.dist = sourceLod.distance;
             lod.numsurfs = static_cast<std::uint16_t>(converted.surfaces.size());
             lod.surfIndex = static_cast<std::uint16_t>(surfaceOffset);
-            lod.partBits[0] = rootBonePartBit;
+            for (std::size_t word = 0; word < 6; ++word)
+                lod.partBits[word] = static_cast<std::uint32_t>(xse.modelSurfPartBits[word]);
             lod.surfsName = converted.name;
             prepared.model.lods.push_back(std::move(lod));
             surfaceOffset += static_cast<std::uint32_t>(converted.surfaces.size());
@@ -2920,15 +3400,39 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
         prepared.model.radius = bounds.Radius();
         std::copy_n(bounds.midpoint.data(), 3, prepared.model.boundsMid);
         std::copy_n(bounds.halfSize.data(), 3, prepared.model.boundsHalf);
-        prepared.model.skeleton.boneInfo = {
-            {bounds.midpoint, bounds.halfSize, prepared.model.radius * prepared.model.radius}};
+        if (skinned)
+        {
+            for (std::size_t bone = 0; bone < boneBounds.size(); ++bone)
+            {
+                if (!boneUsed[bone])
+                    continue;
+                const replaybounds::Bounds local = boneBounds[bone].Finish();
+                auto &info = prepared.model.skeleton.boneInfo[bone];
+                info.midPoint = local.midpoint;
+                info.halfSize = local.halfSize;
+                // Squared distance from the bone origin to the farthest corner.
+                info.radiusSquared = 0.0f;
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                {
+                    const float extent = std::abs(local.midpoint[axis]) + local.halfSize[axis];
+                    info.radiusSquared += extent * extent;
+                }
+            }
+            zt::info("iw3: entity model %s keeps its %zu-bone IW3 skeleton",
+                     sourceModel.name.c_str(), sourceModel.bones.size());
+        }
+        else
+            prepared.model.skeleton.boneInfo = {
+                {bounds.midpoint, bounds.halfSize, prepared.model.radius * prepared.model.radius}};
         if (nativePhysics && sourceModel.collisionLod != SIZE_MAX)
         {
             iw8::havok::PhysicsMesh physics;
             // Fixed placements use Replay's static-model collision list. The
             // generic 0xB180 contents match common shipped static assets;
             // per-material contents need their own source-to-target mapping.
-            if (collisionModels)
+            // Static placements and script models use the contents of the
+            // shipped Static / KeyframedEntity assets.
+            if (collisionModels || scriptModelPhysics)
                 physics.contents = 0xB180u;
             std::map<Vec3, std::uint32_t> vertexIndices;
             const auto appendVertex = [&](const Vec3 &vertex) {
@@ -2942,23 +3446,48 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                 vertexIndices.emplace(vertex, index);
                 return index;
             };
+            // Replay carries one surface type per model mesh (shipped assets do
+            // the same); take the IW3 type covering the most collision area.
+            std::map<unsigned, float> surfaceAreas;
             for (const Surface &surface : sourceModel.lods.at(sourceModel.collisionLod).surfaces)
+            {
+                const auto material = plan.materials.find(surface.material);
+                const unsigned surfaceType =
+                    material == plan.materials.end()
+                        ? 0
+                        : NativeSurfaceMaterial(material->second.sourceSurfaceTypeBits);
                 for (std::size_t first = 0; first < surface.indices.size(); first += 3)
                 {
                     std::array<std::uint32_t, 3> triangle{};
+                    std::array<Vec3, 3> corners{};
                     for (std::size_t corner = 0; corner < triangle.size(); ++corner)
                     {
                         const auto sourceIndex = surface.indices.at(first + corner);
                         if (sourceIndex >= surface.vertices.size())
                             throw std::runtime_error(
                                 "IW3 dynamic-model physics references a missing vertex");
-                        triangle[corner] = appendVertex(surface.vertices[sourceIndex].position);
+                        corners[corner] = surface.vertices[sourceIndex].position;
+                        triangle[corner] = appendVertex(corners[corner]);
                     }
+                    // IW3 model triangles are clockwise seen from outside;
+                    // Havok fronts are counter-clockwise (see the world mesh).
+                    std::swap(triangle[1], triangle[2]);
                     physics.triangles.push_back(triangle);
+                    if (surfaceType)
+                    {
+                        const Vec3 normal = Cross(Subtract(corners[1], corners[0]),
+                                                  Subtract(corners[2], corners[0]));
+                        surfaceAreas[surfaceType] += std::sqrt(Dot(normal, normal));
+                    }
                 }
-            prepared.physicsAsset = collisionModels
-                                        ? iw8::havok::BakePhysicsAsset(assetName, physics, 0, 0)
-                                        : iw8::havok::BakePhysicsAsset(assetName, physics);
+            }
+            const auto dominant = std::ranges::max_element(
+                surfaceAreas, {}, [](const auto &entry) { return entry.second; });
+            physics.surfaceType = dominant == surfaceAreas.end() ? 0 : dominant->first;
+            prepared.physicsAsset =
+                collisionModels
+                    ? iw8::havok::BakePhysicsAsset(assetName, physics, 0, 0)
+                    : iw8::havok::BakePhysicsAsset(assetName, physics, 3, 1, scriptModelPhysics);
             prepared.model.physicsAssetName = assetName;
         }
         if (collisionModels && !prepared.model.physicsAssetName.empty())
@@ -3134,8 +3663,7 @@ std::optional<GlassFaceUv> BestGlassFaceUv(const BrushModel &model, const Render
     return best;
 }
 
-Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
-                     const std::filesystem::path &mapDirectory, const std::string &map,
+Json BuildGlassPanes(const std::vector<BrushModel> &models, const RenderPlan &plan,
                      const std::string &entityText, CollisionData &collision,
                      std::set<std::uint32_t> &glassModels,
                      std::set<std::string> &glassTargets,
@@ -3220,7 +3748,6 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
         // IW3 scripted glass commonly links its intact brush to the shattered
         // replacement by target/targetname. Follow that authored link rather
         // than assuming adjacent brush-model indices or a material name suffix.
-        std::string shatteredMaterial = paneMaterial;
         const EntityFields *shatteredEntity = nullptr;
         std::size_t shatteredModel = 0;
         if (const EntityFields *replacement = linkedBrush(entity))
@@ -3236,23 +3763,20 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
                 if (number.ec == std::errc{} && number.ptr == end &&
                     linkedIndex < models.size())
                 {
-                    std::string linkedMaterial;
-                    bool ambiguous = false;
-                    for (const Surface &surface : models[linkedIndex].surfaces)
+                    // The linked brush is the pane's broken state; its own
+                    // material is not used (Replay fractures the intact pane),
+                    // but it must leave the world. IW3 shattered textures such
+                    // as com_glass_shattered_inside_fb are not glass materials.
+                    const bool brokenGlass = std::ranges::any_of(
+                        models[linkedIndex].surfaces, [&](const Surface &surface) {
+                            const auto material = plan.materials.find(surface.material);
+                            return Lowercase(surface.material).find("shatter") !=
+                                       std::string::npos ||
+                                   (material != plan.materials.end() &&
+                                    material->second.kind == SurfaceKind::glass);
+                        });
+                    if (brokenGlass)
                     {
-                        const auto material = plan.materials.find(surface.material);
-                        if (material == plan.materials.end() ||
-                            material->second.kind != SurfaceKind::glass ||
-                            material->second.glassMaterial.empty())
-                            continue;
-                        if (!linkedMaterial.empty() &&
-                            linkedMaterial != material->second.glassMaterial)
-                            ambiguous = true;
-                        linkedMaterial = material->second.glassMaterial;
-                    }
-                    if (!ambiguous && !linkedMaterial.empty())
-                    {
-                        shatteredMaterial = linkedMaterial;
                         shatteredEntity = replacement;
                         shatteredModel = linkedIndex;
                     }
@@ -3273,68 +3797,6 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
         if (const auto found = entity.find("origin"); found != entity.end())
             entityOrigin = ParseVector(found->second);
         origin = Add(origin, entityOrigin);
-        if (shatteredEntity && shatteredMaterial != paneMaterial)
-        {
-            const auto linkedAxis = EntityAxis(*shatteredEntity);
-            Vec3 linkedOrigin{};
-            if (const auto found = shatteredEntity->find("origin");
-                found != shatteredEntity->end())
-                linkedOrigin = ParseVector(found->second);
-            const Vec3 relative = Subtract(origin, linkedOrigin);
-            const Vec3 linkedSample{Dot(relative, linkedAxis[0]), Dot(relative, linkedAxis[1]),
-                                    Dot(relative, linkedAxis[2])};
-            const BrushModel &linkedModel = models.at(shatteredModel);
-            Vec3 linkedSize{};
-            for (std::size_t dimension = 0; dimension < 3; ++dimension)
-                linkedSize[dimension] = linkedModel.maximum[dimension] -
-                                        linkedModel.minimum[dimension];
-            const std::size_t linkedThin = static_cast<std::size_t>(
-                std::min_element(linkedSize.begin(), linkedSize.end()) - linkedSize.begin());
-            std::array<std::size_t, 2> linkedPlane{};
-            std::size_t linkedPlaneIndex = 0;
-            for (std::size_t dimension = 0; dimension < 3; ++dimension)
-                if (dimension != linkedThin)
-                    linkedPlane[linkedPlaneIndex++] = dimension;
-            const auto linkedFace = BestGlassFaceUv(linkedModel, plan, linkedPlane,
-                                                     linkedSample, false, shatteredMaterial);
-            if (!linkedFace)
-                throw std::runtime_error("linked IW3 shattered glass has no textured face");
-            const auto paneGradient = intactFace->gradient;
-            const float determinant = paneGradient[0] * paneGradient[3] -
-                                      paneGradient[1] * paneGradient[2];
-            if (std::abs(determinant) < 1.0e-10f)
-                throw std::runtime_error("IW3 glass pane UV basis cannot be inverted");
-            const auto linkedGradient = [&](const std::size_t channel,
-                                            const Vec3 &direction) {
-                return linkedFace->gradient[channel * 2] *
-                           Dot(direction, linkedAxis[linkedPlane[0]]) +
-                       linkedFace->gradient[channel * 2 + 1] *
-                           Dot(direction, linkedAxis[linkedPlane[1]]);
-            };
-            const float su = linkedGradient(0, worldU), sv = linkedGradient(0, worldV);
-            const float tu = linkedGradient(1, worldU), tv = linkedGradient(1, worldV);
-            const float inv = 1.0f / determinant;
-            std::array<float, 6> remap{
-                (su * paneGradient[3] - sv * paneGradient[2]) * inv,
-                (sv * paneGradient[0] - su * paneGradient[1]) * inv,
-                (tu * paneGradient[3] - tv * paneGradient[2]) * inv,
-                (tv * paneGradient[0] - tu * paneGradient[1]) * inv, 0, 0};
-            remap[4] = linkedFace->atSample[0] - remap[0] * texOrigin[0] -
-                       remap[1] * texOrigin[1];
-            remap[5] = linkedFace->atSample[1] - remap[2] * texOrigin[0] -
-                       remap[3] * texOrigin[1];
-            const std::array<float, 6> identity{1, 0, 0, 1, 0, 0};
-            bool differs = false;
-            for (std::size_t index = 0; index < remap.size(); ++index)
-            {
-                if (!std::isfinite(remap[index]))
-                    throw std::runtime_error("linked IW3 shattered glass has invalid UV mapping");
-                differs |= std::abs(remap[index] - identity[index]) > 0.00001f;
-            }
-            if (differs)
-                shatteredMaterial = RegisterGlassUvRemap(plan, mapDirectory, map,
-                                                         shatteredMaterial, remap);
-        }
         if (panes.size() >= std::numeric_limits<std::uint16_t>::max())
             throw std::runtime_error("IW3 glass has too many native collision pieces");
         const auto glassId = static_cast<std::uint16_t>(panes.size() + 1);
@@ -3393,21 +3855,27 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
         if (shatteredEntity)
         {
             glassModels.insert(static_cast<std::uint32_t>(shatteredModel));
-            if (const EntityFields *broken = linkedBrush(*shatteredEntity))
+            // The prefab continues past the shattered state: clip brush, then
+            // the final broken remnants (jagged shards left in the frame). All
+            // of them are superseded by the native pane, so leave the world.
+            const EntityFields *stage = shatteredEntity;
+            for (std::size_t depth = 0; depth < 8; ++depth)
             {
-                const auto brokenModelValue = broken->find("model");
-                if (brokenModelValue != broken->end() && brokenModelValue->second.size() > 1 &&
-                    brokenModelValue->second.front() == '*')
-                {
-                    std::uint32_t brokenIndex{};
-                    const char *begin = brokenModelValue->second.data() + 1;
-                    const char *end = brokenModelValue->second.data() +
-                                      brokenModelValue->second.size();
-                    const auto brokenParsed = std::from_chars(begin, end, brokenIndex);
-                    if (brokenParsed.ec == std::errc{} && brokenParsed.ptr == end &&
-                        brokenIndex < models.size())
-                        glassModels.insert(brokenIndex);
-                }
+                const EntityFields *next = linkedBrush(*stage);
+                if (!next)
+                    break;
+                const auto nextModel = next->find("model");
+                if (nextModel == next->end() || nextModel->second.size() < 2 ||
+                    nextModel->second.front() != '*')
+                    break;
+                std::uint32_t nextIndex{};
+                const char *begin = nextModel->second.data() + 1;
+                const char *end = nextModel->second.data() + nextModel->second.size();
+                const auto nextNumber = std::from_chars(begin, end, nextIndex);
+                if (nextNumber.ec != std::errc{} || nextNumber.ptr != end || nextIndex >= models.size() ||
+                    !glassModels.insert(nextIndex).second)
+                    break;
+                stage = next;
             }
         }
         // FxGlassDef stores fracture extrusion in eighths of an IW world unit.
@@ -3415,7 +3883,7 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
         // the native shard geometry (an 8-unit IW3 pane becomes 0.5 here).
         const float fractureHalfThickness = std::max(0.125f, size[thin] / 16.0f);
         panes.push_back({{"material", paneMaterial},
-                         {"materialShattered", shatteredMaterial},
+                         {"materialShattered", paneMaterial},
                          {"texVecs", texVecs},
                          {"texCoordOrigin", texOrigin},
                          {"origin", origin},
@@ -3534,37 +4002,6 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
         std::array<float, 4> texVecs{};
         for (std::size_t index = 0; index < texVecs.size(); ++index)
             texVecs[index] = intactFace->gradient[index] / 32.0f;
-        std::string shatteredMaterial = shatteredFace->material;
-        // Both prefab states share one placement; remap the shattered UVs into
-        // the pane's single FxGlassDef UV basis when they differ.
-        const auto &pane = intactFace->gradient;
-        const auto &linked = shatteredFace->gradient;
-        const float determinant = pane[0] * pane[3] - pane[1] * pane[2];
-        if (std::abs(determinant) < 1.0e-10f)
-            continue;
-        const float inv = 1.0f / determinant;
-        std::array<float, 6> remap{(linked[0] * pane[3] - linked[1] * pane[2]) * inv,
-                                   (linked[1] * pane[0] - linked[0] * pane[1]) * inv,
-                                   (linked[2] * pane[3] - linked[3] * pane[2]) * inv,
-                                   (linked[3] * pane[0] - linked[2] * pane[1]) * inv, 0, 0};
-        remap[4] = shatteredFace->atSample[0] - remap[0] * intactFace->atSample[0] -
-                   remap[1] * intactFace->atSample[1];
-        remap[5] = shatteredFace->atSample[1] - remap[2] * intactFace->atSample[0] -
-                   remap[3] * intactFace->atSample[1];
-        bool differs = false;
-        const std::array<float, 6> identity{1, 0, 0, 1, 0, 0};
-        bool finite = true;
-        for (std::size_t index = 0; index < remap.size(); ++index)
-        {
-            finite &= std::isfinite(remap[index]);
-            differs |= std::abs(remap[index] - identity[index]) > 0.00001f;
-        }
-        if (!finite)
-            continue;
-        if (differs)
-            shatteredMaterial =
-                RegisterGlassUvRemap(plan, mapDirectory, map, shatteredMaterial, remap);
-
         const auto axis = EntityAxis(intact);
         const Vec3 localU{plane[0] == 0 ? 1.0f : 0.0f, plane[0] == 1 ? 1.0f : 0.0f,
                           plane[0] == 2 ? 1.0f : 0.0f};
@@ -3610,7 +4047,7 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
             glassTargets.insert(name->second);
         const float fractureHalfThickness = std::max(0.125f, size[thin] / 16.0f);
         panes.push_back({{"material", intactFace->material},
-                         {"materialShattered", shatteredMaterial},
+                         {"materialShattered", intactFace->material},
                          {"texVecs", texVecs},
                          {"texCoordOrigin", intactFace->atSample},
                          {"origin", origin},
@@ -3627,7 +4064,6 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, RenderPlan &plan,
 
 Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                  const std::vector<BrushModel> &models, RenderPlan &plan,
-                 const std::filesystem::path &mapDirectory, const std::string &map,
                  const std::string &entities, const SourceStaticModels &sourceStaticModels,
                  const replayrender::StaticModels &staticModels, CollisionData &collision,
                  std::size_t &triangleCount,
@@ -3840,8 +4276,53 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                 target = nullptr;
                 activeKey.clear();
             }
-            const bool nativeWorld = material.kind == SurfaceKind::opaque && surface.lightmap >= 0;
+            // Opaque BSP surfaces draw with the generated atlas material. In
+            // Replay 1.20 the native world materials were drawn through the
+            // atlas world pipeline anyway (tile 0 of a layer-1 record), which
+            // showed one 32-texel corner of each texture per repeat (Nuketown
+            // fixes-29..31 grass, siding, garage doors). MW120R_NATIVE_WORLD=1
+            // keeps the retained Replay world shader path for investigation.
+            static const bool nativeWorldPath = std::getenv("MW120R_NATIVE_WORLD") != nullptr;
+            const bool nativeWorld =
+                material.kind == SurfaceKind::opaque && surface.lightmap >= 0 && nativeWorldPath;
             const unsigned materialIndex = MaterialIndex(plan, material, nativeWorld);
+            // Replay's world shader carries texture coordinates at reduced
+            // precision; stock maps keep them near zero. IW3 world UVs are
+            // absolute (Nuketown reaches 164 repeats), which snapped them into
+            // blocks of texels. Repeating textures tolerate whole-tile shifts,
+            // so each triangle moves to the tile of its UV centroid; vertices
+            // shared by triangles in different tiles are duplicated.
+            std::vector<std::array<int, 2>> triangleTiles(surface.indices.size() / 3);
+            std::size_t emittedVertices = surface.vertices.size();
+            if (nativeWorld)
+            {
+                std::set<std::tuple<std::uint32_t, int, int>> unique;
+                for (std::size_t triangle = 0; triangle < triangleTiles.size(); ++triangle)
+                {
+                    Vec2 centroid{};
+                    float largest = 0.0f;
+                    for (std::size_t corner = 0; corner < 3; ++corner)
+                    {
+                        const Vec2 &uv = surface.vertices[surface.indices[triangle * 3 + corner]].uv;
+                        for (std::size_t axis = 0; axis < 2; ++axis)
+                        {
+                            centroid[axis] += uv[axis] / 3.0f;
+                            largest = std::max(largest, std::abs(uv[axis]));
+                        }
+                    }
+                    // Clamped decals and trims stay within a tile or two.
+                    if (largest > 2.0f)
+                        triangleTiles[triangle] = {static_cast<int>(std::floor(centroid[0])),
+                                                   static_cast<int>(std::floor(centroid[1]))};
+                    for (std::size_t corner = 0; corner < 3; ++corner)
+                        unique.insert({surface.indices[triangle * 3 + corner],
+                                       triangleTiles[triangle][0], triangleTiles[triangle][1]});
+                }
+                emittedVertices = unique.size();
+                if (emittedVertices > 60000)
+                    throw std::runtime_error("IW3 world surface exceeds Replay's vertex batch after "
+                                             "UV recentring: " + surface.material);
+            }
             std::ostringstream key;
             key << materialIndex;
             for (const float value : material.environment)
@@ -3852,7 +4333,7 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
             // their caster eligibility separate when merging fixed and entity brushes.
             key << ':' << material.castsShadow;
             if (!target || activeKey != key.str() ||
-                targetVertices + surface.vertices.size() > 60000 ||
+                targetVertices + emittedVertices > 60000 ||
                 targetIndices + surface.indices.size() > 65535u * 3u)
             {
                 output["surfaces"].push_back({{"vertices", Json::array()},
@@ -3887,9 +4368,10 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                         treeSurfaces.at(surface.visibilityGroup).insert(destinationSurface);
                 }
             }
-            std::unordered_map<std::uint32_t, std::uint32_t> remap;
+            std::map<std::tuple<std::uint32_t, int, int>, std::uint32_t> remap;
             for (std::size_t offset = 0; offset < surface.indices.size(); offset += 3)
             {
+                const auto &tile = triangleTiles[offset / 3];
                 const Vertex &a = surface.vertices[surface.indices[offset]];
                 const Vertex &b = surface.vertices[surface.indices[offset + 1]];
                 const Vertex &c = surface.vertices[surface.indices[offset + 2]];
@@ -3901,10 +4383,14 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                      {surface.indices[offset], surface.indices[offset + 2],
                       surface.indices[offset + 1]})
                 {
-                    auto found = remap.find(sourceIndex);
+                    const std::tuple<std::uint32_t, int, int> remapKey{sourceIndex, tile[0],
+                                                                       tile[1]};
+                    auto found = remap.find(remapKey);
                     if (found == remap.end())
                     {
                         const Vertex &vertex = surface.vertices[sourceIndex];
+                        const Vec2 uv{vertex.uv[0] - static_cast<float>(tile[0]),
+                                      vertex.uv[1] - static_cast<float>(tile[1])};
                         if (surface.reflectionProbe >= geometryProbeBounds.size())
                             throw std::runtime_error(
                                 "IW3 surface references an invalid reflection probe");
@@ -3914,12 +4400,12 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                             EncodedLightmap(vertex, surface, material, plan, nativeWorld);
                         (*target)["vertices"].push_back(
                             {{"position", vertex.position},
-                             {"uv", vertex.uv},
+                             {"uv", uv},
                              {"normal", PackedNormal(vertex.normal, vertex.tangent,
                                                      vertex.binormalSign, vertex.authoredTangent)},
                              {"lightmapUV", lightmap},
                              {"color", vertex.color}});
-                        found = remap.emplace(sourceIndex, index).first;
+                        found = remap.emplace(remapKey, index).first;
                     }
                     (*target)["indices"].push_back(found->second);
                     ++targetIndices;
@@ -4078,8 +4564,8 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                                               {"image", probe.image},
                                               {"sh", probe.sh}});
     }
-    output["glassPanes"] = BuildGlassPanes(models, plan, mapDirectory, map, entities, collision,
-                                          glassModels, glassTargets, entityModels);
+    output["glassPanes"] = BuildGlassPanes(models, plan, entities, collision, glassModels,
+                                          glassTargets, entityModels);
     output["assetMaterials"] = plan.assetMaterials;
     return output;
 }
@@ -4254,13 +4740,14 @@ std::uint32_t ConvertContents(const std::uint32_t source)
 unsigned NativeSurfaceMaterial(const std::uint32_t sourceBits)
 {
     // IW3 uses bit (surface type - 1); Replay has additional surface families
-    // and a different ordering. Return zero for types without a known mapping.
+    // and a different ordering (infoParms table 4618420: 3 carpet_solid,
+    // 4 cloth). Return zero for types without a known mapping.
     switch (sourceBits)
     {
     case 1u: return 1;         // bark
     case 2u: return 2;         // brick
-    case 4u: return 4;         // carpet
-    case 8u: return 3;         // cloth
+    case 4u: return 3;         // carpet
+    case 8u: return 4;         // cloth
     case 16u: return 5;        // concrete
     case 32u: return 6;        // dirt
     case 64u: return 7;        // flesh
@@ -4668,6 +5155,12 @@ CollisionData ReadCollision(const Json &collision)
                 terrain.vertices.push_back(points[corner]);
             meshTriangle.indices[corner] = found->second;
         }
+        // IW3 winds collision triangles clockwise seen from the open side (6006
+        // of Nuketown's 7652 face down by the right-hand rule). Havok takes the
+        // counter-clockwise face as the front: contact welding pushed ragdolls
+        // and dropped weapons through every terrain floor, while two-sided ray
+        // traces (players, bullets) still hit. Reverse to Havok's convention.
+        std::swap(meshTriangle.indices[1], meshTriangle.indices[2]);
         terrain.triangles.push_back(meshTriangle);
     }
     if (!terrain.triangles.empty())
@@ -6099,6 +6592,44 @@ iw8::vfx::Effect ConvertFx(
     return effect;
 }
 
+// First reason an IW3 FX graph has no direct Replay mapping (empty when it has one).
+std::string FxMappingBlocker(const PreparedMap &map, const PreparedFx &effect)
+{
+    if (effect.elements.empty())
+        return "no elements";
+    for (const auto &element : effect.elements)
+    {
+        const std::string type = std::to_string(element.type);
+        if (!(element.type == 0 || element.type == 1 || element.type == 2 || element.type == 4 ||
+              element.type == 5 || element.type == 6 || element.type == 9 || element.type == 10))
+            return "element type " + type;
+        if (!element.effectOnDeath.empty())
+            return "effect on death (type " + type + ")";
+        if (!element.effectOnImpact.empty() && element.type != 5)
+            return "effect on impact on element type " + type;
+        if (!element.effectEmitted.empty() && element.type == 10)
+            return "runner with emitted effect";
+        for (const auto &visual : element.visuals)
+        {
+            if ((element.type == 0 || element.type == 1 || element.type == 2 ||
+                 element.type == 4) &&
+                (visual.kind != PreparedFxVisualKind::material || visual.names.size() != 1 ||
+                 !map.fxMaterialAliases.contains(visual.names.front())))
+                return "material " + (visual.names.empty() ? std::string("?") : visual.names.front()) +
+                       " (type " + type + ")";
+            if (element.type == 9 &&
+                (visual.kind != PreparedFxVisualKind::decal || visual.names.size() != 2 ||
+                 !map.fxMaterialAliases.contains(visual.names[1])))
+                return "decal material " +
+                       (visual.names.size() == 2 ? visual.names[1] : std::string("?"));
+            if (element.type == 6 &&
+                (visual.kind != PreparedFxVisualKind::none || !visual.names.empty()))
+                return "omni light visual";
+        }
+    }
+    return {};
+}
+
 bool HasDirectReplayFxMapping(const PreparedMap &map, const PreparedFx &effect)
 {
     return !effect.elements.empty() &&
@@ -6148,8 +6679,13 @@ BuildFxAliases(const PreparedMap &map, const std::string &targetMap)
     const auto &effects = map.fxEffects;
     std::set<std::string> convertible;
     for (const auto &effect : effects)
+    {
         if (HasDirectReplayFxMapping(map, effect))
             convertible.insert(effect.name);
+        else
+            zt::info("iw3: FX %s not converted: %s", effect.name.c_str(),
+                     FxMappingBlocker(map, effect).c_str());
+    }
 
     bool changed = true;
     while (changed)
@@ -6175,6 +6711,8 @@ BuildFxAliases(const PreparedMap &map, const std::string &targetMap)
                 });
             if (missingChild)
             {
+                zt::info("iw3: FX %s not converted: a child effect is not convertible",
+                         iterator->c_str());
                 iterator = convertible.erase(iterator);
                 changed = true;
             }
@@ -6188,7 +6726,7 @@ BuildFxAliases(const PreparedMap &map, const std::string &targetMap)
     std::unordered_map<std::string, std::string> aliases;
     aliases.reserve(convertible.size());
     for (const auto &name : convertible)
-        aliases.emplace(name, "mw120r/" + targetMap + "/fx/" + name);
+        aliases.emplace(name, "vfx/mw120r/" + targetMap + "/" + name);
     return aliases;
 }
 
@@ -6197,20 +6735,28 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
     const std::vector<std::filesystem::path> &sourcePaths,
     const std::unordered_map<std::string, std::string> &effectAliases)
 {
-    constexpr std::array<std::pair<std::size_t, std::size_t>, 12> targetRows{{
-        {1, 0},  // bullet small
-        {1, 1},  // bullet small exit
-        {2, 0},  // bullet large
-        {2, 1},  // bullet large exit
-        {6, 0},  // shotgun
-        {6, 1},  // shotgun exit
-        {3, 0},  // armor piercing
-        {3, 1},  // armor piercing exit
-        {9, 0},  // grenade bounce
-        {10, 0}, // grenade explosion
-        {12, 0}, // rocket explosion
-        {14, 0}, // projectile dud
+    // IW3 rows: bullet small, large, shotgun and armor piercing (each followed
+    // by its exit row), grenade bounce, grenade explosion, rocket explosion and
+    // projectile dud. Replay weapons select the VFX impact type themselves
+    // (weapon +452, q_CG_Weapons_GetVFXImpactType), so every Replay bullet type
+    // takes the IW3 row of its calibre: sml 1/37/38, med 2 and the med blueprint
+    // variants 33-36/39/41, lrg 3/4/5/7, 12g 6/40, xxl 15. Exits exist only
+    // where impact_data::kExitMask has the type.
+    struct Target
+    {
+        std::size_t sourceRow;
+        std::size_t impactType;
+        std::size_t direction;
+    };
+    constexpr std::array<Target, 36> targets{{
+        {0, 1, 0},   {0, 37, 0},  {0, 38, 0},  {1, 1, 1},   {1, 37, 1},  {1, 38, 1},
+        {2, 2, 0},   {2, 33, 0},  {2, 34, 0},  {2, 35, 0},  {2, 36, 0},  {2, 39, 0},
+        {2, 41, 0},  {2, 3, 0},   {2, 4, 0},   {2, 5, 0},   {2, 7, 0},   {3, 2, 1},
+        {3, 33, 1},  {3, 34, 1},  {3, 35, 1},  {3, 36, 1},  {3, 39, 1},  {3, 41, 1},
+        {3, 3, 1},   {3, 4, 1},   {4, 6, 0},   {4, 40, 0},  {5, 6, 1},   {5, 40, 1},
+        {6, 15, 0},  {7, 15, 1},  {8, 9, 0},   {9, 10, 0},  {10, 12, 0}, {11, 14, 0},
     }};
+    constexpr std::size_t sourceRowCount = 12;
     constexpr std::size_t nonFleshCount = 29;
     constexpr std::size_t fleshCount = 4;
 
@@ -6242,15 +6788,15 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
     const auto &entries = source.at("entries");
     if (source.value("schema", 0) != 1 ||
         source.value("asset_type", std::string{}) != "iw3_impact_fx" ||
-        !layout.is_object() || layout.value("impact_count", 0) != targetRows.size() ||
+        !layout.is_object() || layout.value("impact_count", 0) != sourceRowCount ||
         layout.value("nonflesh_count", 0) != nonFleshCount ||
         layout.value("flesh_count", 0) != fleshCount || !entries.is_array() ||
-        entries.size() != targetRows.size())
+        entries.size() != sourceRowCount)
         throw std::runtime_error("IW3 impact FX export has an unsupported schema or layout");
 
     iw8::impact::EffectOverrides overrides;
-    overrides.reserve(targetRows.size() * (nonFleshCount + fleshCount));
-    for (std::size_t sourceRow = 0; sourceRow < targetRows.size(); ++sourceRow)
+    overrides.reserve(targets.size() * (nonFleshCount + fleshCount) * 2);
+    for (std::size_t sourceRow = 0; sourceRow < sourceRowCount; ++sourceRow)
     {
         const auto &entry = entries.at(sourceRow);
         if (entry.at("index").get<std::size_t>() != sourceRow)
@@ -6267,17 +6813,28 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
                 return;
             if (!value.is_string() || !IsValidFxAssetName(value.get<std::string>()))
                 throw std::runtime_error("IW3 impact FX slot has an invalid effect name");
-            // Keep Replay's decal-bearing bullet effects for ordinary hits.
-            // The converted IW3 cushion effect, for example, has no mark/decal
-            // element and would replace Replay's native rubber bullet mark.
-            // Glass retains its converted break effect at surface type 9.
-            if (sourceRow < 8 && (isFlesh || index != 9))
-                return;
             const auto alias = effectAliases.find(value.get<std::string>());
             if (alias == effectAliases.end())
                 return;
-            overrides.push_back({targetRows[sourceRow].first, targetRows[sourceRow].second,
-                                 isFlesh, index, "," + alias->second});
+            // Nonflesh slots are IW3 surface types; Replay indexes the table by
+            // its own surface type (trace surfaceFlags >> 19), the mapping the
+            // collision tags use. IW3 flesh slots (body/head x nonfatal/fatal)
+            // match Replay's first four flesh slots.
+            const std::size_t target = isFlesh ? index
+                                       : index ? NativeSurfaceMaterial(1u << (index - 1))
+                                               : 0;
+            if (!isFlesh && !target)
+                return;
+            for (const Target &destination : targets)
+            {
+                if (destination.sourceRow != sourceRow)
+                    continue;
+                // IW3 plays one effect per slot; clear Replay's second pack too.
+                overrides.push_back({destination.impactType, destination.direction, isFlesh,
+                                     target, 0, "," + alias->second});
+                overrides.push_back({destination.impactType, destination.direction, isFlesh,
+                                     target, 1, {}});
+            }
         };
         for (std::size_t index = 0; index < nonFleshCount; ++index)
             append(nonFlesh.at(index), false, index);
@@ -6307,6 +6864,9 @@ PreparedMap::PreparedMap(PreparedMap &&other) noexcept
     , dynamicEntities(std::move(other.dynamicEntities))
     , navigation(std::move(other.navigation))
     , mapScript(std::move(other.mapScript))
+    , gradingClutName(std::move(other.gradingClutName))
+    , gradingClutPixels(std::move(other.gradingClutPixels))
+    , soundBank(std::move(other.soundBank))
 {
     other.scratch.clear();
 }
@@ -6338,6 +6898,9 @@ PreparedMap &PreparedMap::operator=(PreparedMap &&other) noexcept
         dynamicEntities = std::move(other.dynamicEntities);
         navigation = std::move(other.navigation);
         mapScript = std::move(other.mapScript);
+        gradingClutName = std::move(other.gradingClutName);
+        gradingClutPixels = std::move(other.gradingClutPixels);
+        soundBank = std::move(other.soundBank);
         other.scratch.clear();
     }
     return *this;
@@ -6537,9 +7100,78 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             zt::warn("iw3: could not cache the extraction: %s", cacheError.message().c_str());
     }
 
+    // Entity model skeletons: a second, model-only export in XMODEL_EXPORT
+    // form, kept beside the cached extraction.
+    const auto skeletonRoot = std::getenv("IW8_ZONETOOL_NO_EXTRACT_CACHE")
+                                  ? result.scratch / "skeleton"
+                                  : cacheDirectory / "skeleton";
+    if (!std::filesystem::is_regular_file(skeletonRoot / "complete", error))
+    {
+        std::error_code skeletonError;
+        std::filesystem::remove_all(skeletonRoot, skeletonError);
+        std::filesystem::create_directories(skeletonRoot);
+        zt::info("iw3: exporting model skeletons from %s", options.fastfile.string().c_str());
+        RunUnlinker(unlinker, options, skeletonRoot, options.fastfile, false, true);
+        std::vector<std::string> unexported;
+        for (const auto &model : entityModelNames)
+            if (!std::filesystem::is_regular_file(
+                    SafeChild(skeletonRoot, std::filesystem::path("xmodel") / (model + ".json")),
+                    skeletonError))
+                unexported.push_back(model);
+        const auto commonFastfile = FindIw3CommonFastfile(options);
+        if (!unexported.empty() && !commonFastfile.empty())
+        {
+            zt::info("iw3: exporting %zu entity model skeleton(s) from %s", unexported.size(),
+                     commonFastfile.string().c_str());
+            RunUnlinker(unlinker, options, skeletonRoot, commonFastfile, false, true);
+        }
+        zt::write_file_str((skeletonRoot / "complete").string(), "1");
+    }
+
     result.rawFiles = ReadPreparedRawFiles(exportRoot, sourceMap);
+    // setExpFog and the vision film grade become Replay's vision fog, a grading
+    // CLUT and (below) the converted surface shader's fog.
+    const auto expFog = ReadMapExpFog(exportRoot, sourceMap);
+    if (const auto film = ReadMapFilm(exportRoot, sourceMap))
+    {
+        result.gradingClutName = "mw120r_" + options.map + "_clut";
+        result.gradingClutPixels = BuildGradingClutPixels(*film);
+    }
+    {
+        const std::string vision = BuildReplayVision(expFog, result.gradingClutName);
+        result.rawFiles.push_back(
+            {"vision/" + options.map + ".vision",
+             std::vector<std::uint8_t>(vision.begin(), vision.end())});
+        zt::info("iw3: converted vision (fog %s, grading CLUT %s)", expFog ? "yes" : "no",
+                 result.gradingClutName.empty() ? "none" : result.gradingClutName.c_str());
+    }
     result.fxEffects = ReadPreparedFx(exportRoot);
-    const auto declaredFx = ReadDeclaredFx(exportRoot / "zone_source" / (sourceMap + ".zone"));
+    auto declaredFx = ReadDeclaredFx(exportRoot / "zone_source" / (sourceMap + ".zone"));
+    {
+        // Script-driven IW3 effects: literals the map scripts load, and the
+        // common-zone effects maps\mp\_destructible_types plays on vehicles.
+        std::set<std::string> scriptFx = ReadScriptEffectNames(exportRoot / "maps" / "mp");
+        const bool hasDestructibleVehicles = std::ranges::any_of(
+            ParseEntityFields(entities), [](const EntityFields &entity) {
+                const auto type = entity.find("destructible_type");
+                return type != entity.end() && type->second.find("vehicle") != std::string::npos;
+            });
+        if (hasDestructibleVehicles)
+            for (const char *name : kIw3VehicleDestructibleEffects)
+                scriptFx.insert(name);
+        for (const auto &name : scriptFx)
+        {
+            if (declaredFx.contains(name))
+                continue;
+            if (std::ranges::none_of(result.fxEffects,
+                                     [&](const PreparedFx &effect) { return effect.name == name; }))
+            {
+                zt::warn("iw3: script effect %s has no extracted IW3 FX graph", name.c_str());
+                continue;
+            }
+            declaredFx.insert(name);
+        }
+    }
     std::set<std::string> reachableFx(declaredFx.begin(), declaredFx.end());
     std::vector<std::string> pendingFx(declaredFx.begin(), declaredFx.end());
     for (std::size_t index = 0; index < pendingFx.size(); ++index)
@@ -6689,7 +7321,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         try
         {
             auto translation = scripts::Translate(
-                options.map, scriptSources, [](const std::string &) { return std::string{}; },
+                options.map, scriptSources,
+                [](const std::string &effect) { return std::string(kScriptEffectMarker) + effect; },
                 generated);
             for (const auto &note : translation.notes)
                 zt::info("iw3: script translation: %s", note.c_str());
@@ -6714,7 +7347,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             keptEntityModelNames.push_back(model);
     sourceEntityModels.models.reserve(keptEntityModelNames.size());
     for (const auto &modelName : keptEntityModelNames)
-        sourceEntityModels.models.push_back(ReadSourceModel(exportRoot, modelName));
+        sourceEntityModels.models.push_back(
+            ReadSourceModel(exportRoot, modelName, false, skeletonRoot));
     SourceStaticModels sourceFxModels;
     std::set<std::string> fxModelNames;
     for (const auto &effect : result.fxEffects)
@@ -6768,9 +7402,34 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         PrepareRenderAssets(exportRoot, world, materialNames, worldMaterialNames,
                             modelMaterialNames, entityMaterialNames, fxMaterials, shadowWorldMaterialNames,
                             shadowModelMaterialNames, options.searchPaths, mapDirectory,
-                            options.map, options.scratchRoot / ".iw3-render-cache");
+                            options.map, options.scratchRoot / ".iw3-render-cache",
+                            FogShaderDefines(expFog));
     timing.lap("render assets");
     result.fxMaterialAliases = renderPlan.fxMaterialAliases;
+    for (auto &effect : result.fxEffects)
+    {
+        // Replay screen distortion needs a native refraction technique; the
+        // rest of the effect converts without the IW3 heat-haze elements.
+        const std::size_t removed = std::erase_if(effect.elements, [&](const PreparedFxElement &element) {
+            return std::ranges::any_of(element.visuals, [&](const PreparedFxVisual &visual) {
+                return visual.kind == PreparedFxVisualKind::material && visual.names.size() == 1 &&
+                       renderPlan.fxDistortionMaterials.contains(visual.names.front());
+            });
+        });
+        if (removed)
+            zt::info("iw3: FX %s: left out %zu distortion element(s)", effect.name.c_str(), removed);
+        for (auto &element : effect.elements)
+        {
+            // Replay spawns impact children only from model particles.
+            if (!element.effectOnImpact.empty() && element.type != 5)
+            {
+                zt::info("iw3: FX %s: element type %u impact effect %s not spawned",
+                         effect.name.c_str(), static_cast<unsigned>(element.type),
+                         element.effectOnImpact.c_str());
+                element.effectOnImpact.clear();
+            }
+        }
+    }
     BuildPreparedStaticModels(sourceStaticModels, renderPlan, options.map, "smodel", result.xmodels,
                               result.staticModels, true, false, false,
                               &result.staticModelCollisionModels);
@@ -6780,7 +7439,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     BuildPreparedStaticModels(sourceDynamicEntities.models, renderPlan, options.map, "dynmodel",
                               result.xmodels, unusedDynamicTables, true, true);
     BuildPreparedStaticModels(sourceEntityModels, renderPlan, options.map, "entitymodel",
-                              result.xmodels, unusedDynamicTables, true, true, true);
+                              result.xmodels, unusedDynamicTables, true, true, true, nullptr, true);
     replayrender::StaticModels unusedFxTables;
     BuildPreparedStaticModels(sourceFxModels, renderPlan, options.map, "fxmodel",
                               result.xmodels, unusedFxTables, true, true, true);
@@ -6861,7 +7520,110 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                  result.smallGlassEffect.c_str());
     result.impactOverrides = ReadImpactOverrides(exportRoot, options.searchPaths, effectAliases);
     zt::info("iw3: mapped %zu native IW3 impact slots into Replay's impact table",
-             result.impactOverrides.size());
+             static_cast<std::size_t>(std::ranges::count(result.impactOverrides, std::size_t{0},
+                                                         &iw8::impact::EffectOverride::pack)));
+    // Sound aliases the map's scripts play, plus the IW3 vehicle destructible
+    // sounds the compatibility layer plays itself.
+    std::map<std::string, bool> soundAliases;
+    {
+        std::set<std::string> requestedSounds = sound::ReadScriptSoundNames(exportRoot / "maps" / "mp");
+        const bool hasDestructibleVehicles = std::ranges::any_of(
+            ParseEntityFields(entities), [](const EntityFields &entity) {
+                const auto type = entity.find("destructible_type");
+                return type != entity.end() && type->second.find("vehicle") != std::string::npos;
+            });
+        if (hasDestructibleVehicles)
+            for (const char *name : kIw3VehicleDestructibleSounds)
+                requestedSounds.insert(name);
+        if (auto sounds = sound::Convert(exportRoot, options.searchPaths, options.map, requestedSounds))
+        {
+            soundAliases = std::move(sounds->aliases);
+            result.soundBank = std::move(sounds->bank);
+        }
+        zt::info("iw3: converted %zu of %zu requested IW3 sound alias(es)", soundAliases.size(),
+                 requestedSounds.size());
+    }
+    if (!result.mapScript.empty())
+    {
+        // Translated loadfx( "<marker><iw3 name>" ) calls load the converted
+        // effect, or a stock Replay stand-in when the graph did not convert.
+        std::string &gsc = result.mapScript;
+        for (std::size_t at = gsc.find(kScriptEffectMarker); at != std::string::npos;
+             at = gsc.find(kScriptEffectMarker, at))
+        {
+            const std::size_t end = gsc.find('"', at);
+            if (end == std::string::npos)
+                throw std::runtime_error("translated script has an unterminated effect name");
+            const std::string name =
+                gsc.substr(at + kScriptEffectMarker.size(), end - at - kScriptEffectMarker.size());
+            const auto alias = effectAliases.find(name);
+            const std::string replacement =
+                alias != effectAliases.end() ? alias->second : scripts::StockEffectFor(name);
+            zt::info("iw3: script effect %s -> %s", name.c_str(), replacement.c_str());
+            gsc.replace(at, end - at, replacement);
+            at += replacement.size();
+        }
+        // iw3compat_iw3fx(): IW3 effects the compatibility layer plays itself
+        // (destructible vehicles), keyed by IW3 name.
+        gsc += "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n";
+        std::vector<const char *> compatEffects(std::begin(kIw3VehicleDestructibleEffects),
+                                                std::end(kIw3VehicleDestructibleEffects));
+        compatEffects.insert(compatEffects.end(), std::begin(kIw3CompatPropEffects),
+                             std::end(kIw3CompatPropEffects));
+        for (const char *name : compatEffects)
+        {
+            const auto alias = effectAliases.find(name);
+            if (alias == effectAliases.end())
+                continue;
+            gsc += "    level.mw120r_iw3fx[\"" + std::string(name) + "\"] = loadfx( \"" +
+                   alias->second + "\" );\n";
+        }
+        gsc += "}\n";
+        // iw3compat_sounds(): converted aliases, 1 = playsound, 2 = playloopsound.
+        gsc += "\niw3compat_sounds()\n{\n    level.mw120r_sounds = [];\n";
+        for (const auto &[name, looping] : soundAliases)
+            gsc += "    level.mw120r_sounds[\"" + name + "\"] = " + (looping ? "2" : "1") + ";\n";
+        gsc += "}\n";
+        // iw3compat_model_parts(): each skinned entity model's bones with
+        // geometry and their bind-pose boxes in model space (LOD0), which the
+        // compatibility layer uses to route hits to IW3 destructible parts.
+        gsc += "\niw3compat_model_parts()\n{\n    level.mw120r_part_min = [];\n"
+               "    level.mw120r_part_max = [];\n";
+        const auto vector = [](const Vec3 &value) {
+            char text[96]{};
+            std::snprintf(text, sizeof(text), "( %.3f, %.3f, %.3f )", value[0], value[1], value[2]);
+            return std::string(text);
+        };
+        for (const SourceStaticModel &model : sourceEntityModels.models)
+        {
+            if (model.bones.size() < 2 || model.lods.empty())
+                continue;
+            std::vector<replaybounds::Accumulator> boxes(model.bones.size());
+            std::vector<bool> used(model.bones.size());
+            for (const Surface &surface : model.lods.front().surfaces)
+                for (std::size_t vertex = 0;
+                     vertex < surface.vertices.size() && vertex < surface.vertexBones.size(); ++vertex)
+                {
+                    boxes[surface.vertexBones[vertex]].Add(surface.vertices[vertex].position);
+                    used[surface.vertexBones[vertex]] = true;
+                }
+            const std::string key = "[\"" + model.name + "\"]";
+            gsc += "    level.mw120r_part_min" + key + " = [];\n    level.mw120r_part_max" + key +
+                   " = [];\n";
+            for (std::size_t bone = 0; bone < model.bones.size(); ++bone)
+            {
+                if (!used[bone])
+                    continue;
+                const replaybounds::Bounds box = boxes[bone].Finish();
+                const std::string tag = "[\"" + model.bones[bone].name + "\"]";
+                gsc += "    level.mw120r_part_min" + key + tag + " = " +
+                       vector(Subtract(box.midpoint, box.halfSize)) + ";\n";
+                gsc += "    level.mw120r_part_max" + key + tag + " = " +
+                       vector(Add(box.midpoint, box.halfSize)) + ";\n";
+            }
+        }
+        gsc += "}\n";
+    }
     std::set<std::string> emittedFx;
     for (const auto &entry : effectAliases)
         emittedFx.insert(entry.first);
@@ -6899,8 +7661,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     AddStairRamps(nativeCollision);
     std::set<std::uint32_t> nativeGlassModels;
     std::set<std::string> nativeGlassTargets;
-    const Json render = BuildRender(world, visibility, brushModels, renderPlan,
-                                    mapDirectory, options.map, entities, sourceStaticModels,
+    const Json render = BuildRender(world, visibility, brushModels, renderPlan, entities,
+                                    sourceStaticModels,
                                     result.staticModels, nativeCollision, triangles,
                                     nativeGlassModels, nativeGlassTargets, sourceEntityModels);
     timing.lap("collision read and render json");
@@ -7069,6 +7831,51 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     if (!zt::write_file_str((mapDirectory / (targetAsset + ".ents")).string(), convertedEntities))
     {
         throw std::runtime_error("cannot write temporary IW3 entities");
+    }
+    // Build-time probe: IW8_ZONETOOL_COLLISION_PROBE="x,y" logs every world
+    // hull and mesh triangle above that point, as the baker receives them.
+    if (const char *probe = std::getenv("IW8_ZONETOOL_COLLISION_PROBE"))
+    {
+        float px = 0.0f, py = 0.0f;
+        if (std::sscanf(probe, "%f,%f", &px, &py) == 2)
+        {
+            for (const CollisionHull &hull : nativeCollision.hulls)
+            {
+                Vec3 low{FLT_MAX, FLT_MAX, FLT_MAX}, high{-FLT_MAX, -FLT_MAX, -FLT_MAX};
+                for (const Vec3 &point : hull.points)
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                    {
+                        low[axis] = std::min(low[axis], point[axis]);
+                        high[axis] = std::max(high[axis], point[axis]);
+                    }
+                if (px >= low[0] && px <= high[0] && py >= low[1] && py <= high[1])
+                    zt::info("collision probe: hull model %u contents 0x%X glass %u z %.2f..%.2f "
+                             "points %zu slabs %zu",
+                             hull.model, hull.contents, hull.glassId, low[2], high[2],
+                             hull.points.size(), hull.slabs.size());
+            }
+            for (const CollisionMesh &mesh : nativeCollision.meshes)
+                for (const auto &triangle : mesh.triangles)
+                {
+                    const Vec3 &a = mesh.vertices[triangle.indices[0]];
+                    const Vec3 &b = mesh.vertices[triangle.indices[1]];
+                    const Vec3 &c = mesh.vertices[triangle.indices[2]];
+                    const auto side = [&](const Vec3 &p, const Vec3 &q) {
+                        return (q[0] - p[0]) * (py - p[1]) - (q[1] - p[1]) * (px - p[0]);
+                    };
+                    const float d0 = side(a, b), d1 = side(b, c), d2 = side(c, a);
+                    if ((d0 < 0 || d1 < 0 || d2 < 0) && (d0 > 0 || d1 > 0 || d2 > 0))
+                        continue;
+                    const Vec3 normal = Cross(Subtract(b, a), Subtract(c, a));
+                    const float z = std::abs(normal[2]) > 1.0e-6f
+                                        ? a[2] - (normal[0] * (px - a[0]) + normal[1] * (py - a[1])) /
+                                                     normal[2]
+                                        : a[2];
+                    zt::info("collision probe: mesh model %u triangle contents 0x%X material %u "
+                             "z %.2f",
+                             mesh.model, triangle.contents, triangle.material, z);
+                }
+        }
     }
     result.collision = result.scratch / "collision.native";
     WriteCollision(result.collision, nativeCollision);

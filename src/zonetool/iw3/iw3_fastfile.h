@@ -7,6 +7,7 @@
 #include "../iw8/replay_impact.h"
 #include "../iw8/replay_navigation.h"
 #include "../iw8/replay_render.h"
+#include "../iw8/replay_sound.h"
 #include "../iw8/replay_static_model_collision.h"
 #include "../iw8/replay_sunshadow.h"
 #include "../iw8/replay_vfx.h"
@@ -222,6 +223,12 @@ struct PreparedMap
     // IW8 GSC translated from the map's IW3 scripts (without the generated
     // minimap function), compiled with gsc-tool at package time.
     std::string mapScript;
+    // Converted IW3 film grade (empty name without one); the generated Replay
+    // vision file in rawFiles references it.
+    std::string gradingClutName;
+    std::vector<std::uint8_t> gradingClutPixels;
+    // Converted IW3 sound aliases (always-loaded map bank), when any convert.
+    std::optional<iw8::sound::Bank> soundBank;
 
     PreparedMap() = default;
     PreparedMap(const PreparedMap &) = delete;
