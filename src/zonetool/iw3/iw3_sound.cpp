@@ -4,6 +4,13 @@
 #include "common/json.hpp"
 #include "common/log.h"
 
+#include <Windows.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <shlwapi.h>
+#include <wrl/client.h>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -404,6 +411,105 @@ struct Pcm
     uint8_t channels{};
     std::vector<int16_t> samples;
 };
+
+// IW3 also streams MP3 (ambient loops such as ambient/amb_middle_east1v7_lr.mp3).
+// Windows Media Foundation decodes it to 16-bit PCM in memory.
+std::optional<Pcm> DecodeCompressedAudio(const std::vector<uint8_t> &file, std::string &error)
+{
+    using Microsoft::WRL::ComPtr;
+    static const HRESULT started = MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    if (FAILED(started))
+    {
+        error = "Media Foundation is unavailable";
+        return std::nullopt;
+    }
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const bool comOwned = SUCCEEDED(com);
+    struct ComScope
+    {
+        bool owned;
+        ~ComScope()
+        {
+            if (owned)
+                CoUninitialize();
+        }
+    } scope{comOwned};
+    if (file.empty() || file.size() > 0x7FFFFFFF)
+    {
+        error = "compressed audio has an invalid size";
+        return std::nullopt;
+    }
+    ComPtr<IStream> stream;
+    stream.Attach(SHCreateMemStream(file.data(), static_cast<UINT>(file.size())));
+    ComPtr<IMFByteStream> byteStream;
+    ComPtr<IMFSourceReader> reader;
+    ComPtr<IMFMediaType> requested;
+    if (!stream || FAILED(MFCreateMFByteStreamOnStream(stream.Get(), &byteStream)) ||
+        FAILED(MFCreateSourceReaderFromByteStream(byteStream.Get(), nullptr, &reader)) ||
+        FAILED(MFCreateMediaType(&requested)) ||
+        FAILED(requested->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio)) ||
+        FAILED(requested->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM)) ||
+        FAILED(requested->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16)) ||
+        FAILED(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS), FALSE)) ||
+        FAILED(reader->SetStreamSelection(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), TRUE)) ||
+        FAILED(reader->SetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM),
+                                           nullptr, requested.Get())))
+    {
+        error = "Media Foundation cannot decode the audio";
+        return std::nullopt;
+    }
+    ComPtr<IMFMediaType> actual;
+    if (FAILED(reader->GetCurrentMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM),
+                                           &actual)))
+    {
+        error = "Media Foundation has no PCM output";
+        return std::nullopt;
+    }
+    Pcm result;
+    result.rate = MFGetAttributeUINT32(actual.Get(), MF_MT_AUDIO_SAMPLES_PER_SECOND, 0);
+    const UINT32 channels = MFGetAttributeUINT32(actual.Get(), MF_MT_AUDIO_NUM_CHANNELS, 0);
+    if (!result.rate || channels < 1 || channels > 2 ||
+        MFGetAttributeUINT32(actual.Get(), MF_MT_AUDIO_BITS_PER_SAMPLE, 0) != 16)
+    {
+        error = "decoded audio has an unsupported format";
+        return std::nullopt;
+    }
+    result.channels = static_cast<uint8_t>(channels);
+    for (;;)
+    {
+        DWORD flags = 0;
+        ComPtr<IMFSample> sample;
+        if (FAILED(reader->ReadSample(static_cast<DWORD>(MF_SOURCE_READER_FIRST_AUDIO_STREAM), 0,
+                                      nullptr, &flags, nullptr, &sample)))
+        {
+            error = "Media Foundation failed while decoding";
+            return std::nullopt;
+        }
+        if (sample)
+        {
+            ComPtr<IMFMediaBuffer> buffer;
+            BYTE *data = nullptr;
+            DWORD length = 0;
+            if (FAILED(sample->ConvertToContiguousBuffer(&buffer)) ||
+                FAILED(buffer->Lock(&data, nullptr, &length)))
+            {
+                error = "Media Foundation returned an unreadable sample";
+                return std::nullopt;
+            }
+            const auto *pcm = reinterpret_cast<const int16_t *>(data);
+            result.samples.insert(result.samples.end(), pcm, pcm + length / 2);
+            buffer->Unlock();
+        }
+        if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
+            break;
+    }
+    if (result.samples.empty())
+    {
+        error = "decoded audio is empty";
+        return std::nullopt;
+    }
+    return result;
+}
 
 std::optional<Pcm> ReadWav(const std::vector<uint8_t> &file, std::string &error)
 {
@@ -857,11 +963,33 @@ std::set<std::string> ReadScriptSoundNames(const std::filesystem::path &scriptDi
     return names;
 }
 
+std::set<std::string> ReadScriptStringLiterals(const std::filesystem::path &scriptDirectory)
+{
+    std::set<std::string> names;
+    std::error_code error;
+    if (!std::filesystem::is_directory(scriptDirectory, error))
+        return names;
+    static const std::regex literal(R"re("([A-Za-z0-9_]+)")re");
+    for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory, error))
+    {
+        if (Lower(entry.path().extension().string()) != ".gsc")
+            continue;
+        std::string text;
+        if (!zt::read_file_str(entry.path().string(), text))
+            continue;
+        for (auto match = std::sregex_iterator(text.begin(), text.end(), literal);
+             match != std::sregex_iterator(); ++match)
+            names.insert(Lower((*match)[1].str()));
+    }
+    return names;
+}
+
 std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
                                        const std::vector<std::filesystem::path> &searchPaths,
-                                       const std::string &map, const std::set<std::string> &requested)
+                                       const std::string &map, const std::set<std::string> &requested,
+                                       const std::set<std::string> &candidates)
 {
-    if (requested.empty())
+    if (requested.empty() && candidates.empty())
         return std::nullopt;
     const auto zoneAliases = ReadZoneAliases(exportRoot);
     const auto csvAliases = ReadCsvAliases(searchPaths, Lower(map));
@@ -878,6 +1006,15 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
     std::vector<std::string> order;
     std::set<std::string> visited;
     std::vector<std::string> pending(requested.begin(), requested.end());
+    std::size_t literalAliases = 0;
+    for (const auto &name : candidates)
+        if (!requested.contains(name) && definition(Lower(name)))
+        {
+            pending.push_back(name);
+            ++literalAliases;
+        }
+    if (literalAliases)
+        zt::info("iw3 sound: %zu alias(es) passed to map script helpers as literals", literalAliases);
     while (!pending.empty())
     {
         const std::string name = Lower(pending.back());
@@ -912,7 +1049,11 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
         const auto bytes = files.Find(path, source);
         std::optional<Pcm> pcm;
         if (bytes)
+        {
             pcm = ReadWav(*bytes, failure);
+            if (!pcm && Lower(path).ends_with(".mp3"))
+                pcm = DecodeCompressedAudio(*bytes, failure);
+        }
         else
             failure = "not found in the extracted zone, raw sound folders or IWDs";
         if (!pcm)
@@ -922,7 +1063,9 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
             return nullptr;
         }
         iw8::sound::Sample sample;
-        std::string stem = path.ends_with(".wav") ? path.substr(0, path.size() - 4) : path;
+        std::string stem = path.ends_with(".wav") || path.ends_with(".mp3")
+                               ? path.substr(0, path.size() - 4)
+                               : path;
         std::replace(stem.begin(), stem.end(), '/', '\\');
         sample.name = prefix + stem;
         sample.rate = pcm->rate;

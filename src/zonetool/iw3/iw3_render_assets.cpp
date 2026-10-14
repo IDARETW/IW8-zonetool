@@ -2004,11 +2004,23 @@ std::string ShadowSource(const std::string &source)
     return output;
 }
 
+void AppendTextureArgument(Json &technique, std::string_view hex);
+
 void AppendCoverageArgument(Json &technique, bool staticModel)
+{
+    AppendTextureArgument(technique, staticModel ? "051000000000" : "051001000000");
+}
+
+// Per-instance IW3 light-grid lighting for static models (StaticModelLightingImage):
+// material texture slot 0x3D bound to the lit pixel shader's t6.
+constexpr std::uint8_t kInstanceLightingSlot = 0x3D;
+constexpr unsigned kInstanceLightingColumns = 256; // instances per image row (6 texels each)
+
+void AppendTextureArgument(Json &technique, const std::string_view hex)
 {
     auto header = Unhex(technique.at("header").get<std::string>());
     auto args = Unhex(technique.at("args").get<std::string>());
-    const auto argument = Unhex(staticModel ? "051000000000" : "051001000000");
+    const auto argument = Unhex(std::string(hex));
     // Shipped records keep each argument category sorted by type (code
     // constants, textures, then code images); insert into the stable block.
     std::size_t at = (std::size_t{header[0x78]} + header[0x79]) * 6;
@@ -2110,7 +2122,8 @@ void ReplaceAtlasTokens(std::string &source, const unsigned columns, const unsig
 
 Json BuildTechset(const std::string &map, const unsigned columns, const unsigned atlasSize,
                   const TechniqueGeometry geometry,
-                  const std::string &glassEnvironment)
+                  const std::string &glassEnvironment, const bool instanceLighting = false,
+                  const std::string &lightVolumeDefines = {})
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
     const bool entity = geometry == TechniqueGeometry::entity;
@@ -2123,6 +2136,10 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         "#define MAP_SOURCE_SUN_MASK 1\n#define MAP_SOURCE_CHANNELS 1\n" + glassEnvironment;
     if (model)
         pixelSource += "#define STATIC_MODEL 1\n";
+    if (staticModel && instanceLighting)
+        pixelSource += "#define MAP_INSTANCE_LIGHTING 1\n";
+    if (entity && !lightVolumeDefines.empty())
+        pixelSource += lightVolumeDefines;
     pixelSource += ResourceText(IDR_IW3_PIXEL_SHADER);
     ReplaceAtlasTokens(pixelSource, columns, atlasSize);
     // Model coverage passes bind no view mip bias; sample with the gradients alone.
@@ -2157,6 +2174,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
                       Hex(std::span(techDigest).first(6));
     lit["name"] =
         "TECHNIQUE_LIT_FORWARDPLUS_BITMASK_" + techset.at("name").get<std::string>().substr(3);
+    if ((staticModel && instanceLighting) || (entity && !lightVolumeDefines.empty()))
+        AppendTextureArgument(lit, "051006003d00"); // type 5, pixel stage, t6, slot 0x3D
     PatchStateIdentity(lit, pixel);
 
     const auto depthProgram =
@@ -2880,7 +2899,9 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                                const std::vector<std::filesystem::path> &sourcePaths,
                                const std::filesystem::path &mapDirectory, const std::string &map,
                                const std::filesystem::path &cacheRoot,
-                               const std::string &surfaceShaderDefines)
+                               const std::string &surfaceShaderDefines,
+                               const unsigned staticModelInstances,
+                               const EntityLightVolume *entityLightVolume)
 {
     zt::LapTimer timing("render");
     std::set<std::string> unique(surfaceMaterials.begin(), surfaceMaterials.end());
@@ -3433,6 +3454,9 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     Json material = Json::parse(ResourceText(IDR_IW3_MATERIAL_TEMPLATE));
     const std::string stem = map + ".d3dbsp";
     plan.material = "w/mw120r_" + map;
+    plan.instanceLightingImage = "mw120r/" + map + "_smodel_lighting";
+    plan.instanceLightingFile = map + "_smodel_lighting.rgba";
+    plan.instanceLightingCount = staticModelInstances;
     plan.materialDefinition = stem + ".material.json";
     std::set<std::string> writtenResidentImages;
     const auto residentImage = [&](Json &definition, const unsigned channel, Image source,
@@ -3919,9 +3943,22 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         Json modelMaterialTemplate = material;
         auto modelInfo = Unhex(modelMaterialTemplate.at("info").get<std::string>());
         Put<std::uint32_t>(modelInfo, 0xC, entity ? 0x80014u : 589844u);
+        // Static placements read their IW3 light-grid lighting (one ambient
+        // cube per instance) from a shared fourth texture.
+        const bool instanceLighting = !entity && staticModelInstances > 0;
+        // Entities (DObjs) sample the world-space light-grid volume instead.
+        const bool volumeLighting = entity && entityLightVolume;
+        if (instanceLighting || volumeLighting)
+        {
+            modelInfo[0x14] = 4; // texture count
+            modelMaterialTemplate["textures"].push_back(
+                {{"header", "3d00000000000000"},
+                 {"image", instanceLighting ? plan.instanceLightingImage : entityLightVolume->image}});
+        }
         modelMaterialTemplate["info"] = Hex(modelInfo);
         Json modelTechset =
-            BuildTechset(map, columns, plan.atlasSize, geometry, plan.glassEnvironment);
+            BuildTechset(map, columns, plan.atlasSize, geometry, plan.glassEnvironment,
+                         instanceLighting, volumeLighting ? entityLightVolume->defines : std::string{});
         std::array<Json, 5> modelTechsets{};
         modelTechsets[static_cast<unsigned>(SurfaceKind::opaque)] = modelTechset;
 
@@ -4005,6 +4042,22 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                               ? Image{1, 1, std::vector<std::uint8_t>{0, 0, 0, 0}}
                               : image(source.response).front(),
                           {1, 1, 1, 1}, "model");
+            if (instanceLighting)
+                direct["imageDefinitions"].push_back(
+                    {{"name", plan.instanceLightingImage},
+                     {"width", kInstanceLightingColumns * 6},
+                     {"height", (staticModelInstances + kInstanceLightingColumns - 1) /
+                                    kInstanceLightingColumns},
+                     {"rgba8", plan.instanceLightingFile},
+                     {"format", 6},
+                     {"mipCount", 1}});
+            if (volumeLighting)
+                direct["imageDefinitions"].push_back({{"name", entityLightVolume->image},
+                                                      {"width", entityLightVolume->width},
+                                                      {"height", entityLightVolume->height},
+                                                      {"rgba8", entityLightVolume->file},
+                                                      {"format", 6},
+                                                      {"mipCount", 1}});
             WriteJson(mapDirectory / materialFile, direct);
             plan.assetMaterials.push_back(
                 {{"schema", 1}, {"material", materialName}, {"materialDefinition", materialFile}});
@@ -4028,7 +4081,21 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         }
         if (source.family == FxMaterialFamily::distortion)
         {
+            // IW3 heat haze and shock rings become Replay's own refraction
+            // materials (common_mp vfx_dist_heat_1 / _shimmer_blast_1, used by
+            // the stock grenade and concussion effects).
+            std::string lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            const bool blast = lower.find("shock") != std::string::npos ||
+                               lower.find("blast") != std::string::npos ||
+                               lower.find("wave") != std::string::npos;
+            const std::string stock =
+                blast ? "elcq/vfx_dist_heat_shimmer_blast_1" : "elcq/vfx_dist_heat_1";
             plan.fxDistortionMaterials.insert(name);
+            plan.stockMaterials.insert(stock);
+            if (!plan.fxMaterialAliases.emplace(name, stock).second)
+                throw std::runtime_error("duplicate IW3 FX material alias: " + name);
             continue;
         }
         const std::string materialName = FxMaterialName(map, source);

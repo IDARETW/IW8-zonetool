@@ -330,8 +330,13 @@ std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
     return film;
 }
 
-std::string FogShaderDefines(const std::optional<ExpFog> &fog)
+std::string FogShaderDefines(const std::optional<ExpFog> &fog, const LightingStyle style)
 {
+    // iw8: opaque surfaces get Replay's native fog pass (stock opaque forward+
+    // shaders apply no fog of their own; only translucent ones do), and the
+    // surface shader adds Replay's probe reflections (MAP_IW8_LIGHTING).
+    if (style == LightingStyle::iw8)
+        return "#define MAP_IW8_LIGHTING 1\n";
     if (!fog)
         return {};
     return "#define MAP_FOG 1\n#define MAP_FOG_START " + Number(fog->start) +
@@ -376,10 +381,37 @@ std::vector<std::uint8_t> BuildGradingClutPixels(const Film &film)
     return pixels;
 }
 
-std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut)
+std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut,
+                              const LightingStyle style, const std::array<float, 3> &sunDirection)
 {
     std::map<std::string_view, std::string> overrides;
-    if (fog)
+    if (style == LightingStyle::iw8)
+    {
+        // Stock mp_shipment's fog, atmospheric scattering and volumetric fields
+        // (replay_vision_iw8_template.inc), lit by this map's sun. A map with
+        // IW3 fog keeps its colour and distances.
+        static constexpr std::pair<std::string_view, std::string_view> kTemplate[] = {
+#include "replay_vision_iw8_template.inc"
+        };
+        for (const auto &[token, value] : kTemplate)
+            overrides[token] = std::string(value);
+        overrides["RLNQONPKS"] = Vector(sunDirection); // fogSunDir
+        if (fog)
+        {
+            const float start = std::clamp(fog->start, 0.0f, 20000.0f);
+            const float halfway = std::clamp(fog->halfway, 1.0f, 70000.0f);
+            overrides["MSTOLQOTKN"] = Number(halfway);    // fogDensity
+            overrides["RPNOKKL"] = Number(start);         // fogStartDist
+            overrides["NMLMMNQLSQ"] = Vector(fog->color); // fogColor
+        }
+    }
+    else if (!fog)
+    {
+        // IW3 maps without setExpFog have no fog; Replay's default vision fog
+        // (70000-unit half distance, full opacity) would still haze big maps.
+        overrides["TRPROKTLS"] = "0"; // fogMaxOpacity
+    }
+    else
     {
         // Replay's non-atmospheric fog (fogAtmosphericScattering 0) evaluates
         // exp2(-(distance - fogStartDist) / fogDensity): fogDensity is the IW3 halfway.
@@ -391,7 +423,10 @@ std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::strin
         overrides["RPNOKKL"] = Number(start);            // fogStartDist
         overrides["NTPTLNNQQL"] = "1";                   // fogColorIntensity
         overrides["NMLMMNQLSQ"] = Vector(fog->color);    // fogColor
-        overrides["TRPROKTLS"] = "1";                    // fogMaxOpacity
+        // The surface shader bakes this fog (FogShaderDefines). Stock opaque
+        // forward+ shaders apply no fog, so a native fog pass would add it a
+        // second time; its opacity stays 0 (the parameters document the map).
+        overrides["TRPROKTLS"] = "0";                    // fogMaxOpacity
         overrides["MPNPSMMTTT"] = Number(halfway);       // fogSunDensity
         overrides["MLORTTKOLN"] = "1";                   // fogSunColorIntensity
         overrides["MRTOMMTTQM"] = Vector(fog->color);    // fogSunColor

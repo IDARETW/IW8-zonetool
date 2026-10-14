@@ -14,6 +14,8 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
+#include <unordered_map>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -946,5 +948,303 @@ bool PrepareNativeLightGrid(const std::filesystem::path &sourceRoot,
     if (!zt::write_file(output.string(), payload))
         throw std::runtime_error("cannot write temporary native Replay light grid");
     return true;
+}
+
+std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
+    const std::filesystem::path &sourceRoot, const std::string &sourceAsset,
+    const std::vector<std::array<float, 3>> &points)
+{
+    std::vector<std::array<std::array<float, 3>, 6>> cubes;
+    const auto metadataPath = sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
+    std::error_code error;
+    if (points.empty() || !std::filesystem::is_regular_file(metadataPath, error))
+        return cubes;
+    const Json metadata = ReadJson(metadataPath);
+    if (metadata.value("available", true) == false)
+        return cubes;
+    std::vector<std::uint8_t> palette;
+    const auto cells = ReadCells(sourceRoot, metadata, palette);
+    const auto probes = BuildProbes(palette);
+    if (cells.empty() || probes.empty())
+        return cubes;
+
+    // Grid coordinates: 32 units in x/y, 64 in z, from -131072 (ReadCells).
+    const auto key = [](const std::int64_t x, const std::int64_t y, const std::int64_t z) {
+        return static_cast<std::uint64_t>(x & 0xffff) | static_cast<std::uint64_t>(y & 0xffff) << 16 |
+               static_cast<std::uint64_t>(z & 0xffff) << 32;
+    };
+    std::unordered_map<std::uint64_t, std::uint16_t> grid;
+    grid.reserve(cells.size());
+    for (const Cell &cell : cells)
+        grid.emplace(key((cell.position[0] + 131072) / 32, (cell.position[1] + 131072) / 32,
+                         (cell.position[2] + 131072) / 64),
+                     cell.entry.color);
+    constexpr std::array<std::array<float, 3>, 6> directions{
+        {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
+    std::array<std::array<float, 9>, 6> basis{};
+    for (std::size_t face = 0; face < 6; ++face)
+        basis[face] = EvaluateShBasis(directions[face]);
+
+    cubes.resize(points.size());
+    std::size_t nearestFallbacks = 0, unlit = 0;
+    for (std::size_t index = 0; index < points.size(); ++index)
+    {
+        const std::array<double, 3> coordinate{(points[index][0] + 131072.0) / 32.0,
+                                               (points[index][1] + 131072.0) / 32.0,
+                                               (points[index][2] + 131072.0) / 64.0};
+        std::array<std::int64_t, 3> base{};
+        std::array<double, 3> fraction{};
+        for (unsigned axis = 0; axis < 3; ++axis)
+        {
+            base[axis] = static_cast<std::int64_t>(std::floor(coordinate[axis]));
+            fraction[axis] = coordinate[axis] - static_cast<double>(base[axis]);
+        }
+        Probe sum{};
+        double total = 0.0;
+        for (unsigned corner = 0; corner < 8; ++corner)
+        {
+            const auto found = grid.find(key(base[0] + (corner & 1), base[1] + ((corner >> 1) & 1),
+                                             base[2] + ((corner >> 2) & 1)));
+            if (found == grid.end())
+                continue;
+            double weight = 1.0;
+            for (unsigned axis = 0; axis < 3; ++axis)
+                weight *= (corner >> axis) & 1 ? fraction[axis] : 1.0 - fraction[axis];
+            if (weight <= 0.0)
+                continue;
+            for (unsigned channel = 0; channel < 3; ++channel)
+                for (unsigned coefficient = 0; coefficient < 9; ++coefficient)
+                    sum[channel][coefficient] +=
+                        static_cast<float>(weight * probes.at(found->second)[channel][coefficient]);
+            total += weight;
+        }
+        if (total < 1.0e-3)
+        {
+            // No surrounding cells (solid volume or outside the grid): the
+            // nearest cell in growing shells, as IW3 falls back to.
+            std::optional<std::uint16_t> nearest;
+            for (std::int64_t radius = 1; radius <= 8 && !nearest; ++radius)
+                for (std::int64_t z = -radius; z <= radius && !nearest; ++z)
+                    for (std::int64_t y = -radius; y <= radius && !nearest; ++y)
+                        for (std::int64_t x = -radius; x <= radius && !nearest; ++x)
+                        {
+                            if (std::max({std::abs(x), std::abs(y), std::abs(z)}) != radius)
+                                continue;
+                            const auto found = grid.find(key(base[0] + x, base[1] + y, base[2] + z));
+                            if (found != grid.end())
+                                nearest = found->second;
+                        }
+            if (!nearest)
+            {
+                ++unlit;
+                continue;
+            }
+            ++nearestFallbacks;
+            sum = probes.at(*nearest);
+            total = 1.0;
+        }
+        for (std::size_t face = 0; face < 6; ++face)
+            for (unsigned channel = 0; channel < 3; ++channel)
+            {
+                double value = 0.0;
+                for (unsigned coefficient = 0; coefficient < 9; ++coefficient)
+                    value += sum[channel][coefficient] / total * basis[face][coefficient];
+                cubes[index][face][channel] = static_cast<float>(std::max(0.0, value));
+            }
+    }
+    zt::info("iw3: lit %zu static model instance(s) from the IW3 light grid (%zu nearest-cell, %zu "
+             "outside the grid)",
+             points.size() - unlit, nearestFallbacks, unlit);
+    return cubes;
+}
+
+std::optional<LightGridVolume> BuildLightGridVolume(const std::filesystem::path &sourceRoot,
+                                                    const std::string &sourceAsset)
+{
+    const auto metadataPath = sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(metadataPath, error))
+        return std::nullopt;
+    const Json metadata = ReadJson(metadataPath);
+    if (metadata.value("available", true) == false)
+        return std::nullopt;
+    std::vector<std::uint8_t> palette;
+    const auto cells = ReadCells(sourceRoot, metadata, palette);
+    const auto probes = BuildProbes(palette);
+    if (cells.empty() || probes.empty())
+        return std::nullopt;
+
+    std::array<std::int64_t, 3> low{INT64_MAX, INT64_MAX, INT64_MAX}, high{INT64_MIN, INT64_MIN, INT64_MIN};
+    const auto coordinate = [](const Cell &cell) {
+        return std::array<std::int64_t, 3>{(cell.position[0] + 131072) / 32,
+                                           (cell.position[1] + 131072) / 32,
+                                           (cell.position[2] + 131072) / 64};
+    };
+    for (const Cell &cell : cells)
+    {
+        const auto c = coordinate(cell);
+        for (unsigned axis = 0; axis < 3; ++axis)
+        {
+            low[axis] = std::min(low[axis], c[axis]);
+            high[axis] = std::max(high[axis], c[axis]);
+        }
+    }
+    // Coarsen until the three coefficient groups of every Z slice fit a
+    // 4096 x 4096 atlas.
+    std::array<std::int64_t, 3> step{1, 1, 1};
+    LightGridVolume volume;
+    for (;;)
+    {
+        for (unsigned axis = 0; axis < 3; ++axis)
+            volume.dims[axis] = static_cast<unsigned>((high[axis] - low[axis]) / step[axis] + 1);
+        const unsigned tileWidth = volume.dims[0] + 2, tileHeight = volume.dims[1] + 2;
+        volume.tilesPerRow = tileWidth <= 4096 ? 4096 / tileWidth : 0;
+        if (volume.tilesPerRow)
+        {
+            const unsigned tiles = 3 * volume.dims[2];
+            const unsigned rows = (tiles + volume.tilesPerRow - 1) / volume.tilesPerRow;
+            // Replay's resident image loader pads each mip to 16 bytes; keep rows 16-byte
+            // multiples so the RGBA8 file length is exactly width * height * 4.
+            volume.width = (std::min(tiles, volume.tilesPerRow) * tileWidth + 3) & ~3u;
+            volume.height = rows * tileHeight;
+            if (volume.height <= 4096)
+                break;
+        }
+        if (step[0] <= step[2] * 2)
+        {
+            step[0] *= 2;
+            step[1] *= 2;
+        }
+        else
+            step[2] *= 2;
+        if (step[0] > 64)
+            return std::nullopt;
+    }
+    volume.cell = {32.0f * step[0], 32.0f * step[1], 64.0f * step[2]};
+    for (unsigned axis = 0; axis < 3; ++axis)
+        volume.origin[axis] = static_cast<float>(low[axis] * (axis == 2 ? 64 : 32) - 131072) +
+                              0.5f * (volume.cell[axis] - (axis == 2 ? 64.0f : 32.0f));
+
+    // L0 + L1 per channel (12 values) per volume cell, averaged over the IW3
+    // cells it covers.
+    const std::size_t count = std::size_t(volume.dims[0]) * volume.dims[1] * volume.dims[2];
+    std::vector<std::array<float, 12>> sh(count);
+    std::vector<float> weight(count, 0.0f);
+    const auto index = [&](const std::array<std::int64_t, 3> &c) {
+        return (std::size_t(c[2]) * volume.dims[1] + std::size_t(c[1])) * volume.dims[0] + std::size_t(c[0]);
+    };
+    for (const Cell &cell : cells)
+    {
+        auto c = coordinate(cell);
+        for (unsigned axis = 0; axis < 3; ++axis)
+            c[axis] = (c[axis] - low[axis]) / step[axis];
+        const std::size_t at = index(c);
+        const Probe &probe = probes.at(cell.entry.color);
+        for (unsigned channel = 0; channel < 3; ++channel)
+            for (unsigned coefficient = 0; coefficient < 4; ++coefficient)
+                sh[at][channel * 4 + coefficient] += probe[channel][coefficient];
+        weight[at] += 1.0f;
+    }
+    std::array<double, 12> total{};
+    double totalWeight = 0.0;
+    for (std::size_t at = 0; at < count; ++at)
+        if (weight[at] > 0.0f)
+        {
+            for (unsigned value = 0; value < 12; ++value)
+            {
+                sh[at][value] /= weight[at];
+                total[value] += sh[at][value];
+            }
+            totalWeight += 1.0;
+            weight[at] = 1.0f;
+        }
+    // Empty cells (solid, outside the playable grid) take their filled
+    // neighbours' average, so trilinear filtering never blends in black.
+    std::size_t filled = 0;
+    for (unsigned pass = 0; pass < 8; ++pass)
+    {
+        std::vector<std::size_t> updates;
+        std::vector<std::array<float, 12>> values;
+        for (unsigned z = 0; z < volume.dims[2]; ++z)
+            for (unsigned y = 0; y < volume.dims[1]; ++y)
+                for (unsigned x = 0; x < volume.dims[0]; ++x)
+                {
+                    const std::size_t at = index({x, y, z});
+                    if (weight[at] > 0.0f)
+                        continue;
+                    std::array<float, 12> sum{};
+                    unsigned neighbours = 0;
+                    const std::array<std::array<int, 3>, 6> offsets{
+                        {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
+                    for (const auto &offset : offsets)
+                    {
+                        const std::int64_t nx = std::int64_t(x) + offset[0], ny = std::int64_t(y) + offset[1],
+                                           nz = std::int64_t(z) + offset[2];
+                        if (nx < 0 || ny < 0 || nz < 0 || nx >= volume.dims[0] || ny >= volume.dims[1] ||
+                            nz >= volume.dims[2])
+                            continue;
+                        const std::size_t other = index({nx, ny, nz});
+                        if (weight[other] <= 0.0f)
+                            continue;
+                        for (unsigned value = 0; value < 12; ++value)
+                            sum[value] += sh[other][value];
+                        ++neighbours;
+                    }
+                    if (!neighbours)
+                        continue;
+                    for (auto &value : sum)
+                        value /= static_cast<float>(neighbours);
+                    updates.push_back(at);
+                    values.push_back(sum);
+                }
+        for (std::size_t update = 0; update < updates.size(); ++update)
+        {
+            sh[updates[update]] = values[update];
+            weight[updates[update]] = 1.0f;
+        }
+        filled += updates.size();
+        if (updates.empty())
+            break;
+    }
+    for (std::size_t at = 0; at < count; ++at)
+        if (weight[at] <= 0.0f)
+            for (unsigned value = 0; value < 12; ++value)
+                sh[at][value] = totalWeight > 0.0 ? static_cast<float>(total[value] / totalWeight) : 0.0f;
+
+    // Group layout (see the header): channel*4 + coefficient indexes sh.
+    constexpr std::array<std::array<unsigned, 4>, 3> groups{{{0, 4, 8, 1}, {2, 3, 5, 6}, {7, 9, 10, 11}}};
+    const auto encode = [](const float value, const bool l0) {
+        const float unit = l0 ? value / 8.0f : value / 8.0f + 0.5f;
+        return static_cast<std::uint8_t>(std::lround(std::clamp(unit, 0.0f, 1.0f) * 255.0f));
+    };
+    const unsigned tileWidth = volume.dims[0] + 2, tileHeight = volume.dims[1] + 2;
+    volume.pixels.assign(std::size_t(volume.width) * volume.height * 4, 0);
+    for (unsigned group = 0; group < 3; ++group)
+        for (unsigned z = 0; z < volume.dims[2]; ++z)
+        {
+            const unsigned tile = group * volume.dims[2] + z;
+            const unsigned originX = (tile % volume.tilesPerRow) * tileWidth;
+            const unsigned originY = (tile / volume.tilesPerRow) * tileHeight;
+            for (unsigned ty = 0; ty < tileHeight; ++ty)
+                for (unsigned tx = 0; tx < tileWidth; ++tx)
+                {
+                    // The border replicates the edge cells.
+                    const unsigned x = std::min(std::max(tx, 1u) - 1, volume.dims[0] - 1);
+                    const unsigned y = std::min(std::max(ty, 1u) - 1, volume.dims[1] - 1);
+                    const auto &cell = sh[index({x, y, z})];
+                    auto *out = volume.pixels.data() +
+                                (std::size_t(originY + ty) * volume.width + originX + tx) * 4;
+                    for (unsigned channel = 0; channel < 4; ++channel)
+                    {
+                        const unsigned value = groups[group][channel];
+                        out[channel] = encode(cell[value], value % 4 == 0);
+                    }
+                }
+        }
+    zt::info("iw3: light-grid volume %ux%ux%u cells of %gx%gx%g units (%zu filled from neighbours), "
+             "%ux%u atlas",
+             volume.dims[0], volume.dims[1], volume.dims[2], volume.cell[0], volume.cell[1],
+             volume.cell[2], filled, volume.width, volume.height);
+    return volume;
 }
 } // namespace iw3

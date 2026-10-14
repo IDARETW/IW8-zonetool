@@ -61,6 +61,9 @@ struct Output {
     float4 clipPosition : CLIP_POS0;
     float4 previousClipPosition : PREV_CLIP_POS0;
 #endif
+    // Static placement index (GfxWorld instance order) for per-instance
+    // lighting; 0xffffffff for entities.
+    nointerpolation uint instance : INSTANCE0;
 };
 
 float4 DecodePlacementQuaternion(uint xy, uint zw) {
@@ -200,5 +203,10 @@ Output main(uint id : SV_VertexID) {
     // Replay decodes authored model RGB from sRGB; alpha remains linear.
     o.color = float4(lerp(color.rgb / 12.92, pow((color.rgb + .055) / 1.055, 2.4),
                           step(.04045, color.rgb)), color.a);
+#ifdef MAP_ENTITY
+    o.instance = 0xffffffff;
+#else
+    o.instance = surface.x;
+#endif
     return o;
 }

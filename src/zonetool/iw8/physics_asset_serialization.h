@@ -21,7 +21,10 @@ void emitPhysicsAssetBody(Writer &writer, const havok::PhysicsAsset &asset)
         asset.havokData.size() > std::numeric_limits<std::uint32_t>::max() || !asset.contents ||
         !((asset.useCategory == 0 && asset.simulationCategory == 0) ||
           (asset.useCategory == 3 && asset.simulationCategory == 1) ||
-          (asset.useCategory == 7 && asset.simulationCategory == 9)))
+          (asset.useCategory == 7 && asset.simulationCategory == 9) ||
+          // Simulated clutter: DynamicDebris / Dynamic (shipped mp_hideout clutter).
+          (asset.useCategory == 3 &&
+           (asset.simulationCategory == 4 || asset.simulationCategory == 5))))
         throw std::runtime_error("emitPhysicsAssetBody: invalid native physics asset");
 
     std::array<std::uint8_t, iw8sz::PHYSICSASSET> body{};

@@ -36,6 +36,8 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <optional>
+#include <string_view>
 #include <regex>
 #include <set>
 #include <string>
@@ -63,6 +65,7 @@ struct Args
     float sunIntensityScale = 1.0f;
     bool navigation = true;
     bool iw3ModeAssets = true;
+    std::string lightingStyle = "iw3";
     std::string gscTool;
 };
 
@@ -101,6 +104,7 @@ void printUsage()
                 "  --metadata <map.json>\n"
                 "  --lighting-profile source|aniyah-incursion\n"
                 "  --sun-intensity-scale <positive multiplier>\n"
+                "  --lighting-style iw3|iw8  (iw8: Replay native fog, atmosphere and volumetrics)\n"
                 "  --no-navigation  (skip generated bot aipaths/navmesh/tacgraph)\n"
                 "  --gsc-tool <gsc-tool.exe>  (compile converted IW3 map scripts; or IW8_GSC_TOOL)\n"
                 "  -v  -q\n");
@@ -178,6 +182,12 @@ bool parseArgs(const int argc, char **argv, Args &args)
         else if (value == "--no-navigation")
         {
             args.navigation = false;
+        }
+        else if (value == "--lighting-style" && index + 1 < argc)
+        {
+            args.lightingStyle = argv[++index];
+            if (args.lightingStyle != "iw3" && args.lightingStyle != "iw8")
+                return false;
         }
         else if (value == "--iw3-mode-assets" && index + 1 < argc)
         {
@@ -1014,15 +1024,65 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
     // Use the final ComWorld sun vector, including any requested profile.
     // Replay rejects compressed shadows whose stored direction differs from
     // the active sun. Moving entities and breakable panes are not baked.
-    const auto sunShadow = prepared
-        ? replaysunshadow::Bake(prepared->shadowScene,
-                                {lighting.direction[0], lighting.direction[1], lighting.direction[2]},
-                                renderMesh.sceneBounds)
-        : replaysunshadow::Data{};
+    // Shipped worlds keep this blob near 14-20 MB; a large IW3 world at one unit
+    // per texel can reach hundreds of MB, so it uses Backlot's two-unit texels.
+    // Worlds far larger than their play space (Greenband: 5.2M caster triangles
+    // over +/-100000 units) overflow even then; their last step bakes only the
+    // casters that can shadow the minimap region plus a margin.
+    constexpr std::size_t kSunShadowBudget = 96u * 1024u * 1024u;
+    const auto bakeSunShadow = [&](const float sampleSize, const replaybounds::Bounds *focus)
+        -> std::optional<replaysunshadow::Data> {
+        try
+        {
+            auto data = replaysunshadow::Bake(
+                prepared->shadowScene, {lighting.direction[0], lighting.direction[1], lighting.direction[2]},
+                renderMesh.sceneBounds, sampleSize, focus);
+            if (data.bytes.size() <= kSunShadowBudget)
+                return data;
+            info("sun-shadow: %zu bytes at %.0f unit(s) per texel%s exceed the %zu-byte budget",
+                 data.bytes.size(), sampleSize, focus ? " (play-space crop)" : "", kSunShadowBudget);
+        }
+        catch (const std::runtime_error &error)
+        {
+            if (std::string_view(error.what()).find("exceeds") == std::string_view::npos)
+                throw;
+            info("sun-shadow: %s at %.0f unit(s) per texel%s", error.what(), sampleSize,
+                 focus ? " (play-space crop)" : "");
+        }
+        return std::nullopt;
+    };
+    replaysunshadow::Data sunShadow;
+    if (prepared)
+    {
+        auto baked = bakeSunShadow(1.0f, nullptr);
+        if (!baked)
+            baked = bakeSunShadow(2.0f, nullptr);
+        if (!baked && compassBounds)
+        {
+            constexpr float margin = 4096.0f;
+            replaybounds::Bounds focus = renderMesh.sceneBounds;
+            const float minX = std::min(compassBounds->northwestX, compassBounds->southeastX) - margin;
+            const float maxX = std::max(compassBounds->northwestX, compassBounds->southeastX) + margin;
+            const float minY = std::min(compassBounds->northwestY, compassBounds->southeastY) - margin;
+            const float maxY = std::max(compassBounds->northwestY, compassBounds->southeastY) + margin;
+            focus.midpoint[0] = (minX + maxX) * 0.5f;
+            focus.midpoint[1] = (minY + maxY) * 0.5f;
+            focus.halfSize[0] = (maxX - minX) * 0.5f;
+            focus.halfSize[1] = (maxY - minY) * 0.5f;
+            info("sun-shadow: baking only casters that shadow the minimap region +%.0f units "
+                 "(%.0f..%.0f, %.0f..%.0f)", margin, minX, maxX, minY, maxY);
+            baked = bakeSunShadow(2.0f, &focus);
+        }
+        if (!baked)
+            throw std::runtime_error("compressed sun-shadow does not fit the native format even at two "
+                                     "units per texel over the play space");
+        sunShadow = std::move(*baked);
+    }
     if (!sunShadow.bytes.empty())
-        info("sun-shadow: baked %u cells at %u resolution, %zu native compressed bytes",
+        info("sun-shadow: baked %u cells at %u resolution (%u uniform, %u quadtree), %zu native "
+             "compressed bytes",
              sunShadow.parameters.forestSize, sunShadow.parameters.resolution,
-             sunShadow.bytes.size());
+             sunShadow.uniformCells, sunShadow.treeCells, sunShadow.bytes.size());
     timing.lap("sun shadow bake");
     const auto glassInitCount = static_cast<uint32_t>(renderMesh.glassPanes.size());
     iw8::havok::PhysicsAsset glassPhysics;
@@ -1161,14 +1221,16 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         const auto sunPrimaryLightIndex = lighting.sunPrimaryLightIndex;
         const replayrender::StaticModels staticModels =
             prepared ? prepared->staticModels : replayrender::StaticModels{};
+        const std::array<float, 3> sunDirection{lighting.direction[0], lighting.direction[1],
+                                                lighting.direction[2]};
         writer.add(ASSET_TYPE_GFX_MAP, assetName,
                    [assetName, renderPath, &renderMesh, primaryLightCount,
                     sunPrimaryLightIndex, staticModels, dynamicCounts,
-                    &sunShadow](iw8::ZoneWriter &output) {
+                    &sunShadow, sunDirection](iw8::ZoneWriter &output) {
                        iw8maps::emitGfxMapBody(output, assetName.c_str(), renderPath,
                                                renderMesh, primaryLightCount, sunPrimaryLightIndex,
                                                staticModels, dynamicCounts.models,
-                                               dynamicCounts.brushes, sunShadow);
+                                               dynamicCounts.brushes, sunShadow, sunDirection);
                    });
         writer.add(ASSET_TYPE_GLASS_MAP, assetName,
                    [assetName, &renderMesh](iw8::ZoneWriter &output) {
@@ -1517,8 +1579,8 @@ int buildMap(const Args &args, const iw3::PreparedMap *prepared = nullptr)
             bounds.mn[index] = data.at("min").at(index).get<float>();
             bounds.mx[index] = data.at("max").at(index).get<float>();
             if (!std::isfinite(bounds.mn[index]) || !std::isfinite(bounds.mx[index]) ||
-                bounds.mn[index] >= bounds.mx[index] || std::abs(bounds.mn[index]) > 100100.0f ||
-                std::abs(bounds.mx[index]) > 100100.0f)
+                bounds.mn[index] >= bounds.mx[index] || std::abs(bounds.mn[index]) > 262144.0f ||
+                std::abs(bounds.mx[index]) > 262144.0f)
             {
                 throw std::runtime_error("invalid map bounds");
             }
@@ -1697,6 +1759,8 @@ int buildIw3(const Args &args)
     options.map = map;
     options.unlinker = args.unlinkerExecutable;
     options.iw3ModeAssets = args.iw3ModeAssets;
+    options.lightingStyle =
+        args.lightingStyle == "iw8" ? iw3::LightingStyle::iw8 : iw3::LightingStyle::iw3;
     const auto requestedOutput = args.outputDirectory.empty()
                                      ? std::filesystem::path(args.positional[0]).parent_path() /
                                            (map + "_iw8")
@@ -1779,7 +1843,10 @@ int translateIw3Script(const Args &args)
         info("translate: %s", note.c_str());
     // Standalone translation has no converted effects: stock stand-ins only.
     const std::string source = translation.gsc + "\niw3compat_minimap()\n{\n}\n" +
-                               "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n}\n";
+                               "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n}\n" +
+                               "\niw3compat_global_fx()\n{\n}\n" + "\niw3compat_structs()\n{\n}\n" +
+                               "\niw3compat_sounds()\n{\n    level.mw120r_sounds = [];\n}\n" +
+                               "\niw3compat_model_parts()\n{\n}\n";
     std::filesystem::create_directories(args.outputDirectory);
     if (!write_file_str(path_join(args.outputDirectory, map + ".gsc"), source))
         return 1;

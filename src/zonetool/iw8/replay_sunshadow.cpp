@@ -110,17 +110,166 @@ std::vector<std::uint8_t> EncodeTile(const std::span<const float> depths,
     return tile;
 }
 
+std::vector<std::uint8_t> EncodeIntervalTile(const std::span<const float> upper,
+                                             const std::span<const float> lower,
+                                             const float origin, const float inverseSpan,
+                                             float &uniform)
+{
+    constexpr std::size_t texels = TileResolution * TileResolution;
+    if (upper.size() != texels || lower.size() != texels)
+        throw std::runtime_error("compressed sun-shadow tile must contain 512x512 intervals");
+    CheckDepthRange(origin, inverseSpan);
+    // Level k holds (512 >> k)^2 nodes: the lowest upper bound and the highest
+    // lower bound of the texels with a caster (+inf / -inf without one).
+    constexpr unsigned levels = 10;
+    std::array<std::vector<float>, levels> high, low;
+    high[0].resize(texels);
+    low[0].resize(texels);
+    for (std::size_t index = 0; index < texels; ++index)
+    {
+        if (!std::isfinite(upper[index]) || upper[index] < 0.0f || upper[index] > 1.0f ||
+            std::isnan(lower[index]))
+            throw std::runtime_error("compressed sun-shadow depth is outside [0, 1]");
+        const bool caster = upper[index] > 0.0f;
+        high[0][index] = caster ? upper[index] : INFINITY;
+        low[0][index] = caster ? lower[index] : -INFINITY;
+    }
+    for (unsigned level = 1; level < levels; ++level)
+    {
+        const unsigned size = TileResolution >> level, previous = size * 2;
+        high[level].resize(std::size_t(size) * size);
+        low[level].resize(std::size_t(size) * size);
+        for (unsigned y = 0; y < size; ++y)
+            for (unsigned x = 0; x < size; ++x)
+            {
+                float h = INFINITY, l = -INFINITY;
+                for (unsigned child = 0; child < 4; ++child)
+                {
+                    const std::size_t from =
+                        std::size_t(y * 2 + (child >> 1)) * previous + x * 2 + (child & 1);
+                    h = std::min(h, high[level - 1][from]);
+                    l = std::max(l, low[level - 1][from]);
+                }
+                high[level][std::size_t(y) * size + x] = h;
+                low[level][std::size_t(y) * size + x] = l;
+            }
+    }
+    uniform = 0.0f;
+    if (!std::isfinite(high[levels - 1][0]))
+        throw std::runtime_error("compressed sun-shadow tile has no caster");
+    if (low[levels - 1][0] < high[levels - 1][0])
+    {
+        uniform = high[levels - 1][0];
+        return {};
+    }
+
+    struct Node
+    {
+        std::size_t offset;
+        unsigned x, y, size;
+    };
+    std::vector<std::uint8_t> tile(80);
+    Store(tile, 4, TileResolution);
+    Store(tile, 8, std::bit_cast<std::uint32_t>(1.0f / TileResolution));
+    Store(tile, 16, 0x00020000);
+    Store(tile, 24, std::bit_cast<std::uint32_t>(origin));
+    Store(tile, 28, std::bit_cast<std::uint32_t>(inverseSpan));
+    std::vector<Node> pending;
+    for (unsigned root = 0; root < 4; ++root)
+        pending.push_back({32 + 12 * root, (root & 1) * 256u, (root >> 1) * 256u, 256});
+    for (std::size_t cursor = 0; cursor < pending.size(); ++cursor)
+    {
+        const Node node = pending[cursor];
+        const unsigned childSize = node.size / 2;
+        const unsigned level = std::countr_zero(childSize);
+        const unsigned levelWidth = TileResolution >> level;
+        const std::size_t base = tile.size();
+        if (base <= node.offset || base - node.offset > 0x00ffffffu)
+            throw std::runtime_error("compressed sun-shadow child offset exceeds 24 bits");
+        std::uint32_t packed = static_cast<std::uint32_t>(base - node.offset) << 8;
+        for (unsigned child = 0; child < 4; ++child)
+        {
+            const unsigned x = node.x + (child & 1) * childSize;
+            const unsigned y = node.y + (child >> 1) * childSize;
+            const std::size_t index = std::size_t(y >> level) * levelWidth + (x >> level);
+            const float h = high[level][index], l = low[level][index];
+            // 0: no caster (inherited zero), 3: one depth for the block, 1: split.
+            const unsigned type = !std::isfinite(h) ? 0 : (childSize == 1 || l < h) ? 3 : 1;
+            packed |= type << (2 * child);
+            if (!type)
+                continue;
+            const std::size_t offset = tile.size();
+            tile.resize(offset + 4);
+            if (type == 1)
+                pending.push_back({offset, x, y, childSize});
+            else
+                Store(tile, offset, std::bit_cast<std::uint32_t>(h));
+        }
+        Store(tile, node.offset, packed);
+    }
+    Store(tile, 0, static_cast<std::uint32_t>(tile.size()));
+    Store(tile, 12, static_cast<std::uint32_t>(tile.size()));
+
+    // Decode the tree and check every texel against its interval: first
+    // surfaces stay lit (stored <= upper), the surface behind stays shadowed
+    // (stored > lower), texels without a caster are free.
+    std::vector<float> decoded(texels, 0.0f);
+    std::vector<Node> walk;
+    for (unsigned root = 0; root < 4; ++root)
+        walk.push_back({32 + 12 * root, (root & 1) * 256u, (root >> 1) * 256u, 256});
+    while (!walk.empty())
+    {
+        const Node node = walk.back();
+        walk.pop_back();
+        const std::uint32_t packed = Read(tile, node.offset);
+        std::size_t child = node.offset + (packed >> 8);
+        const unsigned childSize = node.size / 2;
+        for (unsigned index = 0; index < 4; ++index)
+        {
+            const unsigned type = (packed >> (2 * index)) & 3;
+            if (!type)
+                continue;
+            const unsigned x = node.x + (index & 1) * childSize;
+            const unsigned y = node.y + (index >> 1) * childSize;
+            if (type == 1)
+                walk.push_back({child, x, y, childSize});
+            else
+            {
+                const float value = std::bit_cast<float>(Read(tile, child));
+                for (unsigned row = y; row < y + childSize; ++row)
+                    std::fill_n(decoded.begin() + std::size_t(row) * TileResolution + x, childSize, value);
+            }
+            child += 4;
+        }
+    }
+    for (std::size_t index = 0; index < texels; ++index)
+        if (upper[index] > 0.0f &&
+            (decoded[index] > upper[index] ||
+             (decoded[index] <= lower[index] && decoded[index] != upper[index])))
+            throw std::runtime_error("compressed sun-shadow interval tile failed verification");
+    return tile;
+}
+
 std::vector<std::uint8_t> EncodeForest(
     const std::uint32_t resolution, const std::uint16_t width, const std::uint16_t height,
     const float origin, const float inverseSpan,
-    const std::span<const std::vector<std::uint8_t>> tiles)
+    const std::span<const std::vector<std::uint8_t>> tiles,
+    const std::span<const float> uniform)
 {
     CheckDepthRange(origin, inverseSpan);
     if (resolution < TileResolution || !std::has_single_bit(resolution) ||
         !width || !height || std::uint32_t(width) > resolution / TileResolution ||
         std::uint32_t(height) > resolution / TileResolution ||
-        tiles.size() != std::size_t(width) * height || tiles.size() > (MaximumBytes - 32) / 4)
+        tiles.size() != std::size_t(width) * height || tiles.size() > (MaximumBytes - 32) / 4 ||
+        (!uniform.empty() && uniform.size() != tiles.size()))
         throw std::runtime_error("invalid compressed sun-shadow forest dimensions");
+    // A uniform cell stores its positive depth itself (high bit clear); a
+    // tile cell stores 0x80000000 | offset.
+    for (std::size_t cell = 0; cell < uniform.size(); ++cell)
+        if (uniform[cell] != 0.0f &&
+            (!tiles[cell].empty() || !std::isfinite(uniform[cell]) || uniform[cell] < 0.0f ||
+             uniform[cell] > 1.0f))
+            throw std::runtime_error("invalid compressed sun-shadow uniform cell");
 
     std::size_t size = 32 + tiles.size() * 4;
     for (const auto &tile : tiles)
@@ -155,12 +304,17 @@ std::vector<std::uint8_t> EncodeForest(
             Store(forest, 32 + 4 * cell, 0x80000000u | static_cast<std::uint32_t>(forest.size()));
             forest.insert(forest.end(), tiles[cell].begin(), tiles[cell].end());
         }
+        else if (!uniform.empty() && uniform[cell] != 0.0f)
+            Store(forest, 32 + 4 * cell, std::bit_cast<std::uint32_t>(uniform[cell]));
     return forest;
 }
 
 Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
-          const replaybounds::Bounds &receiverBounds)
+          const replaybounds::Bounds &receiverBounds, const float sampleSize,
+          const replaybounds::Bounds *focus)
 {
+    if (!(sampleSize == 1.0f || sampleSize == 2.0f))
+        throw std::runtime_error("compressed sun-shadow sample size must be 1 or 2 (shipped values)");
     using Microsoft::WRL::ComPtr;
     using Vec3 = std::array<float, 3>;
     const auto dot = [](const Vec3 &a, const Vec3 &b) {
@@ -213,6 +367,25 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
     std::erase_if(projected, [](const Surface &surface) { return surface.vertices.empty(); });
     if (projected.empty())
         return {};
+    // The focus box's footprint in sun space (x = right, y = -up).
+    float focusMinX = -INFINITY, focusMinY = -INFINITY, focusMaxX = INFINITY, focusMaxY = INFINITY;
+    if (focus)
+    {
+        focusMinX = focusMinY = INFINITY;
+        focusMaxX = focusMaxY = -INFINITY;
+        for (unsigned corner = 0; corner < 8; ++corner)
+        {
+            Vec3 point{};
+            for (unsigned axis = 0; axis < 3; ++axis)
+                point[axis] = focus->midpoint[axis] +
+                              ((corner >> axis) & 1 ? focus->halfSize[axis] : -focus->halfSize[axis]);
+            const float x = dot(right, point), y = -dot(up, point);
+            focusMinX = std::min(focusMinX, x);
+            focusMaxX = std::max(focusMaxX, x);
+            focusMinY = std::min(focusMinY, y);
+            focusMaxY = std::max(focusMaxY, y);
+        }
+    }
     Vec3 minimum{INFINITY, INFINITY, INFINITY}, maximum{-INFINITY, -INFINITY, -INFINITY};
     for (auto &surface : projected)
     {
@@ -229,15 +402,44 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
                 throw std::runtime_error("invalid compressed sun-shadow caster attributes");
             vertex.position = {dot(right, vertex.position), -dot(up, vertex.position),
                                 dot(sunDirection, vertex.position)};
+        }
+        if (focus)
+        {
+            // Keep the triangles that can shadow the focus box.
+            std::vector<decltype(surface.vertices)::value_type> kept;
+            for (std::size_t first = 0; first < surface.vertices.size(); first += 3)
+            {
+                float minX = INFINITY, minY = INFINITY, maxX = -INFINITY, maxY = -INFINITY;
+                for (std::size_t corner = 0; corner < 3; ++corner)
+                {
+                    const auto &position = surface.vertices[first + corner].position;
+                    minX = std::min(minX, position[0]);
+                    maxX = std::max(maxX, position[0]);
+                    minY = std::min(minY, position[1]);
+                    maxY = std::max(maxY, position[1]);
+                }
+                if (maxX >= focusMinX && minX <= focusMaxX && maxY >= focusMinY && minY <= focusMaxY)
+                    kept.insert(kept.end(), surface.vertices.begin() + first,
+                                surface.vertices.begin() + first + 3);
+            }
+            surface.vertices = std::move(kept);
+        }
+        for (const auto &vertex : surface.vertices)
             for (unsigned axis = 0; axis < 3; ++axis)
             {
                 minimum[axis] = std::min(minimum[axis], vertex.position[axis]);
                 maximum[axis] = std::max(maximum[axis], vertex.position[axis]);
             }
-        }
     }
-    constexpr float sampleSize = 1.0f;
-    constexpr float tileWorldSize = TileResolution * sampleSize;
+    std::erase_if(projected, [](const Surface &surface) { return surface.vertices.empty(); });
+    if (projected.empty())
+        return {};
+    // The shadow covers at most the focus footprint.
+    minimum[0] = std::max(minimum[0], focusMinX);
+    minimum[1] = std::max(minimum[1], focusMinY);
+    maximum[0] = std::min(maximum[0], focusMaxX);
+    maximum[1] = std::min(maximum[1], focusMaxY);
+    const float tileWorldSize = TileResolution * sampleSize;
     const float startX = std::floor(minimum[0] / tileWorldSize) * tileWorldSize;
     const float startY = std::floor(minimum[1] / tileWorldSize) * tileWorldSize;
     const auto width = static_cast<std::uint32_t>(std::max(1.0f,
@@ -292,8 +494,9 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
             maxX = std::max(maxX, vertex.position[0]);
             maxY = std::max(maxY, vertex.position[1]);
         }
-        const auto left = std::min(width - 1, static_cast<unsigned>(minX / TileResolution));
-        const auto top = std::min(height - 1, static_cast<unsigned>(minY / TileResolution));
+        // A focus crop can leave triangles starting before the grid.
+        const auto left = std::min(width - 1, static_cast<unsigned>(std::max(0.0f, minX) / TileResolution));
+        const auto top = std::min(height - 1, static_cast<unsigned>(std::max(0.0f, minY) / TileResolution));
         const auto lastX = std::min(width - 1, static_cast<unsigned>(maxX / TileResolution));
         const auto lastY = std::min(height - 1, static_cast<unsigned>(maxY / TileResolution));
         for (unsigned y = top; y <= lastY; ++y)
@@ -332,6 +535,13 @@ void ps(Output input) {
     if (alphaTest == 2) { if (alpha <= 0) discard; }
     else if (alphaTest == 3) { if (alpha >= 0.5) discard; }
     else clip(alpha - 0.5);
+}
+// Second pass: the nearest surface behind the first one (depth peeling).
+Texture2D<float> firstDepth : register(t1);
+cbuffer Peel : register(b1) { float peelEpsilon; float3 peelPadding; };
+void peel(Output input) {
+    if (alphaTest != 0) ps(input);
+    if (input.position.z >= firstDepth.Load(int3(input.position.xy, 0)) - peelEpsilon) discard;
 })";
     const auto compile = [&](const char *entry, const char *target) {
         ComPtr<ID3DBlob> code, errors;
@@ -344,6 +554,7 @@ void ps(Output input) {
         return code;
     };
     const auto vertexCode = compile("vs", "vs_5_0"), pixelCode = compile("ps", "ps_5_0");
+    const auto peelCode = compile("peel", "ps_5_0");
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     check(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
@@ -354,6 +565,9 @@ void ps(Output input) {
                                      nullptr, &vertexShader), "create vertex shader");
     check(device->CreatePixelShader(pixelCode->GetBufferPointer(), pixelCode->GetBufferSize(),
                                     nullptr, &pixelShader), "create pixel shader");
+    ComPtr<ID3D11PixelShader> peelShader;
+    check(device->CreatePixelShader(peelCode->GetBufferPointer(), peelCode->GetBufferSize(),
+                                    nullptr, &peelShader), "create depth-peel shader");
     const std::array<D3D11_INPUT_ELEMENT_DESC, 3> elements{{
         {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
         {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
@@ -402,6 +616,39 @@ void ps(Output input) {
     texture.BindFlags = 0;
     texture.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     check(device->CreateTexture2D(&texture, nullptr, &readback), "create readback image");
+    // The first-surface depth, read by the depth-peel pass.
+    texture.Usage = D3D11_USAGE_DEFAULT;
+    texture.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    texture.CPUAccessFlags = 0;
+    ComPtr<ID3D11Texture2D> firstCopy;
+    check(device->CreateTexture2D(&texture, nullptr, &firstCopy), "create first-surface image");
+    D3D11_SHADER_RESOURCE_VIEW_DESC firstViewDescription{};
+    firstViewDescription.Format = DXGI_FORMAT_R32_FLOAT;
+    firstViewDescription.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    firstViewDescription.Texture2D.MipLevels = 1;
+    ComPtr<ID3D11ShaderResourceView> firstView;
+    check(device->CreateShaderResourceView(firstCopy.Get(), &firstViewDescription, &firstView),
+          "create first-surface view");
+    // Interval bounds in normalized depth (one world unit along the sun is
+    // inverseSpan): a surface within peelEpsilon of the first is the same
+    // layer; the stored depth stays margin above the surface behind and at
+    // most tolerance below the first surface (dynamic receivers under cover).
+    const float peelEpsilon = 0.25f * inverseSpan;
+    const float margin = 2.0f * inverseSpan;
+    const float tolerance = 32.0f * inverseSpan;
+    ComPtr<ID3D11Buffer> peelConstants, opaqueConstants;
+    {
+        const std::array<float, 4> values{peelEpsilon, 0, 0, 0};
+        D3D11_BUFFER_DESC buffer{};
+        buffer.ByteWidth = sizeof(values);
+        buffer.Usage = D3D11_USAGE_IMMUTABLE;
+        buffer.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        const D3D11_SUBRESOURCE_DATA data{values.data(), 0, 0};
+        check(device->CreateBuffer(&buffer, &data, &peelConstants), "create depth-peel constants");
+        const std::array<std::uint32_t, 4> opaque{0, 0, 0, 0};
+        const D3D11_SUBRESOURCE_DATA opaqueData{opaque.data(), 0, 0};
+        check(device->CreateBuffer(&buffer, &opaqueData, &opaqueConstants), "create opaque constants");
+    }
     D3D11_SAMPLER_DESC sampler{};
     sampler.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
@@ -473,77 +720,116 @@ void ps(Output input) {
     }
 
     std::vector<std::vector<std::uint8_t>> tiles(std::size_t(width) * height);
+    std::vector<float> uniformCells(tiles.size());
     std::vector<float> pixels(TileResolution * TileResolution);
+    std::vector<float> behind(TileResolution * TileResolution);
+    std::vector<float> lowerBounds(TileResolution * TileResolution);
     std::vector<Vertex> vertices;
     std::size_t encodedSize = 32 + tiles.size() * 4;
+    // Draws one tile's casters into the depth image: the first surface, or
+    // with peel the nearest surface behind the first (firstCopy).
+    const auto drawCasters = [&](const unsigned x, const unsigned y,
+                                 const std::vector<std::size_t> &cellCasters, const bool peel) {
+        context->OMSetRenderTargets(0, nullptr, depthView.Get());
+        context->ClearDepthStencilView(depthView.Get(), D3D11_CLEAR_DEPTH, 0, 0);
+        if (peel)
+        {
+            context->PSSetShaderResources(1, 1, firstView.GetAddressOf());
+            context->PSSetConstantBuffers(1, 1, peelConstants.GetAddressOf());
+        }
+        for (const auto index : cellCasters)
+        {
+            const auto &surface = projected[index];
+            const auto &material = scene.materials[surface.material];
+            vertices.clear();
+            for (std::size_t first = 0; first < surface.vertices.size(); first += 3)
+            {
+                std::array<Vertex, 3> triangle;
+                float minX = INFINITY, minY = INFINITY, maxX = -INFINITY, maxY = -INFINITY;
+                for (unsigned corner = 0; corner < 3; ++corner)
+                {
+                    auto &vertex = triangle[corner];
+                    vertex = surface.vertices[first + corner];
+                    vertex.position[0] -= float(x * TileResolution);
+                    vertex.position[1] -= float(y * TileResolution);
+                    minX = std::min(minX, vertex.position[0]);
+                    maxX = std::max(maxX, vertex.position[0]);
+                    minY = std::min(minY, vertex.position[1]);
+                    maxY = std::max(maxY, vertex.position[1]);
+                }
+                if (maxX >= 0 && maxY >= 0 && minX < TileResolution && minY < TileResolution)
+                    vertices.insert(vertices.end(), triangle.begin(), triangle.end());
+            }
+            if (vertices.empty())
+                continue;
+            if (vertices.size() > UINT32_MAX / sizeof(Vertex))
+                throw std::runtime_error("compressed sun-shadow vertex buffer exceeds native size");
+            D3D11_BUFFER_DESC buffer{};
+            buffer.ByteWidth = static_cast<UINT>(vertices.size() * sizeof(Vertex));
+            buffer.Usage = D3D11_USAGE_IMMUTABLE;
+            buffer.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            const D3D11_SUBRESOURCE_DATA vertexData{vertices.data(), 0, 0};
+            ComPtr<ID3D11Buffer> vertexBuffer;
+            check(device->CreateBuffer(&buffer, &vertexData, &vertexBuffer), "create caster vertices");
+            const UINT stride = sizeof(Vertex), offset = 0;
+            context->IASetVertexBuffers(0, 1, vertexBuffer.GetAddressOf(), &stride, &offset);
+            context->RSSetState(rasterizers[material.cullMode].Get());
+            context->PSSetShader(peel ? peelShader.Get() : material.alphaTest ? pixelShader.Get() : nullptr,
+                                 nullptr, 0);
+            context->PSSetConstantBuffers(0, 1, material.alphaTest
+                                                    ? constants[surface.material].GetAddressOf()
+                                                    : opaqueConstants.GetAddressOf());
+            context->PSSetShaderResources(0, 1, alphaViews[surface.material].GetAddressOf());
+            context->Draw(static_cast<UINT>(vertices.size()), 0);
+        }
+        context->OMSetRenderTargets(0, nullptr, nullptr);
+        if (peel)
+        {
+            ID3D11ShaderResourceView *none = nullptr;
+            context->PSSetShaderResources(1, 1, &none);
+        }
+    };
+    const auto readDepth = [&](std::vector<float> &out) {
+        context->CopyResource(readback.Get(), target.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        check(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped), "read caster depth");
+        for (unsigned row = 0; row < TileResolution; ++row)
+            std::memcpy(out.data() + row * TileResolution,
+                        static_cast<const std::uint8_t *>(mapped.pData) + row * mapped.RowPitch,
+                        TileResolution * sizeof(float));
+        context->Unmap(readback.Get(), 0);
+    };
     for (unsigned y = 0; y < height; ++y)
         for (unsigned x = 0; x < width; ++x)
         {
             const auto cell = y * width + x;
             if (candidates[cell].empty())
                 continue;
-            context->OMSetRenderTargets(0, nullptr, depthView.Get());
-            context->ClearDepthStencilView(depthView.Get(), D3D11_CLEAR_DEPTH, 0, 0);
-            for (const auto index : candidates[cell])
-            {
-                const auto &surface = projected[index];
-                const auto &material = scene.materials[surface.material];
-                vertices.clear();
-                for (std::size_t first = 0; first < surface.vertices.size(); first += 3)
-                {
-                    std::array<Vertex, 3> triangle;
-                    float minX = INFINITY, minY = INFINITY, maxX = -INFINITY, maxY = -INFINITY;
-                    for (unsigned corner = 0; corner < 3; ++corner)
-                    {
-                        auto &vertex = triangle[corner];
-                        vertex = surface.vertices[first + corner];
-                        vertex.position[0] -= float(x * TileResolution);
-                        vertex.position[1] -= float(y * TileResolution);
-                        minX = std::min(minX, vertex.position[0]);
-                        maxX = std::max(maxX, vertex.position[0]);
-                        minY = std::min(minY, vertex.position[1]);
-                        maxY = std::max(maxY, vertex.position[1]);
-                    }
-                    if (maxX >= 0 && maxY >= 0 && minX < TileResolution && minY < TileResolution)
-                        vertices.insert(vertices.end(), triangle.begin(), triangle.end());
-                }
-                if (vertices.empty())
-                    continue;
-                if (vertices.size() > UINT32_MAX / sizeof(Vertex))
-                    throw std::runtime_error("compressed sun-shadow vertex buffer exceeds native size");
-                D3D11_BUFFER_DESC buffer{};
-                buffer.ByteWidth = static_cast<UINT>(vertices.size() * sizeof(Vertex));
-                buffer.Usage = D3D11_USAGE_IMMUTABLE;
-                buffer.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-                const D3D11_SUBRESOURCE_DATA vertexData{vertices.data(), 0, 0};
-                ComPtr<ID3D11Buffer> vertexBuffer;
-                check(device->CreateBuffer(&buffer, &vertexData, &vertexBuffer), "create caster vertices");
-                const UINT stride = sizeof(Vertex), offset = 0;
-                context->IASetVertexBuffers(0, 1, vertexBuffer.GetAddressOf(), &stride, &offset);
-                context->RSSetState(rasterizers[material.cullMode].Get());
-                context->PSSetShader(material.alphaTest ? pixelShader.Get() : nullptr, nullptr, 0);
-                context->PSSetConstantBuffers(0, 1, constants[surface.material].GetAddressOf());
-                context->PSSetShaderResources(0, 1, alphaViews[surface.material].GetAddressOf());
-                context->Draw(static_cast<UINT>(vertices.size()), 0);
-            }
-            context->OMSetRenderTargets(0, nullptr, nullptr);
-            context->CopyResource(readback.Get(), target.Get());
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            check(context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapped), "read caster depth");
-            for (unsigned row = 0; row < TileResolution; ++row)
-                std::memcpy(pixels.data() + row * TileResolution,
-                            static_cast<const std::uint8_t *>(mapped.pData) + row * mapped.RowPitch,
-                            TileResolution * sizeof(float));
-            context->Unmap(readback.Get(), 0);
+            drawCasters(x, y, candidates[cell], false);
+            readDepth(pixels);
             if (std::none_of(pixels.begin(), pixels.end(), [](float value) { return value != 0; }))
                 continue;
-            tiles[cell] = EncodeTile(pixels, origin, inverseSpan);
+            context->CopyResource(firstCopy.Get(), target.Get());
+            drawCasters(x, y, candidates[cell], true);
+            readDepth(behind);
+            for (std::size_t index = 0; index < pixels.size(); ++index)
+                lowerBounds[index] = behind[index] > 0.0f
+                                         ? std::max(behind[index] + margin, pixels[index] - tolerance)
+                                         : -INFINITY;
+            float uniform = 0.0f;
+            tiles[cell] = EncodeIntervalTile(pixels, lowerBounds, origin, inverseSpan, uniform);
+            uniformCells[cell] = uniform;
+            if (uniform != 0.0f)
+                ++result.uniformCells;
+            else
+                ++result.treeCells;
             if (tiles[cell].size() > MaximumBytes - encodedSize)
                 throw std::runtime_error("compressed sun-shadow bake exceeds 31-bit pointers");
             encodedSize += tiles[cell].size();
         }
     result.bytes = EncodeForest(parameters.resolution, static_cast<std::uint16_t>(width),
-                                static_cast<std::uint16_t>(height), origin, inverseSpan, tiles);
+                                static_cast<std::uint16_t>(height), origin, inverseSpan, tiles,
+                                uniformCells);
     return result;
 }
 } // namespace replaysunshadow

@@ -20,6 +20,10 @@ struct DynamicEntity
     std::array<float, 4> quaternion{};
     std::array<float, 3> origin{};
     bool noPhysics{true};
+    // Simulated clutter: physics-asset rigid-body count and collision flags
+    // (shipped DynEnt clutter: one body per model bone, collisionFlags 2).
+    std::uint8_t rigidBodies{};
+    std::uint8_t collisionFlags{};
     DynamicEntityBasis basis{DynamicEntityBasis::model};
     std::uint16_t brushModel{};
 };

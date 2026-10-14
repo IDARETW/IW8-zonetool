@@ -101,6 +101,8 @@ struct SourceStaticModel
     // IW3 skeleton of a scripted model that hides, shows, or plays effects on
     // parts by bone (destructible vehicles); empty keeps one tag_origin bone.
     std::vector<SourceBone> bones;
+    // Simulated clutter body from the IW3 physics preset (dynamic models).
+    std::optional<iw8::havok::ClutterBody> clutter;
 };
 
 struct SourceStaticModelInstance
@@ -402,7 +404,7 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
     else if (supplementalAssets)
     {
         arguments.push_back(L"--include-assets");
-        arguments.push_back(L"xmodel,material,image,fx,impactfx");
+        arguments.push_back(L"xmodel,material,image,fx,impactfx,physpreset,soundcurve");
     }
 
     std::vector<std::filesystem::path> searchPaths;
@@ -1239,6 +1241,27 @@ constexpr const char *kIw3VehicleDestructibleEffects[] = {
 constexpr const char *kIw3CompatPropEffects[] = {"impacts/small_glass",
                                                  "impacts/small_metalhit_1"};
 
+// IW3 maps\mp\_global_fx.gsc: a one-shot effect (and loop sound) on every
+// script_struct with these targetnames (prefab fires, lamp haze, tower lights).
+struct Iw3GlobalFx
+{
+    const char *targetname;
+    const char *effect;
+    const char *sound;
+};
+constexpr Iw3GlobalFx kIw3GlobalFx[] = {
+    {"barrel_fireFX_origin", "fire/firelp_barrel_pm", "fire_barrel_small"},
+    {"ch_streetlight_02_FX_origin", "misc/lighthaze", nullptr},
+    {"me_streetlight_01_FX_origin", "misc/lighthaze_bog_a", nullptr},
+    {"ch_street_light_01_on", "misc/light_glow_white", nullptr},
+    {"highway_lamp_post", "misc/lighthaze_villassault", nullptr},
+    {"cs_cargoship_spotlight_on_FX_origin", "misc/lighthaze", nullptr},
+    {"me_dumpster_fire_FX_origin", "fire/firelp_med_pm_nodistort", "fire_dumpster_medium"},
+    {"com_tires_burning01_FX_origin", "fire/tire_fire_med", nullptr},
+    {"icbm_powerlinetower_FX_origin", "misc/power_tower_light_red_blink", nullptr},
+};
+
+
 // loadfx( "name" ) literals in the map's own IW3 scripts.
 std::set<std::string> ReadScriptEffectNames(const std::filesystem::path &scriptDirectory)
 {
@@ -1262,6 +1285,33 @@ std::set<std::string> ReadScriptEffectNames(const std::filesystem::path &scriptD
             std::transform(name.begin(), name.end(), name.begin(),
                            [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
             names.insert(name);
+        }
+    }
+    return names;
+}
+
+// Effect-like string literals ("mire/bilbord_loop") in the map scripts: maps
+// pass effect names through their own helpers to loadfx( variable ).
+std::set<std::string> ReadScriptEffectLiterals(const std::filesystem::path &scriptDirectory)
+{
+    std::set<std::string> names;
+    std::error_code error;
+    if (!std::filesystem::is_directory(scriptDirectory, error))
+        return names;
+    static const std::regex literal(R"re("([A-Za-z0-9_\-]+(?:[/\\][A-Za-z0-9_\-\.]+)+)")re");
+    for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory, error))
+    {
+        if (entry.path().extension() != ".gsc")
+            continue;
+        std::string text;
+        if (!zt::read_file_str(entry.path().string(), text))
+            continue;
+        for (auto match = std::sregex_iterator(text.begin(), text.end(), literal);
+             match != std::sregex_iterator(); ++match)
+        {
+            std::string name = (*match)[1].str();
+            std::replace(name.begin(), name.end(), '\\', '/');
+            names.insert(Lowercase(name));
         }
     }
     return names;
@@ -1292,6 +1342,32 @@ std::set<std::string> ReadDeclaredFx(const std::filesystem::path &zoneFile)
     }
     if (input.bad())
         throw std::runtime_error("cannot read IW3 FX zone declarations");
+    return names;
+}
+
+// Effects the IW3 impact table plays. Maps whose zone does not redeclare them
+// (Gulag) use common_mp's, which the supplemental extraction provides.
+std::set<std::string> ReadImpactEffectNames(const std::filesystem::path &root)
+{
+    std::set<std::string> names;
+    for (const auto &path : {root / "impactfx" / "_default.iw3.json",
+                             root / "raw" / "impactfx" / "_default.iw3.json"})
+    {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(path, error))
+            continue;
+        const Json source = ReadJson(path);
+        const auto entries = source.find("entries");
+        if (entries == source.end() || !entries->is_array())
+            break;
+        for (const auto &entry : *entries)
+            for (const char *surfaces : {"nonflesh", "flesh"})
+                if (const auto slots = entry.find(surfaces); slots != entry.end() && slots->is_array())
+                    for (const auto &slot : *slots)
+                        if (slot.is_string() && IsValidFxAssetName(slot.get<std::string>()))
+                            names.insert(slot.get<std::string>());
+        break;
+    }
     return names;
 }
 
@@ -1369,6 +1445,35 @@ std::vector<PreparedRawFile> ReadPreparedRawFiles(const std::filesystem::path &r
     return rawFiles;
 }
 
+// Physics presets named by the map's dynamic models that are not exported yet
+// (shared presets such as ",bucket_metal" live in common_mp).
+std::vector<std::string> MissingPhysicsPresets(const std::filesystem::path &root)
+{
+    std::set<std::string> missing;
+    std::error_code error;
+    const auto directory = root / "maps" / "mp";
+    if (!std::filesystem::is_directory(directory, error))
+        return {};
+    for (const auto &entry : std::filesystem::directory_iterator(directory, error))
+    {
+        if (!entry.path().string().ends_with(".replay-collision.json"))
+            continue;
+        const Json collision = ReadJson(entry.path());
+        for (const auto &definition : collision.value("dynamic_models", Json::array()))
+        {
+            if (!definition.contains("physics_preset") || !definition.at("physics_preset").is_string())
+                continue;
+            std::string name = definition.at("physics_preset").get<std::string>();
+            while (!name.empty() && name.front() == ',')
+                name.erase(name.begin());
+            if (!name.empty() && name.find_first_of("/\\") == std::string::npos &&
+                !std::filesystem::is_regular_file(root / "physic" / name, error))
+                missing.insert(name);
+        }
+    }
+    return {missing.begin(), missing.end()};
+}
+
 std::vector<std::string> MissingDeclaredFx(const std::filesystem::path &root)
 {
     std::set<std::string> missing;
@@ -1424,12 +1529,14 @@ std::string_view SourceAssetAuditReason(const std::string_view type)
         return "source techniquesets are not portable; reachable materials use matched Replay "
                "material and techniqueset contracts";
     if (type == "fx")
-        return "these source FX graphs use element or material families that are not yet mapped "
-               "to native Replay emitters";
+        return "effects the map never uses (no script, createfx, impact-table, destructible or "
+               "child reference) or that an \"FX ... not converted\" line names";
     if (type == "sound" || type == "soundcurve" || type == "loadedsound")
-        return "audio declarations are outside the native map package";
+        return "only aliases the map uses (scripts, createfx, ambient, destructibles), their "
+               "audio and falloff curves go into the map bank";
     if (type == "physpreset")
-        return "native collision is built from the clipmap export rather than IW3 presets";
+        return "presets convert as simulated clutter on the dynamic models that use them; "
+               "unused presets are not converted";
     if (type == "lightdef")
         return "only map-local light_point_linear has a matched Replay LightDef conversion";
     if (type == "gameworldsp")
@@ -2314,6 +2421,76 @@ std::array<Vec3, 3> BasisFromQuaternion(const Vec4 &source)
              {2.0f * (x * z + y * w), 2.0f * (y * z - x * w), 1.0f - 2.0f * (x * x + y * y)}}};
 }
 
+// IW3 physics preset (physic/<name>: "PHYSIC\mass\25\bounce\0.1\...") as a
+// Replay clutter body. IW3 and Replay masses are both kilograms. The Replay
+// material comes from the preset's sound prefix or name; props up to 2 kg are
+// debris (Replay's shipped buckets, cans and bottles weigh 0.5-1.5).
+std::optional<iw8::havok::ClutterBody> ReadPhysicsPreset(const std::filesystem::path &root,
+                                                         std::string name)
+{
+    while (!name.empty() && name.front() == ',')
+        name.erase(name.begin());
+    std::string text;
+    if (name.empty() || name.find_first_of("/\\") != std::string::npos ||
+        !zt::read_file_str((root / "physic" / name).string(), text))
+        return std::nullopt;
+    std::vector<std::string> fields;
+    std::string field;
+    for (const char character : text)
+    {
+        if (character == '\\')
+        {
+            fields.push_back(field);
+            field.clear();
+        }
+        else if (character != '\r' && character != '\n')
+            field.push_back(character);
+    }
+    fields.push_back(field);
+    if (fields.empty() || fields.front() != "PHYSIC")
+        return std::nullopt;
+    float mass = 0.0f;
+    std::string sound;
+    for (std::size_t index = 1; index + 1 < fields.size(); index += 2)
+    {
+        if (fields[index] == "mass")
+            mass = std::strtof(fields[index + 1].c_str(), nullptr);
+        else if (fields[index] == "sndAliasPrefix")
+            sound = Lowercase(fields[index + 1]);
+    }
+    if (!std::isfinite(mass) || mass <= 0.0f)
+        return std::nullopt;
+    const std::string key = sound + " " + Lowercase(name);
+    const auto has = [&](const char *word) { return key.find(word) != std::string::npos; };
+    // physicsmaterial.hkx name CRCs.
+    std::uint32_t material = 0x4B02BC9Du; // PM_Plastic
+    if (has("plastic"))
+        material = 0x4B02BC9Du;
+    else if (has("glass") || has("bottle"))
+        material = 0xF728E572u; // PM_Glass
+    else if (has("pipe") || has("barrel") || has("extinguisher"))
+        material = 0xCBF7A6C4u; // PM_Metal_Solid
+    else if (has("metal") || has("tin") || has("can") || has("car_") || has("bucket") ||
+             has("helmet") || has("trash"))
+        material = 0xE8F3FA9Au; // PM_Metal_Sheet
+    else if (has("wood") || has("crate") || has("pallet") || has("picture") || has("frame"))
+        material = 0x0AD71E4Eu; // PM_Wood
+    else if (has("cardboard") || has("paper") || has("box") || has("book") || has("carton"))
+        material = 0xA1F93A3Bu; // PM_Paper
+    else if (has("tire") || has("rubber"))
+        material = 0xFFD772CDu; // PM_Rubber
+    else if (has("brick") || has("cinder"))
+        material = 0xD8B39111u; // PM_Brick
+    else if (has("concrete") || has("rock") || has("stone"))
+        material = 0x1AB7BC33u; // PM_Concrete
+    else if (has("cloth") || has("bag") || has("luggage") || has("teddy") || has("pillow"))
+        material = 0xCD123193u; // PM_Cloth
+    else if (has("ceramic") || has("plate") || has("pot"))
+        material = 0xF49C81BFu; // PM_Ceramic
+    mass = std::clamp(mass, 0.1f, 200.0f);
+    return iw8::havok::ClutterBody{mass, material, mass <= 2.0f};
+}
+
 SourceDynamicEntities ReadDynamicEntities(const Json &collision, const std::filesystem::path &root)
 {
     SourceDynamicEntities result;
@@ -2339,7 +2516,10 @@ SourceDynamicEntities ReadDynamicEntities(const Json &collision, const std::file
     {
         if (definition.at("type").get<unsigned>() != 1)
             throw std::runtime_error("IW3 destructible dynamic models require Scriptable data");
-        const std::string modelName = definition.at("model").get<std::string>();
+        std::string modelName = definition.at("model").get<std::string>();
+        // Models from another zone carry IW3's ',' reference prefix (mp_agroprom).
+        while (!modelName.empty() && modelName.front() == ',')
+            modelName.erase(modelName.begin());
         if (modelName.empty())
             throw std::runtime_error("IW3 dynamic model has no XModel");
         auto found = modelCache.find(modelName);
@@ -2347,6 +2527,9 @@ SourceDynamicEntities ReadDynamicEntities(const Json &collision, const std::file
         {
             const std::size_t modelIndex = result.models.models.size();
             result.models.models.push_back(ReadSourceModel(root, modelName));
+            if (definition.contains("physics_preset") && definition.at("physics_preset").is_string())
+                result.models.models.back().clutter =
+                    ReadPhysicsPreset(root, definition.at("physics_preset").get<std::string>());
             found = modelCache.emplace(modelName, modelIndex).first;
         }
 
@@ -2733,6 +2916,25 @@ std::vector<EntityFields> ParseEntityFields(
     if (insideEntity || insideString)
         throw std::runtime_error("unterminated IW3 entity block");
     return entities;
+}
+
+// The _global_fx entries whose script_structs the map places.
+std::vector<const Iw3GlobalFx *> UsedGlobalFx(const std::string &entities)
+{
+    std::set<std::string> targetnames;
+    for (const auto &entity : ParseEntityFields(entities))
+    {
+        const auto classname = entity.find("classname");
+        const auto targetname = entity.find("targetname");
+        if (classname != entity.end() && classname->second == "script_struct" &&
+            targetname != entity.end())
+            targetnames.insert(targetname->second);
+    }
+    std::vector<const Iw3GlobalFx *> used;
+    for (const auto &entry : kIw3GlobalFx)
+        if (targetnames.contains(entry.targetname))
+            used.push_back(&entry);
+    return used;
 }
 
 std::string WithoutLegacyGlassEntities(const std::string &text,
@@ -3443,7 +3645,13 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
         else
             prepared.model.skeleton.boneInfo = {
                 {bounds.midpoint, bounds.halfSize, prepared.model.radius * prepared.model.radius}};
-        if (nativePhysics && sourceModel.collisionLod != SIZE_MAX)
+        // Simulated clutter (an IW3 physics preset on a dynamic model) needs
+        // a hull even when the model has no collision LOD: use its first LOD.
+        const bool clutter =
+            nativePhysics && sourceModel.clutter && !collisionModels && !scriptModelPhysics;
+        const std::size_t physicsLod =
+            sourceModel.collisionLod != SIZE_MAX ? sourceModel.collisionLod : clutter ? 0 : SIZE_MAX;
+        if (nativePhysics && physicsLod != SIZE_MAX)
         {
             iw8::havok::PhysicsMesh physics;
             // Fixed placements use Replay's static-model collision list. The
@@ -3451,7 +3659,7 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             // per-material contents need their own source-to-target mapping.
             // Static placements and script models use the contents of the
             // shipped Static / KeyframedEntity assets.
-            if (collisionModels || scriptModelPhysics)
+            if (collisionModels || scriptModelPhysics || clutter)
                 physics.contents = 0xB180u;
             std::map<Vec3, std::uint32_t> vertexIndices;
             const auto appendVertex = [&](const Vec3 &vertex) {
@@ -3468,7 +3676,7 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             // Replay carries one surface type per model mesh (shipped assets do
             // the same); take the IW3 type covering the most collision area.
             std::map<unsigned, float> surfaceAreas;
-            for (const Surface &surface : sourceModel.lods.at(sourceModel.collisionLod).surfaces)
+            for (const Surface &surface : sourceModel.lods.at(physicsLod).surfaces)
             {
                 const auto material = plan.materials.find(surface.material);
                 // Script-model glass (car windows, lights) breaks by hiding its
@@ -3512,9 +3720,11 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                 surfaceAreas, {}, [](const auto &entry) { return entry.second; });
             physics.surfaceType = dominant == surfaceAreas.end() ? 0 : dominant->first;
             prepared.physicsAsset =
-                collisionModels
-                    ? iw8::havok::BakePhysicsAsset(assetName, physics, 0, 0)
-                    : iw8::havok::BakePhysicsAsset(assetName, physics, 3, 1, scriptModelPhysics);
+                collisionModels ? iw8::havok::BakePhysicsAsset(assetName, physics, 0, 0)
+                : clutter       ? iw8::havok::BakePhysicsAsset(assetName, physics, 3,
+                                                               sourceModel.clutter->debris ? 5 : 4,
+                                                               false, &*sourceModel.clutter)
+                          : iw8::havok::BakePhysicsAsset(assetName, physics, 3, 1, scriptModelPhysics);
             prepared.model.physicsAssetName = assetName;
         }
         if (collisionModels && !prepared.model.physicsAssetName.empty())
@@ -4629,6 +4839,7 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
     output["glassPanes"] = BuildGlassPanes(models, plan, entities, collision, glassModels,
                                           glassTargets, entityModels);
     output["assetMaterials"] = plan.assetMaterials;
+    output["stockMaterials"] = plan.stockMaterials;
     return output;
 }
 
@@ -4735,10 +4946,12 @@ std::vector<Vec3> HullFromPlanes(const std::vector<Vec4> &source)
                 if (inside && !duplicate)
                     points.push_back(point);
             }
-    if (points.size() < 4 || points.size() > 252)
-    {
-        throw std::runtime_error("empty or invalid IW3 collision brush");
-    }
+    // A brush whose planes leave no volume (mp_arnhem has one: two planes that
+    // cut its whole box away) collides with nothing; callers skip it.
+    if (points.size() < 4)
+        return {};
+    if (points.size() > 252)
+        throw std::runtime_error("IW3 collision brush exceeds 252 vertices");
     return points;
 }
 
@@ -4783,7 +4996,11 @@ void CollectLeafBrushes(const Json &nodes, const std::size_t index,
 
 std::uint32_t ConvertContents(const std::uint32_t source)
 {
-    constexpr std::uint32_t replayContents = 0x33681u;
+    // 0x2 is foliage in both games (Replay physicscontents_foliage). No player,
+    // bullet, melee or physics-body mask includes it; like IW3 it drives the
+    // foliage movement and bullet sounds (cg_foliagesnd_alias / EV_FOLIAGE_SOUND,
+    // cg_foliagebulletsnd_alias) and AI sight (ai_foliageSeeThroughDist).
+    constexpr std::uint32_t replayContents = 0x33683u;
     std::uint32_t result = source & replayContents;
     // IW3 glass brushes participate in native solid traces. 0x40 is IW3's
     // "can shoot through" clip flag (clip_nosight in window frames); treating
@@ -4795,7 +5012,7 @@ std::uint32_t ConvertContents(const std::uint32_t source)
     // player-clip contents (0x30200 / 0x30000 / 0x10000); with the IW3 extras
     // the player walked through stair ramps and stepped on raw stairs.
     if (!(result & 1u) && (result & 0x10000u))
-        result &= 0x30200u;
+        result &= 0x30202u;
     return result;
 }
 
@@ -5001,6 +5218,7 @@ CollisionData ReadCollision(const Json &collision)
     std::size_t sourceTaggedBrushes = 0;
     std::size_t mixedMaterialBrushes = 0;
     std::size_t splitMixedBoxes = 0;
+    std::size_t emptyBrushes = 0;
     std::size_t splitMixedSlanted = 0;
     for (std::size_t brushIndex = 0; brushIndex < sourceBrushes.size(); ++brushIndex)
     {
@@ -5026,6 +5244,11 @@ CollisionData ReadCollision(const Json &collision)
         }
         CollisionHull hull;
         hull.points = HullFromPlanes(planes);
+        if (hull.points.empty())
+        {
+            ++emptyBrushes;
+            continue;
+        }
         hull.slabs = BuildTriggerSlabs(hull.points, planes);
         hull.contents = contents;
         hull.model = owner.at(brushIndex);
@@ -5145,6 +5368,9 @@ CollisionData ReadCollision(const Json &collision)
         else
             result.hulls.push_back(std::move(hull));
     }
+    if (emptyBrushes)
+        zt::warn("iw3: left out %zu IW3 collision brush(es) whose planes enclose no volume",
+                 emptyBrushes);
     if (!collisionMaterials.empty())
         zt::info("iw3: tagged %zu brush hulls from source materials; split %zu mixed axial and %zu slanted brushes into face-tagged convex pieces; %zu other mixed brushes retain floor-derived tags",
                  sourceTaggedBrushes, splitMixedBoxes, splitMixedSlanted,
@@ -5823,16 +6049,22 @@ float ParseEntityFloat(const std::string &value, const float fallback)
     return result;
 }
 
-Json BuildLighting(const Json &world, const Json &commonWorld, const std::string &entities)
+// The worldspawn sundirection (else the exported sun angles) as a unit vector
+// toward the sun.
+Vec3 SunDirection(const Json &world, const std::string &entities)
 {
-    const Json &sun = world.at("sun");
-    const Vec3 exportedAngles = ReadVector<3>(sun.at("angles"));
+    const Vec3 exportedAngles = ReadVector<3>(world.at("sun").at("angles"));
     const Vec3 angles = ParseEntityVector(EntityValue(entities, "sundirection"), exportedAngles);
     constexpr float degrees = 3.14159265358979323846f / 180.0f;
     const float pitch = angles[0] * degrees;
     const float yaw = angles[1] * degrees;
-    const Vec3 direction{std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw),
-                         -std::sin(pitch)};
+    return {std::cos(pitch) * std::cos(yaw), std::cos(pitch) * std::sin(yaw), -std::sin(pitch)};
+}
+
+Json BuildLighting(const Json &world, const Json &commonWorld, const std::string &entities)
+{
+    const Json &sun = world.at("sun");
+    const Vec3 direction = SunDirection(world, entities);
 
     Vec3 fallbackColor = ReadVector<3>(sun.at("color"));
     if (*std::max_element(fallbackColor.begin(), fallbackColor.end()) <= 0.0f)
@@ -6327,8 +6559,8 @@ void AddVfxImpact(
 {
     if (source.effectOnImpact.empty())
         return;
-    if (source.type != 5)
-        throw std::runtime_error("IW3 FX impact conversion is pinned only for model particles");
+    if (source.type != 5 && source.type != 0)
+        throw std::runtime_error("IW3 FX impact conversion is pinned only for model and sprite particles");
 
     iw8_focus::ParticleModulePhysicsRayCast rayCast{};
     rayCast.base.type =
@@ -6377,6 +6609,29 @@ void AddVfxBirth(
     birth.moduleIndex = static_cast<std::uint16_t>(state.groups[2].size());
     birth.orientationOptions = 6;
     auto module = VfxValueModule(iw8_focus::ParticleModuleType::testBirth, birth);
+    module.childEffects.push_back(child->second);
+    state.groups[2].push_back(std::move(module));
+    state.native.flags |= 0x100000000ull;
+}
+
+// IW3 effectOnDeath: Replay's TEST_DEATH in module group 2 (shipped
+// common_mp flash_bang_cld_sparks), set up like TEST_BIRTH.
+void AddVfxDeath(
+    const PreparedFxElement &source,
+    const std::unordered_map<std::string, std::string> &effectAliases,
+    iw8::vfx::State &state)
+{
+    if (source.effectOnDeath.empty())
+        return;
+    const auto child = effectAliases.find(source.effectOnDeath);
+    if (child == effectAliases.end())
+        throw std::runtime_error("IW3 FX death child was not converted: " + source.effectOnDeath);
+
+    iw8_focus::ParticleModuleTest death{};
+    death.base.type = static_cast<std::uint16_t>(iw8_focus::ParticleModuleType::testDeath);
+    death.moduleIndex = static_cast<std::uint16_t>(state.groups[2].size());
+    death.orientationOptions = 6;
+    auto module = VfxValueModule(iw8_focus::ParticleModuleType::testDeath, death);
     module.childEffects.push_back(child->second);
     state.groups[2].push_back(std::move(module));
     state.native.flags |= 0x100000000ull;
@@ -6433,6 +6688,14 @@ iw8::vfx::Emitter ConvertFxElement(
         state.native.flags = 550830604356ull;
         emitter.native.flags = 4194306;
         emitter.native.dataFlags = 30603519;
+        if (source.distortion)
+        {
+            // Shipped distortion sprites (common_mp grenadeexp_half,
+            // vfx_muz_undbrl_w_a, cruise-missile thrust) set state bit 40
+            // instead of 39 and emitter flags 2.
+            state.native.flags = (state.native.flags & ~(1ull << 39)) | (1ull << 40);
+            emitter.native.flags = 2;
+        }
         break;
     case 1:
         state.native.elementType = 8;
@@ -6484,13 +6747,25 @@ iw8::vfx::Emitter ConvertFxElement(
     }
     if (!source.effectOnImpact.empty())
     {
-        if (!model)
-            throw std::runtime_error("IW3 FX impact conversion is pinned only for model particles");
-        // Shipped Replay debris with PHYSICS_RAY_CAST + TEST_IMPACT uses this
-        // exact model-state family. The collision bit is 0x10000 in m_dataFlags.
-        state.native.flags = 4297130116ull;
-        emitter.native.flags = 4194306;
-        emitter.native.dataFlags = 131594751;
+        if (model)
+        {
+            // Shipped Replay debris with PHYSICS_RAY_CAST + TEST_IMPACT uses this
+            // exact model-state family. The collision bit is 0x10000 in m_dataFlags.
+            state.native.flags = 4297130116ull;
+            emitter.native.flags = 4194306;
+            emitter.native.dataFlags = 131594751;
+        }
+        else if (source.type == 0 && !source.distortion)
+        {
+            // Shipped sprites with PHYSICS_RAY_CAST + TEST_IMPACT (common_mp
+            // dismemberment blood, 13 states) use this state family; their
+            // data flags are the sprite's plus the 0x10000 collision stream.
+            state.native.flags = 5371920388ull;
+            emitter.native.flags = 2;
+            emitter.native.dataFlags = 30669055;
+        }
+        else
+            throw std::runtime_error("IW3 FX impact conversion is pinned only for model and sprite particles");
     }
 
     state.groups[0].push_back(VfxSpawnModule());
@@ -6626,6 +6901,7 @@ iw8::vfx::Emitter ConvertFxElement(
     AddVfxGravity(source, state);
     AddVfxImpact(source, effectAliases, state);
     AddVfxBirth(source, effectAliases, state);
+    AddVfxDeath(source, effectAliases, state);
     AddVfxVisualCurves(source, state);
     emitter.states.push_back(std::move(state));
     return emitter;
@@ -6665,9 +6941,9 @@ std::string FxMappingBlocker(const PreparedMap &map, const PreparedFx &effect)
         if (!(element.type == 0 || element.type == 1 || element.type == 2 || element.type == 4 ||
               element.type == 5 || element.type == 6 || element.type == 9 || element.type == 10))
             return "element type " + type;
-        if (!element.effectOnDeath.empty())
-            return "effect on death (type " + type + ")";
-        if (!element.effectOnImpact.empty() && element.type != 5)
+        if (!element.effectOnDeath.empty() && element.type == 10)
+            return "runner with death effect";
+        if (!element.effectOnImpact.empty() && element.type != 5 && element.type != 0)
             return "effect on impact on element type " + type;
         if (!element.effectEmitted.empty() && element.type == 10)
             return "runner with emitted effect";
@@ -6701,8 +6977,8 @@ bool HasDirectReplayFxMapping(const PreparedMap &map, const PreparedFx &effect)
                                           element.type == 4 || element.type == 5 ||
                                           element.type == 6 ||
                                           element.type == 9 || element.type == 10;
-               if (!supportedType || !element.effectOnDeath.empty() ||
-                   (!element.effectOnImpact.empty() && element.type != 5) ||
+               if (!supportedType || (!element.effectOnDeath.empty() && element.type == 10) ||
+                   (!element.effectOnImpact.empty() && element.type != 5 && element.type != 0) ||
                    (!element.effectEmitted.empty() && element.type == 10))
                    return false;
                if (element.type == 0 || element.type == 1 || element.type == 2 ||
@@ -6769,7 +7045,9 @@ BuildFxAliases(const PreparedMap &map, const std::string &targetMap)
                                                !convertible.contains(element.effectOnImpact);
                     const bool missingBirth = !element.effectEmitted.empty() &&
                                               !convertible.contains(element.effectEmitted);
-                    return missingRunner || missingImpact || missingBirth;
+                    const bool missingDeath = !element.effectOnDeath.empty() &&
+                                              !convertible.contains(element.effectOnDeath);
+                    return missingRunner || missingImpact || missingBirth || missingDeath;
                 });
             if (missingChild)
             {
@@ -7002,7 +7280,8 @@ PreparedMap::~PreparedMap()
 std::filesystem::path ExtractionCacheDirectory(const std::filesystem::path &unlinker,
                                                const ImportOptions &options)
 {
-    std::string key = "iw3-extract-v1";
+    // v3: physics presets and sound curves are resolved from common_mp.
+    std::string key = "iw3-extract-v3";
     const auto stamp = [&key](const std::filesystem::path &path) {
         std::error_code error;
         const auto absolute = std::filesystem::absolute(path, error);
@@ -7245,6 +7524,76 @@ std::string WithIw3CtfObjectives(const std::string &text, const std::string &map
     return result;
 }
 
+// IW3 sun sprite, flare, blind and glare (sun/<map>.sun r_sun* dvars) as
+// Replay's GfxWorld sunflare_t. IW3 R_LoadSunThroughDvars stores the angles as
+// cosines and the fade times in milliseconds, as Replay does. Without a .sun
+// file, Replay's stock values (mp_rust) apply: no sprite or flare, the stock
+// blind and glare.
+Json ReadSunFlare(const std::filesystem::path &exportRoot, const std::string &sourceMap)
+{
+    std::map<std::string, float> values{
+        {"r_sunsprite_size", 0.0f},        {"r_sunflare_min_size", 0.0f},
+        {"r_sunflare_min_angle", 45.0f},   {"r_sunflare_max_size", 0.0f},
+        {"r_sunflare_max_angle", 2.0f},    {"r_sunflare_max_alpha", 0.0f},
+        {"r_sunflare_fadein", 0.7f},       {"r_sunflare_fadeout", 1.0f},
+        {"r_sunblind_min_angle", 30.0f},   {"r_sunblind_max_angle", 5.0f},
+        {"r_sunblind_max_darken", 0.5f},   {"r_sunblind_fadein", 2.5f},
+        {"r_sunblind_fadeout", 6.0f},      {"r_sunglare_min_angle", 30.0f},
+        {"r_sunglare_max_angle", 5.0f},    {"r_sunglare_max_lighten", 0.3f},
+        {"r_sunglare_fadein", 2.5f},       {"r_sunglare_fadeout", 6.0f}};
+    std::string text;
+    const bool authored = zt::read_file_str(
+        (exportRoot / "sun" / (sourceMap + ".sun")).string(), text);
+    if (authored)
+    {
+        std::istringstream lines(text);
+        for (std::string line; std::getline(lines, line);)
+        {
+            std::istringstream fields(line);
+            std::string key, value;
+            if (!(fields >> key) || !values.contains(Lowercase(key)))
+                continue;
+            std::getline(fields, value);
+            const auto quote = value.find('"');
+            const auto end = value.find('"', quote + 1);
+            if (quote == std::string::npos || end == std::string::npos)
+                continue;
+            const float number = std::strtof(value.substr(quote + 1, end - quote - 1).c_str(), nullptr);
+            if (std::isfinite(number))
+                values[Lowercase(key)] = number;
+        }
+    }
+    const auto dot = [&](const char *key) {
+        return std::cos(values.at(key) * 3.14159265358979323846f / 180.0f);
+    };
+    const auto ms = [&](const char *key) {
+        return static_cast<int>(std::lround(std::max(0.0f, values.at(key)) * 1000.0f));
+    };
+    zt::info("iw3: sun %s: sprite %g, flare %g..%g, blind darken %g, glare lighten %g",
+             authored ? "file converted" : "file absent; stock Replay blind and glare",
+             values.at("r_sunsprite_size"), values.at("r_sunflare_min_size"),
+             values.at("r_sunflare_max_size"), values.at("r_sunblind_max_darken"),
+             values.at("r_sunglare_max_lighten"));
+    return {{"spriteSize", values.at("r_sunsprite_size")},
+            {"flareMinSize", values.at("r_sunflare_min_size")},
+            {"flareMinDot", dot("r_sunflare_min_angle")},
+            {"flareMaxSize", values.at("r_sunflare_max_size")},
+            {"flareMaxDot", dot("r_sunflare_max_angle")},
+            {"flareMaxAlpha", values.at("r_sunflare_max_alpha")},
+            {"flareFadeInTime", ms("r_sunflare_fadein")},
+            {"flareFadeOutTime", ms("r_sunflare_fadeout")},
+            {"blindMinDot", dot("r_sunblind_min_angle")},
+            {"blindMaxDot", dot("r_sunblind_max_angle")},
+            {"blindMaxDarken", values.at("r_sunblind_max_darken")},
+            {"blindFadeInTime", ms("r_sunblind_fadein")},
+            {"blindFadeOutTime", ms("r_sunblind_fadeout")},
+            {"glareMinDot", dot("r_sunglare_min_angle")},
+            {"glareMaxDot", dot("r_sunglare_max_angle")},
+            {"glareMaxLighten", values.at("r_sunglare_max_lighten")},
+            {"glareFadeInTime", ms("r_sunglare_fadein")},
+            {"glareFadeOutTime", ms("r_sunglare_fadeout")}};
+}
+
 // Replay's killstreak scripts read stock template entities at load (getent;
 // an undefined one errors when the streak runs): care packages clone
 // care_package_col into each crate, deployable cover clones tactical_cover_col
@@ -7299,6 +7648,8 @@ void AddReplayTemplateEntities(CollisionData &collision, Json &render, std::stri
         collision.models.push_back({box.low, box.high});
         CollisionHull hull;
         hull.points = HullFromPlanes(planes);
+        if (hull.points.empty())
+            throw std::runtime_error("Replay template collision box is empty");
         hull.contents = 1;
         hull.model = modelIndex;
         collision.hulls.push_back(std::move(hull));
@@ -7451,6 +7802,20 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             RunUnlinker(unlinker, options, exportRoot, commonFastfile, true);
         }
     }
+    if (const auto presets = MissingPhysicsPresets(exportRoot); !cached && !presets.empty())
+    {
+        const auto commonFastfile = FindIw3CommonFastfile(options);
+        if (!commonFastfile.empty())
+        {
+            zt::info("iw3: resolving %zu shared physics preset(s) from %s", presets.size(),
+                     commonFastfile.string().c_str());
+            RunUnlinker(unlinker, options, exportRoot, commonFastfile, true);
+        }
+    }
+    if (const auto presets = MissingPhysicsPresets(exportRoot); !presets.empty())
+        zt::warn("iw3: %zu physics preset(s) have no exported payload; their models stay "
+                 "static: %s",
+                 presets.size(), JoinNames(presets).c_str());
     const auto unresolvedFx = MissingDeclaredFx(exportRoot);
     if (!unresolvedFx.empty())
         zt::warn("iw3: %zu declared source FX graph(s) have no exported payload; first: %s",
@@ -7519,15 +7884,28 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         result.gradingClutPixels = BuildGradingClutPixels(*film);
     }
     {
-        const std::string vision = BuildReplayVision(expFog, result.gradingClutName);
+        const std::string vision = BuildReplayVision(expFog, result.gradingClutName, options.lightingStyle,
+                                                     SunDirection(world, entities));
         result.rawFiles.push_back(
             {"vision/" + options.map + ".vision",
              std::vector<std::uint8_t>(vision.begin(), vision.end())});
-        zt::info("iw3: converted vision (fog %s, grading CLUT %s)", expFog ? "yes" : "no",
+        zt::info("iw3: converted vision (%s lighting, fog %s, grading CLUT %s)",
+                 options.lightingStyle == LightingStyle::iw8 ? "iw8" : "iw3", expFog ? "yes" : "no",
                  result.gradingClutName.empty() ? "none" : result.gradingClutName.c_str());
     }
     result.fxEffects = ReadPreparedFx(exportRoot);
     auto declaredFx = ReadDeclaredFx(exportRoot / "zone_source" / (sourceMap + ".zone"));
+    // Effect names the map scripts hold as plain literals (loaded at runtime
+    // through iw3compat_loadfx).
+    std::set<std::string> literalFx;
+    for (const char *folder : {"mp", "createfx", "createart"})
+        for (const auto &name : ReadScriptEffectLiterals(exportRoot / "maps" / folder))
+            if (std::ranges::any_of(result.fxEffects,
+                                    [&](const PreparedFx &effect) { return effect.name == name; }))
+            {
+                literalFx.insert(name);
+                declaredFx.insert(name);
+            }
     {
         // Script-driven IW3 effects: literals the map scripts load, and the
         // common-zone effects maps\mp\_destructible_types plays on vehicles.
@@ -7540,6 +7918,20 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         if (hasDestructibleVehicles)
             for (const char *name : kIw3VehicleDestructibleEffects)
                 scriptFx.insert(name);
+        for (const auto *entry : UsedGlobalFx(entities))
+            scriptFx.insert(entry->effect);
+        std::size_t commonImpactFx = 0;
+        for (const auto &name : ReadImpactEffectNames(exportRoot))
+            if (!declaredFx.contains(name) &&
+                std::ranges::any_of(result.fxEffects,
+                                    [&](const PreparedFx &effect) { return effect.name == name; }))
+            {
+                declaredFx.insert(name);
+                ++commonImpactFx;
+            }
+        if (commonImpactFx)
+            zt::info("iw3: %zu impact-table effect(s) not declared by the map zone convert from common_mp",
+                     commonImpactFx);
         for (const auto &name : scriptFx)
         {
             if (declaredFx.contains(name))
@@ -7684,18 +8076,47 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             }
         }
         // Destroyed states of IW3 destructibles (<type>_destroyed, <model>_d).
+        // Custom types (Broadcast2's cust_vehicle_80s_sedan1_green) name the
+        // destroyed model after the vehicle model instead:
+        // vehicle_80s_sedan1_green_destructible_mp -> vehicle_80s_sedan1_green_destroyed.
         std::set<std::string> extraModels;
+        std::map<std::string, std::string> destroyedModels; // destructible_type -> model
+        const auto exportedModel = [&](const std::string &model) {
+            std::error_code missing;
+            return std::filesystem::is_regular_file(exportRoot / "xmodel" / (model + ".json"), missing);
+        };
         for (const EntityFields &entity : ParseEntityFields(entities))
         {
             const auto type = entity.find("destructible_type");
-            if (type != entity.end())
-                extraModels.insert(type->second + "_destroyed");
             const auto name = entity.find("targetname");
             const auto model = entity.find("model");
+            if (type != entity.end())
+            {
+                std::vector<std::string> candidates{type->second + "_destroyed"};
+                if (model != entity.end())
+                    for (const std::string suffix : {"_destructible_mp", "_destructible"})
+                        if (model->second.ends_with(suffix))
+                        {
+                            candidates.push_back(
+                                model->second.substr(0, model->second.size() - suffix.size()) +
+                                "_destroyed");
+                            break;
+                        }
+                for (const auto &candidate : candidates)
+                    if (exportedModel(candidate))
+                    {
+                        extraModels.insert(candidate);
+                        destroyedModels.emplace(type->second, candidate);
+                        break;
+                    }
+            }
             if (name != entity.end() && name->second == "interactive_tv" && model != entity.end())
                 extraModels.insert(model->second + "_d");
         }
-        std::string generated = "iw3compat_generated()\n{\n    level.mw120r_models = [];\n";
+        std::string generated = "iw3compat_generated()\n{\n    level.mw120r_models = [];\n"
+                                "    level.mw120r_destroyed = [];\n";
+        for (const auto &[type, model] : destroyedModels)
+            generated += "    level.mw120r_destroyed[\"" + type + "\"] = \"" + model + "\";\n";
         for (const auto &model : extraModels)
         {
             std::error_code missing;
@@ -7788,30 +8209,72 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     const auto mapDirectory = result.root / "maps" / "mp";
     std::filesystem::create_directories(mapDirectory);
     const std::vector<std::string> fxMaterials(fxMaterialNames.begin(), fxMaterialNames.end());
+    // Entities (script models, dynamic entities, FX models) read the IW3 light
+    // grid from a world-space volume, as IW3 lit them from the grid.
+    std::optional<EntityLightVolume> entityLightVolume;
+    if (const auto volume = BuildLightGridVolume(exportRoot, sourceAsset))
+    {
+        entityLightVolume.emplace();
+        entityLightVolume->image = "mw120r/" + options.map + "_light_volume";
+        entityLightVolume->file = options.map + "_light_volume.rgba";
+        entityLightVolume->width = volume->width;
+        entityLightVolume->height = volume->height;
+        if (!zt::write_file((mapDirectory / entityLightVolume->file).string(), volume->pixels))
+            throw std::runtime_error("cannot write the entity light-grid volume");
+        char defines[512];
+        std::snprintf(defines, sizeof(defines),
+                      "#define MAP_LIGHT_VOLUME 1\n"
+                      "#define MAP_LIGHT_VOLUME_ORIGIN float3(%.6g, %.6g, %.6g)\n"
+                      "#define MAP_LIGHT_VOLUME_CELL float3(%.6g, %.6g, %.6g)\n"
+                      "#define MAP_LIGHT_VOLUME_DIMS float3(%u, %u, %u)\n"
+                      "#define MAP_LIGHT_VOLUME_TILES %u\n"
+                      "#define MAP_LIGHT_VOLUME_SIZE float2(%u, %u)\n",
+                      volume->origin[0], volume->origin[1], volume->origin[2], volume->cell[0],
+                      volume->cell[1], volume->cell[2], volume->dims[0], volume->dims[1],
+                      volume->dims[2], volume->tilesPerRow, volume->width, volume->height);
+        entityLightVolume->defines = defines;
+    }
     RenderPlan renderPlan =
         PrepareRenderAssets(exportRoot, world, materialNames, worldMaterialNames,
                             modelMaterialNames, entityMaterialNames, fxMaterials, shadowWorldMaterialNames,
                             shadowModelMaterialNames, options.searchPaths, mapDirectory,
                             options.map, options.scratchRoot / ".iw3-render-cache",
-                            FogShaderDefines(expFog));
+                            FogShaderDefines(expFog, options.lightingStyle),
+                            static_cast<unsigned>(sourceStaticModels.instances.size()),
+                            entityLightVolume ? &*entityLightVolume : nullptr);
     timing.lap("render assets");
     result.fxMaterialAliases = renderPlan.fxMaterialAliases;
     for (auto &effect : result.fxEffects)
     {
-        // Replay screen distortion needs a native refraction technique; the
-        // rest of the effect converts without the IW3 heat-haze elements.
-        const std::size_t removed = std::erase_if(effect.elements, [&](const PreparedFxElement &element) {
-            return std::ranges::any_of(element.visuals, [&](const PreparedFxVisual &visual) {
-                return visual.kind == PreparedFxVisualKind::material && visual.names.size() == 1 &&
-                       renderPlan.fxDistortionMaterials.contains(visual.names.front());
-            });
+        // IW3 heat-haze sprites draw with a stock Replay distortion material
+        // and the stock distortion particle state. Every shipped Replay
+        // distortion emitter is a sprite (element type 0); distortion on other
+        // IW3 element types has no Replay counterpart and is left out.
+        std::size_t distortionSprites = 0;
+        const std::size_t removed = std::erase_if(effect.elements, [&](PreparedFxElement &element) {
+            const bool distortion =
+                std::ranges::any_of(element.visuals, [&](const PreparedFxVisual &visual) {
+                    return visual.kind == PreparedFxVisualKind::material &&
+                           visual.names.size() == 1 &&
+                           renderPlan.fxDistortionMaterials.contains(visual.names.front());
+                });
+            element.distortion = distortion && element.type == 0;
+            distortionSprites += element.distortion ? 1 : 0;
+            return distortion && element.type != 0;
         });
+        if (distortionSprites)
+            zt::info("iw3: FX %s: %zu distortion sprite(s) use a stock Replay distortion material",
+                     effect.name.c_str(), distortionSprites);
         if (removed)
-            zt::info("iw3: FX %s: left out %zu distortion element(s)", effect.name.c_str(), removed);
+            zt::info("iw3: FX %s: left out %zu non-sprite distortion element(s)", effect.name.c_str(),
+                     removed);
         for (auto &element : effect.elements)
         {
-            // Replay spawns impact children only from model particles.
-            if (!element.effectOnImpact.empty() && element.type != 5)
+            // Shipped Replay impact states exist for model particles (debris)
+            // and sprites (shell-eject smoke, blood); distortion sprites keep
+            // their distortion state.
+            if (!element.effectOnImpact.empty() && element.type != 5 &&
+                !(element.type == 0 && !element.distortion))
             {
                 zt::info("iw3: FX %s: element type %u impact effect %s not spawned",
                          effect.name.c_str(), static_cast<unsigned>(element.type),
@@ -7823,6 +8286,52 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     BuildPreparedStaticModels(sourceStaticModels, renderPlan, options.map, "smodel", result.xmodels,
                               result.staticModels, true, false, false,
                               &result.staticModelCollisionModels);
+    if (renderPlan.instanceLightingCount)
+    {
+        // IW3 lit each static model from its light grid at the model's
+        // lighting origin (the bounds centre); one ambient cube per placement,
+        // in placement order (the GfxWorld instance index the shader reads).
+        if (renderPlan.instanceLightingCount != result.staticModels.instances.size())
+            throw std::runtime_error("static-model lighting count does not match the placements");
+        std::vector<std::array<float, 3>> origins;
+        origins.reserve(result.staticModels.instances.size());
+        for (const auto &instance : result.staticModels.instances)
+        {
+            const auto &mid = result.staticModels.models.at(instance.model).bounds.midpoint;
+            const auto &q = instance.quaternion;
+            const float x = q[0], y = q[1], z = q[2], w = q[3];
+            const float rotation[3][3] = {
+                {1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)},
+                {2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)},
+                {2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)}};
+            std::array<float, 3> origin = instance.origin;
+            for (unsigned row = 0; row < 3; ++row)
+                for (unsigned column = 0; column < 3; ++column)
+                    origin[row] += rotation[row][column] * mid[column] * instance.scale;
+            origins.push_back(origin);
+        }
+        auto cubes = SampleLightGridAmbientCubes(exportRoot, sourceAsset, origins);
+        constexpr unsigned columns = 256;
+        const unsigned rows = (renderPlan.instanceLightingCount + columns - 1) / columns;
+        std::vector<std::uint8_t> pixels(std::size_t(columns) * 6 * rows * 4, 0);
+        for (std::size_t index = 0; index < origins.size(); ++index)
+            for (unsigned face = 0; face < 6; ++face)
+            {
+                // Values / 2 in RGBA8 UNORM (IW3 grid shading values peak near 1).
+                const std::size_t texel = (index / columns) * columns * 6 + (index % columns) * 6 + face;
+                for (unsigned channel = 0; channel < 3; ++channel)
+                {
+                    const float value = cubes.empty() ? 0.31f : cubes[index][face][channel];
+                    pixels[texel * 4 + channel] = static_cast<std::uint8_t>(
+                        std::lround(std::clamp(value * 0.5f, 0.0f, 1.0f) * 255.0f));
+                }
+                pixels[texel * 4 + 3] = 255;
+            }
+        if (cubes.empty())
+            zt::warn("iw3: no IW3 light grid; static models use a flat 0.31 ambient");
+        if (!zt::write_file((mapDirectory / renderPlan.instanceLightingFile).string(), pixels))
+            throw std::runtime_error("cannot write the static-model lighting image");
+    }
     result.shadowScene = std::move(renderPlan.shadowScene);
     BuildShadowScene(brushModels, sourceStaticModels, renderPlan, result.shadowScene);
     replayrender::StaticModels unusedDynamicTables;
@@ -7893,6 +8402,14 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                                              element.effectEmitted);
                 self(self, *child->second);
             }
+            if (!element.effectOnDeath.empty())
+            {
+                const auto child = convertibleEffects.find(element.effectOnDeath);
+                if (child == convertibleEffects.end())
+                    throw std::runtime_error("IW3 death child effect was not converted: " +
+                                             element.effectOnDeath);
+                self(self, *child->second);
+            }
         }
         result.vfxEffects.push_back(
             ConvertFx(result, effect, effectAliases, result.vfxLightDef));
@@ -7928,7 +8445,14 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         if (hasDestructibleVehicles)
             for (const char *name : kIw3VehicleDestructibleSounds)
                 requestedSounds.insert(name);
-        if (auto sounds = sound::Convert(exportRoot, options.searchPaths, options.map, requestedSounds))
+        for (const auto *entry : UsedGlobalFx(entities))
+            if (entry->sound)
+                requestedSounds.insert(entry->sound);
+        std::set<std::string> literals;
+        for (const char *folder : {"mp", "createfx", "createart"})
+            literals.merge(sound::ReadScriptStringLiterals(exportRoot / "maps" / folder));
+        if (auto sounds = sound::Convert(exportRoot, options.searchPaths, options.map, requestedSounds,
+                                         literals))
         {
             soundAliases = std::move(sounds->aliases);
             result.soundBank = std::move(sounds->bank);
@@ -7963,6 +8487,49 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                                                 std::end(kIw3VehicleDestructibleEffects));
         compatEffects.insert(compatEffects.end(), std::begin(kIw3CompatPropEffects),
                              std::end(kIw3CompatPropEffects));
+        const auto globalFx = UsedGlobalFx(entities);
+        for (const auto *entry : globalFx)
+            compatEffects.push_back(entry->effect);
+        std::string globalFxGsc;
+        // iw3compat_global_fx(): IW3 _global_fx placements as literals (Replay
+        // scripts here have no struct lookup); played like createfx one-shots
+        // with IW3's random -20..-15 s start offset and loop sound.
+        {
+            std::string placements;
+            std::size_t placed = 0;
+            for (const auto &entity : ParseEntityFields(entities))
+            {
+                const auto classname = entity.find("classname");
+                const auto targetname = entity.find("targetname");
+                const auto origin = entity.find("origin");
+                if (classname == entity.end() || classname->second != "script_struct" ||
+                    targetname == entity.end() || origin == entity.end())
+                    continue;
+                const auto entry = std::ranges::find_if(globalFx, [&](const Iw3GlobalFx *candidate) {
+                    return targetname->second == candidate->targetname;
+                });
+                if (entry == globalFx.end() || !effectAliases.contains((*entry)->effect))
+                    continue;
+                const auto angles = entity.find("angles");
+                const auto vector = [](const std::string &text) {
+                    Vec3 value{};
+                    std::sscanf(text.c_str(), "%f %f %f", &value[0], &value[1], &value[2]);
+                    char buffer[96];
+                    std::snprintf(buffer, sizeof(buffer), "( %g, %g, %g )", value[0], value[1],
+                                  value[2]);
+                    return std::string(buffer);
+                };
+                placements += "    iw3compat_global_fx_one( \"" + std::string((*entry)->effect) +
+                              "\", " + vector(origin->second) + ", " +
+                              (angles == entity.end() ? std::string("( 0, 0, 0 )")
+                                                      : vector(angles->second)) +
+                              ", \"" + ((*entry)->sound ? (*entry)->sound : "") + "\" );\n";
+                ++placed;
+            }
+            globalFxGsc = "\niw3compat_global_fx()\n{\n" + placements + "}\n";
+            if (placed)
+                zt::info("iw3: placed %zu IW3 _global_fx effect(s)", placed);
+        }
         for (const char *name : compatEffects)
         {
             const auto alias = effectAliases.find(name);
@@ -7971,7 +8538,52 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             gsc += "    level.mw120r_iw3fx[\"" + std::string(name) + "\"] = loadfx( \"" +
                    alias->second + "\" );\n";
         }
-        gsc += "}\n";
+        for (const auto &name : literalFx)
+        {
+            const auto alias = effectAliases.find(name);
+            if (alias == effectAliases.end() ||
+                std::ranges::any_of(compatEffects, [&](const char *known) { return name == known; }))
+                continue;
+            gsc += "    level.mw120r_iw3fx[\"" + name + "\"] = loadfx( \"" + alias->second + "\" );\n";
+        }
+        gsc += "}\n" + globalFxGsc;
+        // iw3compat_structs(): the map's keyed script_structs for IW3
+        // getstructarray() (Replay scripts cannot read IW3 structs from MapEnts).
+        {
+            std::string structs;
+            std::size_t count = 0;
+            const auto text = [](std::string value) {
+                std::erase_if(value, [](const char c) { return c == '"' || c == '\\'; });
+                return "\"" + value + "\"";
+            };
+            const auto vector = [](const std::string &value) {
+                Vec3 parsed{};
+                std::sscanf(value.c_str(), "%f %f %f", &parsed[0], &parsed[1], &parsed[2]);
+                char buffer[96];
+                std::snprintf(buffer, sizeof(buffer), "( %g, %g, %g )", parsed[0], parsed[1],
+                              parsed[2]);
+                return std::string(buffer);
+            };
+            for (const auto &entity : ParseEntityFields(entities))
+            {
+                const auto field = [&](const char *key) {
+                    const auto found = entity.find(key);
+                    return found == entity.end() ? std::string{} : found->second;
+                };
+                if (field("classname") != "script_struct" ||
+                    (field("targetname").empty() && field("target").empty() &&
+                     field("script_noteworthy").empty() && field("script_linkname").empty()))
+                    continue;
+                structs += "    iw3compat_struct_add( " + vector(field("origin")) + ", " +
+                           vector(field("angles")) + ", " + text(field("targetname")) + ", " +
+                           text(field("target")) + ", " + text(field("script_noteworthy")) + ", " +
+                           text(field("script_linkname")) + " );\n";
+                ++count;
+            }
+            gsc += "\niw3compat_structs()\n{\n" + structs + "}\n";
+            if (count)
+                zt::info("iw3: %zu IW3 script_struct(s) available to getstructarray", count);
+        }
         // iw3compat_sounds(): converted aliases, 1 = playsound, 2 = playloopsound.
         gsc += "\niw3compat_sounds()\n{\n    level.mw120r_sounds = [];\n";
         for (const auto &[name, looping] : soundAliases)
@@ -8029,13 +8641,18 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     for (std::size_t index = 0; index < sourceDynamicEntities.definitionModels.size(); ++index)
     {
         const std::size_t modelIndex = sourceDynamicEntities.definitionModels[index];
-        const bool noPhysics =
-            sourceDynamicEntities.models.models.at(modelIndex).collisionLod == SIZE_MAX;
-        result.dynamicEntities.push_back(
-            {"mw120r/" + options.map + "/dynmodel_" +
-                 std::to_string(modelIndex),
-             sourceDynamicEntities.quaternions[index], sourceDynamicEntities.origins[index],
-             noPhysics});
+        const auto &model = sourceDynamicEntities.models.models.at(modelIndex);
+        const bool clutter = model.clutter.has_value();
+        const bool noPhysics = model.collisionLod == SIZE_MAX && !clutter;
+        iw8::DynamicEntity entity{"mw120r/" + options.map + "/dynmodel_" + std::to_string(modelIndex),
+                                  sourceDynamicEntities.quaternions[index],
+                                  sourceDynamicEntities.origins[index], noPhysics};
+        if (clutter)
+        {
+            entity.rigidBodies = 1;
+            entity.collisionFlags = 2;
+        }
+        result.dynamicEntities.push_back(std::move(entity));
     }
     for (const auto &source : sourceDynamicEntities.brushes)
     {
@@ -8113,8 +8730,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         });
     if (!nativeGlassModels.empty())
     {
-        if (!glassHullCount)
-            throw std::runtime_error("IW3 scripted glass has no model-local collision to remove");
+        // Render-only (nonsolid) glass brushes have no source collision; their
+        // panes got box hulls when they were built (mp_agroprom).
         zt::info("iw3: removed %zu obsolete scripted glass hull(s) and %zu mesh(es); "
                  "numbered world panes own collision",
                  glassHullCount, glassMeshCount);
@@ -8218,6 +8835,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     const float templateFloor = minimum[2] - 1200.0f;
     AddReplayTemplateEntities(nativeCollision, render, entities, minimum, maximum, templateFloor);
     minimum[2] = templateFloor - 64.0f;
+    render["sunFlare"] = ReadSunFlare(exportRoot, sourceMap);
     WriteJson(mapDirectory / (targetAsset + ".render.json"), render);
     WriteJson(mapDirectory / (targetAsset + ".bounds.json"),
               {{"schema", 1}, {"min", minimum}, {"max", maximum}});

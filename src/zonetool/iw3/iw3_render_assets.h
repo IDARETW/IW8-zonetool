@@ -74,12 +74,33 @@ struct NativeLightmapPlan
     std::array<std::string, 3> files;
 };
 
+// World-space IW3 light-grid volume for entity (DObj) materials: an RGBA8 atlas
+// (iw3_lightgrid.h LightGridVolume) bound as the fourth texture, and the pixel
+// shader defines that locate it (MAP_LIGHT_VOLUME_*).
+struct EntityLightVolume
+{
+    std::string image;
+    std::string file;
+    unsigned width{};
+    unsigned height{};
+    std::string defines;
+};
+
 struct RenderPlan
 {
     std::unordered_map<std::string, MaterialPlan> materials;
     std::unordered_map<std::string, std::string> fxMaterialAliases;
-    // IW3 distortion materials; elements drawn with them are left out of effects.
+    // IW3 distortion materials. Their elements draw with a stock Replay
+    // distortion material (common_mp, always loaded in MP) and the stock
+    // distortion particle state.
     std::set<std::string> fxDistortionMaterials;
+    // Stock Replay materials the map references by name (",<name>").
+    std::set<std::string> stockMaterials;
+    // Per-instance IW3 light-grid lighting for static placements (6 RGBA8
+    // texels per instance, 256 instances per row; written by PrepareFastfile).
+    std::string instanceLightingImage;
+    std::string instanceLightingFile;
+    unsigned instanceLightingCount{};
     std::vector<LightmapRectangle> lightmaps;
     std::array<std::size_t, 6> skyTiles{};
     unsigned columns{};
@@ -116,7 +137,9 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot,
                                const std::filesystem::path &mapDirectory,
                                const std::string &map,
                                const std::filesystem::path &cacheRoot = {},
-                               const std::string &surfaceShaderDefines = {});
+                               const std::string &surfaceShaderDefines = {},
+                               unsigned staticModelInstances = 0,
+                               const EntityLightVolume *entityLightVolume = nullptr);
 
 // The map's IW3 loading-screen image (images/loadscreen_<map>, from its _load
 // zone or IWD) as a custom-map package preview: "MWRI", version 1, width,

@@ -10,6 +10,7 @@
 #include "../iw8/replay_sound.h"
 #include "../iw8/replay_static_model_collision.h"
 #include "../iw8/replay_sunshadow.h"
+#include "iw3_vision.h"
 #include "../iw8/replay_vfx.h"
 
 #include <array>
@@ -32,6 +33,8 @@ struct ImportOptions
     std::vector<std::filesystem::path> searchPaths;
     // Convert IW3 gametype visuals (flag props, headquarters radios).
     bool iw3ModeAssets{true};
+    // IW3's look, or Replay's native fog/atmosphere/volumetrics (iw3_vision.h).
+    LightingStyle lightingStyle{LightingStyle::iw3};
 };
 
 struct PreparedXModel
@@ -148,6 +151,8 @@ struct PreparedFxVisual
 struct PreparedFxElement
 {
     std::int32_t flags{};
+    // Drawn with an IW3 distortion material (stock Replay refraction state).
+    bool distortion{};
     PreparedFxSpawn spawn{};
     PreparedFxFloatRange spawnRange{};
     PreparedFxFloatRange fadeInRange{};

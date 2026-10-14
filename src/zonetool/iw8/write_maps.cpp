@@ -306,7 +306,8 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
                     const uint32_t primaryLightCount, const uint32_t sunPrimaryLightIndex,
                     const replayrender::StaticModels &staticModels,
                     const uint32_t dynamicModelCount, const uint32_t dynamicBrushCount,
-                    const replaysunshadow::Data &sunShadow)
+                    const replaysunshadow::Data &sunShadow,
+                    const std::array<float, 3> &sunDirection)
 {
     if (primaryLightCount < 2 || sunPrimaryLightIndex >= primaryLightCount)
         throw std::runtime_error("invalid primary-light table for GfxWorld");
@@ -350,6 +351,30 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
     for (size_t index = 0; index < sortKeys.size(); ++index)
         stamp32(gw.data(), 0x3C + index * sizeof(uint32_t), sortKeys[index]);
     stamp64(gw.data(), 0x3D68, PTR_FOLLOWS);     // runtime GfxLight[], zero-fill stream 4
+    // sunflare_t at +0x3E28 (Load_sunflare_t 0xE41700): hasValidData, sprite and
+    // flare materials (stock ",sun" / ",sun_flare", as shipped mp_rust), the
+    // converted sizes, cosines and fade times, and sunFxPosition (the direction
+    // to the sun).
+    constexpr size_t kSunFlare = 0x3E28;
+    if (mesh.sunFlare.size() == 18)
+    {
+        gw[kSunFlare] = 1;
+        stamp64(gw.data(), kSunFlare + 0x08, PTR_FOLLOWS);
+        stamp64(gw.data(), kSunFlare + 0x10, PTR_FOLLOWS);
+        constexpr std::array<bool, 18> isInteger{false, false, false, false, false, false,
+                                                 true,  true,  false, false, false, true,
+                                                 true,  false, false, false, true,  true};
+        for (size_t index = 0; index < mesh.sunFlare.size(); ++index)
+        {
+            const size_t offset = kSunFlare + 0x18 + index * 4;
+            if (isInteger[index])
+                stamp32(gw.data(), offset, static_cast<uint32_t>(std::lround(mesh.sunFlare[index])));
+            else
+                stampf(gw.data(), offset, static_cast<float>(mesh.sunFlare[index]));
+        }
+        for (size_t axis = 0; axis < 3; ++axis)
+            stampf(gw.data(), kSunFlare + 0x60 + axis * 4, sunDirection[axis]);
+    }
     // Native Load_GfxBrushModelArray DD1750 consumes 96 bytes per model;
     // allocator DCF750 uses alignment mask 3. Entity model indices refer to
     // this array directly, so preserve every authored IW3 brush-model slot.
@@ -633,6 +658,24 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
         stamp16(brushModel, 0x58, static_cast<uint16_t>(model.surfaceCount));
         stamp32(brushModel, 0x5C, UINT32_MAX);
         zw.write(brushModel, sizeof(brushModel));
+    }
+    // Load_GfxWorld visits sun.spriteMaterial and sun.flareMaterial after the
+    // brush models (the sky-illumination and +0x3E08/+0x3E18 arrays between
+    // them are null here): two Material references.
+    if (mesh.sunFlare.size() == 18)
+    {
+        for (const char *name : {",sun", ",sun_flare"})
+        {
+            zw.pushStream(XFILE_BLOCK_TEMP_PRELOAD);
+            zw.align(7);
+            uint8_t material[0x78]{};
+            stamp64(material, 0, PTR_FOLLOWS);
+            zw.write(material, sizeof(material));
+            zw.pushStream(XFILE_BLOCK_VIRTUAL);
+            zw.writeStr(name);
+            zw.popStream();
+            zw.popStream();
+        }
     }
     replayrender::EmitSortedSurfaces(zw, mesh, staticModels);
     zw.align(15);

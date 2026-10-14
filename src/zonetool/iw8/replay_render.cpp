@@ -8,6 +8,8 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <set>
@@ -83,6 +85,8 @@ std::optional<uint8_t> generatedTextureSlot(const char *name)
         return uint8_t{9};
     if (!std::strcmp(name, "sourceResponseAtlas"))
         return uint8_t{59};
+    if (!std::strcmp(name, "instanceLighting") || !std::strcmp(name, "lightVolume"))
+        return uint8_t{0x3D};
     return std::nullopt;
 }
 
@@ -315,11 +319,26 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
     image.numElements = static_cast<uint16_t>(numElements);
     image.semantic = static_cast<uint8_t>(semantic);
     image.category = static_cast<uint8_t>(category);
-    image.pixels.resize(length);
+    // Materials repeat image definitions (world atlas per glass pane, light volume per
+    // entity material): read each file once and share the bytes.
+    static std::mutex cacheMutex;
+    static std::map<std::string, std::weak_ptr<std::vector<uint8_t>>> cache;
+    const auto stamp = std::filesystem::last_write_time(pixelPath, error).time_since_epoch().count();
+    const std::string key = pixelPath.lexically_normal().string() + '|' + std::to_string(stamp) +
+                            '|' + std::to_string(length);
+    const std::lock_guard lock(cacheMutex);
+    if (auto cached = cache[key].lock())
+    {
+        image.pixels.share(std::move(cached));
+        return image;
+    }
+    auto bytes = std::make_shared<std::vector<uint8_t>>(length);
     std::ifstream input(pixelPath, std::ios::binary);
-    if (!input.read(reinterpret_cast<char *>(image.pixels.data()), length))
+    if (!input.read(reinterpret_cast<char *>(bytes->data()), length))
         throw std::runtime_error(std::string("Cannot read ") + (blocks ? "block-compressed" : "RGBA8") +
                                  " image pixels");
+    cache[key] = bytes;
+    image.pixels.share(std::move(bytes));
     return image;
 }
 
@@ -1025,6 +1044,36 @@ Mesh Load(const std::string &path)
             throw std::runtime_error("Invalid auxiliary material table");
         for (const auto &definition : definitions)
             m.assetMaterials.push_back(LoadMaterial(path, definition, true));
+    }
+    if (j.contains("sunFlare"))
+    {
+        const auto &sun = j.at("sunFlare");
+        for (const char *key : {"spriteSize", "flareMinSize", "flareMinDot", "flareMaxSize",
+                                "flareMaxDot", "flareMaxAlpha", "flareFadeInTime",
+                                "flareFadeOutTime", "blindMinDot", "blindMaxDot",
+                                "blindMaxDarken", "blindFadeInTime", "blindFadeOutTime",
+                                "glareMinDot", "glareMaxDot", "glareMaxLighten",
+                                "glareFadeInTime", "glareFadeOutTime"})
+        {
+            const double value = sun.at(key).get<double>();
+            if (!std::isfinite(value) || std::abs(value) > 1.0e6)
+                throw std::runtime_error("Invalid sun flare value");
+            m.sunFlare.push_back(value);
+        }
+    }
+    if (j.contains("stockMaterials"))
+    {
+        const auto &names = j.at("stockMaterials");
+        if (!names.is_array() || names.size() > 256)
+            throw std::runtime_error("Invalid stock material table");
+        for (const auto &name : names)
+        {
+            const auto text = name.get<std::string>();
+            if (text.empty() || text.size() > 255 || text.front() == ',' ||
+                text.find('\0') != std::string::npos)
+                throw std::runtime_error("Invalid stock material name");
+            m.stockMaterials.push_back(text);
+        }
     }
     const auto &list = j.at("surfaces");
     const unsigned atlasLayout = j.value("atlasVertexLayout", 1u);
@@ -2465,6 +2514,15 @@ void RegisterMapMaterials(ZoneWriter &main, ZoneWriter &techsets, const Mesh &me
         registerOne(material);
     for (const auto &material : mesh.assetMaterials)
         registerOne(material);
+    // The common zone owns these; the map only names them. Both zones carry the
+    // name-only reference so each main-zone material keeps a techset-zone peer.
+    for (const auto &name : mesh.stockMaterials)
+    {
+        if (mainRegistered.emplace(ASSET_TYPE_MATERIAL, name).second)
+            RegisterMaterialReference(main, name);
+        if (techsetRegistered.emplace(ASSET_TYPE_MATERIAL, name).second)
+            RegisterMaterialReference(techsets, name);
+    }
 }
 void RegisterReflectionProbeImage(ZoneWriter &w, const Mesh &mesh)
 {

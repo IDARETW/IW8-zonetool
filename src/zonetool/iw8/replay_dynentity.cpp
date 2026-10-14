@@ -58,8 +58,10 @@ void WriteDefinitions(ZoneWriter &writer, const std::vector<const DynamicEntity 
         Put<std::uint16_t>(definition, 0x40, 0);           // dynentitylist0
         if (basis == DynamicEntityBasis::brush)
             Put(definition, 0x42, entity.brushModel);
+        definition[0x48] = entity.rigidBodies; // physicsAssetRigidBodiesCount
         definition[0x49] = 1; // spawnActive
         definition[0x4A] = entity.noPhysics ? 1 : 0;
+        definition[0x4D] = entity.collisionFlags;
         writer.write(definition, sizeof(definition));
     }
 }

@@ -50,7 +50,7 @@ class Accumulator
     void Add(const std::array<float, 3> &point)
     {
         for (const float v : point)
-            if (!std::isfinite(v) || std::abs(v) > 100000)
+            if (!std::isfinite(v) || std::abs(v) > 262144)
                 throw std::runtime_error("Position outside Replay world bounds");
         for (unsigned k = 0; k < 3; ++k)
         {

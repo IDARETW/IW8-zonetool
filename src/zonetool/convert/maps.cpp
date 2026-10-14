@@ -507,6 +507,10 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
         }
 
         std::string name = lowercase(classname->value);
+        // IW3 info_notnull is a script-visible point (prefab targets such as
+        // mp_broadcast2's pf3_auto27); Replay's equivalent is script_origin.
+        if (name == "info_notnull")
+            name = "script_origin";
         if (name == "misc_model")
         {
             // IW3 static-model instances are loaded from world.models and
@@ -530,8 +534,8 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
         if (name == "script_struct" && isBarrelFireFxStruct(entity))
         {
             // IW3's _global_fx.gsc owns these barrel-fire placement markers.
-            // Until source FX graphs have native Replay emitters, retain the
-            // precise omission in the source-marker audit.
+            // The converted map script plays them from generated literals
+            // (iw3compat_global_fx), so the struct itself has no consumer.
             ++projectedSourceMarkers["script_struct:barrel_fireFX_origin"];
             continue;
         }
@@ -566,6 +570,11 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
 
         const bool hqRadio = name == "script_model" && targetName == "hq_hardpoint";
         const bool hqZone = name == "trigger_multiple" && targetName == "radiotrigger";
+        // Maps that ship a renamed copy of IW3 _destructible (Broadcast2's
+        // "aaadestructible") still tag their vehicles with destructible_type.
+        const bool destructible = std::ranges::any_of(entity, [](const KeyValue &pair) {
+            return lowercase(pair.key) == "destructible_type";
+        });
         std::string body;
         const auto appendKey = [&body](const uint32_t keyId, const std::string &value) {
             if (!body.empty())
@@ -585,6 +594,8 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
                 if (lowered == "destructible" || lowered == "interactive_tv" ||
                     lowered == "exploder")
                     value = "mw120r_" + lowered;
+                else if (destructible)
+                    value = "mw120r_destructible";
                 else if (hqRadio)
                     value = "hqloc";
                 else if (hqZone)

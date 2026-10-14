@@ -148,6 +148,7 @@ void WriteModules(ZoneWriter &writer, const std::vector<Module> &modules)
             break;
         }
         case iw8_focus::ParticleModuleType::testBirth:
+        case iw8_focus::ParticleModuleType::testDeath:
         {
             if (!module.spawnCurve.empty() || !module.models.empty() ||
                 !module.materials.empty() || !module.lightDefs.empty() ||
@@ -355,6 +356,7 @@ void WriteModules(ZoneWriter &writer, const std::vector<Module> &modules)
             break;
         case iw8_focus::ParticleModuleType::initRunner:
         case iw8_focus::ParticleModuleType::testBirth:
+        case iw8_focus::ParticleModuleType::testDeath:
         case iw8_focus::ParticleModuleType::testImpact:
             if (!module.childEffects.empty())
             {

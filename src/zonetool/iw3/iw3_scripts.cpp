@@ -106,6 +106,26 @@ std::string CommonFunction(const std::string &file, const std::string &name)
             if (name == known)
                 return "iw3compat_" + name;
     }
+    // common_scripts\utility and maps\mp\_utility helpers (struct lookups read
+    // the converter's generated struct table, iw3compat_structs()).
+    if (file == "common_scripts/utility" || file == "maps/mp/_utility")
+    {
+        for (const char *known :
+             {"getstructarray", "array_thread", "array_levelthread", "play_sound_on_tag"})
+            if (name == known)
+                return "iw3compat_" + name;
+    }
+    // maps\mp\_fx: the deprecated placement calls IW3 still runs (loopfx is a
+    // createfx loop effect; IW3's OneShotfx is empty).
+    if (file == "maps/mp/_fx")
+    {
+        if (name == "loopfx" || name == "loopsound" || name == "soundfx")
+            return "iw3compat_" + name;
+        if (name == "oneshotfx")
+            return "iw3compat_noop";
+    }
+    if (file == "maps/mp/gametypes/_shellshock" && name == "barrel_earthquake")
+        return "iw3compat_barrel_earthquake";
     return {};
 }
 
@@ -633,6 +653,13 @@ class Translator
                     Note("effect " + source + " -> " + effect);
                     i += 4;
                     continue;
+                }
+                // loadfx( variable ) receives an IW3 name at runtime; Replay's
+                // loadfx only takes converted vfx/ names.
+                if (resolved == "loadfx")
+                {
+                    out.back().text = "iw3compat_loadfx";
+                    Note("non-literal loadfx -> iw3compat_loadfx");
                 }
                 ++i;
                 continue;

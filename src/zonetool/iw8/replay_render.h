@@ -2,6 +2,7 @@
 #include "iw8_zone.h"
 #include "replay_bounds.h"
 #include <array>
+#include <memory>
 #include <string>
 #include <vector>
 namespace replayrender
@@ -12,6 +13,31 @@ struct Shader
     std::string name, debugName;
     std::vector<uint8_t> header, program;
 };
+// Resident pixel bytes, shared by every material definition of the same image file
+// (Greenband's 98 glass panes each carry the 3 x 89 MB world atlas: 30 GB as copies).
+// Writes through data() copy a shared buffer first.
+class ImagePixels
+{
+public:
+    const uint8_t *data() const { return bytes ? bytes->data() : nullptr; }
+    uint8_t *data() { return own().data(); }
+    size_t size() const { return bytes ? bytes->size() : 0; }
+    bool empty() const { return !size(); }
+    void resize(const size_t count) { own().resize(count); }
+    void share(std::shared_ptr<std::vector<uint8_t>> source) { bytes = std::move(source); }
+    const std::shared_ptr<std::vector<uint8_t>> &shared() const { return bytes; }
+
+private:
+    std::vector<uint8_t> &own()
+    {
+        if (!bytes)
+            bytes = std::make_shared<std::vector<uint8_t>>();
+        else if (bytes.use_count() > 1)
+            bytes = std::make_shared<std::vector<uint8_t>>(*bytes);
+        return *bytes;
+    }
+    std::shared_ptr<std::vector<uint8_t>> bytes;
+};
 struct Image
 {
     std::string name;
@@ -20,7 +46,7 @@ struct Image
     uint32_t flags = 0;
     uint16_t depth = 1, numElements = 1;
     uint8_t semantic = 1, category = 1;
-    std::vector<uint8_t> pixels;
+    ImagePixels pixels;
 };
 struct Technique
 {
@@ -158,6 +184,12 @@ struct Mesh : Material
     replaybounds::Bounds drawBounds{{0, 0, 0}, {100000, 100000, 100000}};
     std::vector<Material> additionalMaterials;
     std::vector<Material> assetMaterials;
+    // Stock materials (common zones) referenced by name only.
+    std::vector<std::string> stockMaterials;
+    // GfxWorld sunflare_t (+0x3E28) values, in field order from spriteSize:
+    // 6 floats, 2 ints (flare fades), 3 floats, 2 ints (blind fades), 3 floats,
+    // 2 ints (glare fades). Empty leaves hasValidData false.
+    std::vector<double> sunFlare;
     std::vector<BrushModel> brushModels;
     std::vector<DpvsPlane> planes;
     std::vector<uint16_t> nodes;

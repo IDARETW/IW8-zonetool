@@ -84,6 +84,18 @@ struct PhysicsMesh
     std::uint32_t surfaceType{};
 };
 
+// A simulated clutter body, as shipped Replay DynEnt clutter (mp_hideout
+// decor_misc_props_01_bucket_metal, uk_spray_bottle_01, kitchen_01_teapot_01):
+// one dynamic convex polytope with mass properties. Light props (debris)
+// use simulation category 5, PBQ_Debris and PMP_Debris; heavier ones 4,
+// PBQ_Dynamic and PMP_Dynamic. materialCrc names a physicsmaterial.hkx entry.
+struct ClutterBody
+{
+    float mass{1.0f};
+    std::uint32_t materialCrc{};
+    bool debris{true};
+};
+
 struct PhysicsAsset
 {
     std::string name;
@@ -98,9 +110,12 @@ bool FindOpaqueString(std::string_view value, std::uint32_t &id);
 BakeResult BakeCollision(const BakeInput &input);
 // keyframedBody stores the body contents and sentinel motion ids in the
 // serialized body, as shipped KeyframedEntity (script model) assets do.
+// With clutter, the body is a simulated convex hull of the mesh vertices
+// (useCategory 3; the simulation category comes from the clutter class).
 PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &mesh,
                               std::uint32_t useCategory = 3,
                               std::uint32_t simulationCategory = 1,
-                              bool keyframedBody = false);
+                              bool keyframedBody = false,
+                              const ClutterBody *clutter = nullptr);
 
 } // namespace iw8::havok
