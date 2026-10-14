@@ -1117,7 +1117,21 @@ std::vector<PreparedFx> ReadPreparedFx(const std::filesystem::path &root)
 
         try
         {
-            const Json graph = ReadJson(iterator->path());
+            Json graph = ReadJson(iterator->path());
+            // Names of assets referenced from another zone carry IW3's ','
+            // prefix (mp_agroprom: ",fx_me_brick_01"); the asset is the same.
+            const auto stripReferencePrefix = [](auto &self, Json &value) -> void {
+                if (value.is_string())
+                {
+                    auto &text = value.get_ref<std::string &>();
+                    if (text.size() > 1 && text.front() == ',')
+                        text.erase(0, 1);
+                }
+                else if (value.is_structured())
+                    for (auto &child : value)
+                        self(self, child);
+            };
+            stripReferencePrefix(stripReferencePrefix, graph);
             if (graph.value("schema", 0) != 1 ||
                 graph.value("asset_type", std::string{}) != "iw3_fx")
                 throw std::runtime_error("schema or asset type is unsupported");
@@ -1207,10 +1221,10 @@ constexpr std::string_view kScriptEffectMarker = "@mw120r_iw3fx@";
 
 // IW3 maps\mp\_destructible_types vehicle sounds: the fire state's flare-up and
 // burning loop, and the explosion (its secondaries chain the close, boom and
-// debris layers). IW3 MP has no alias for the glass and tire sounds.
+// debris layers). IW3 MP ships no audio for veh_glass_break_*; car glass uses
+// the window break alias (window_entry_glass_med) instead.
 constexpr const char *kIw3VehicleDestructibleSounds[] = {
-    "fire_vehicle_flareup_med", "fire_vehicle_med", "car_explode", "veh_glass_break_large",
-    "veh_glass_break_small"};
+    "fire_vehicle_flareup_med", "fire_vehicle_med", "car_explode", "window_entry_glass_med"};
 
 // IW3 maps\mp\_destructible_types vehicle effects (sedan, wagon, hatchback, ...).
 constexpr const char *kIw3VehicleDestructibleEffects[] = {
@@ -1714,8 +1728,10 @@ VisibilityGroups ReadVisibilityGroups(const Json &world)
     const auto &cells = dpvs.at("cells");
     const auto &planes = dpvs.at("planes");
     const auto &nodes = dpvs.at("nodes");
+    // Large IW3 maps (mp_arnhem) exceed 65535 BSP planes and nodes; Replay
+    // receives one merged cell, so only the cell count is bounded here.
     if (!cells.is_array() || cells.empty() || cells.size() > 65535 || !planes.is_array() ||
-        planes.size() > 65535 || !nodes.is_array() || nodes.empty() || nodes.size() > 65535)
+        !nodes.is_array() || nodes.empty())
         throw std::runtime_error("invalid IW3 DPVS topology");
 
     VisibilityGroups result;
@@ -2109,7 +2125,10 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
     const auto modelPath = SafeChild(root, std::filesystem::path("xmodel") / (modelName + ".json"));
     const Json model = ReadJson(modelPath);
     const auto modelType = model.value("type", std::string{});
-    if ((modelType != "rigid" && !(placedStaticBindPose && modelType == "animated")) ||
+    // Entity models (with a skeleton root) also take an animated model's bind
+    // pose: IW3 xanims are not converted (mp_greenband's swaying lanterns).
+    const bool bindPose = placedStaticBindPose || !skeletonRoot.empty();
+    if ((modelType != "rigid" && !(bindPose && modelType == "animated")) ||
         !model.contains("lods") ||
         model.at("lods").empty() || model.at("lods").size() > 6)
     {
@@ -2154,7 +2173,7 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
             // OAT's IW3 model exporter writes verts0.xyz directly. Its GLTF bind
             // pose uses each baseMat and its inverse, so a placed static model's
             // deformed vertices have these exact model-space positions at rest.
-            if (sourceSurface.at("deformed").get<bool>() && !placedStaticBindPose)
+            if (sourceSurface.at("deformed").get<bool>() && !bindPose)
                 throw std::runtime_error("IW3 placed model requires skinning: " + modelName);
             Surface surface = ReadWorldSurface(sourceSurface);
             // IW3 destructible base models hold every damage state and hide the
@@ -3452,6 +3471,14 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             for (const Surface &surface : sourceModel.lods.at(sourceModel.collisionLod).surfaces)
             {
                 const auto material = plan.materials.find(surface.material);
+                // Script-model glass (car windows, lights) breaks by hiding its
+                // part, which cannot remove a mesh shape: keep glass out of the
+                // keyframed body so bullets pass windows as they do once broken.
+                if (scriptModelPhysics &&
+                    ((material != plan.materials.end() &&
+                      material->second.kind == SurfaceKind::glass) ||
+                     Lowercase(surface.material).find("glass") != std::string::npos))
+                    continue;
                 const unsigned surfaceType =
                     material == plan.materials.end()
                         ? 0
@@ -3504,13 +3531,19 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
     }
 
     staticModels.instances.reserve(source.instances.size());
+    std::size_t unrotatedInstances = 0;
     for (const SourceStaticModelInstance &sourceInstance : source.instances)
     {
-        const auto axis = StaticModelAxis(sourceInstance);
+        auto axis = StaticModelAxis(sourceInstance);
         const Vec3 angles = iw8::staticmodelcollision::anglesFromAxis(axis);
-        if (!iw8::staticmodelcollision::axesNearlyEqual(
-                axis, iw8::staticmodelcollision::axisFromAngles(angles), 2.0e-4f))
-            throw std::runtime_error("IW3 static-model source axis failed angle round-trip");
+        const auto rotation = iw8::staticmodelcollision::axisFromAngles(angles);
+        if (!iw8::staticmodelcollision::axesNearlyEqual(axis, rotation, 2.0e-4f))
+        {
+            // A mirrored or skewed Radiant placement has no quaternion; Replay
+            // places the model with the nearest rotation instead.
+            axis = rotation;
+            ++unrotatedInstances;
+        }
         staticModels.instances.push_back(
             {static_cast<unsigned>(sourceInstance.model), sourceInstance.origin,
              QuaternionFromBasis(axis[0], axis[1], axis[2]), sourceInstance.scale});
@@ -3520,6 +3553,10 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             collisionModel.instances.push_back({sourceInstance.origin, angles, sourceInstance.scale});
         }
     }
+    if (unrotatedInstances)
+        zt::warn("iw3: %zu static model(s) have a mirrored or skewed IW3 placement; placed with "
+                 "the nearest rotation",
+                 unrotatedInstances);
 }
 
 void BuildShadowScene(const std::vector<BrushModel> &brushModels,
@@ -3842,7 +3879,28 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, const RenderPlan &pl
             ++matchedHulls;
         }
         if (!matchedHulls)
-            throw std::runtime_error("IW3 glass pane is missing its source collision brush");
+        {
+            // A nonsolid (render-only) pane: native glass still needs a world
+            // hull to break, so give it its bounds, at least half a unit thick.
+            CollisionHull paneHull;
+            paneHull.contents = iw8::havok::kBreakableGlassContents;
+            paneHull.materialOverride = 9; // native surftype glass_pane
+            paneHull.glassId = glassId;
+            Vec3 low = model.minimum, high = model.maximum;
+            if (high[thin] - low[thin] < 0.5f)
+            {
+                low[thin] = center[thin] - 0.25f;
+                high[thin] = center[thin] + 0.25f;
+            }
+            for (unsigned corner = 0; corner < 8; ++corner)
+                paneHull.points.push_back(
+                    Add(Transform(axis, Vec3{corner & 1 ? high[0] : low[0],
+                                             corner & 2 ? high[1] : low[1],
+                                             corner & 4 ? high[2] : low[2]}),
+                        entityOrigin));
+            collision.hulls.push_back(std::move(paneHull));
+            zt::info("iw3: glass pane %u has no collision brush; gave it a box hull", glassId);
+        }
         if (duplicateHulls)
             zt::info("iw3: removed %zu exact duplicate native hull(s) from glass pane %u",
                      duplicateHulls, glassId);
@@ -4484,7 +4542,7 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
         // and leave occlusion to Umbra and GPU culling. Replay does not flood
         // IW3's portals, so props owned by another source cell vanished as the
         // camera crossed into a neighbouring cell. Merge every tree into one leaf.
-        std::set<unsigned> surfaces, models;
+        std::set<unsigned> surfaces, cellModels;
         Vec3 minimum{}, maximum{};
         bool first = true;
         for (const auto &cell : output["dpvs"]["cells"])
@@ -4505,17 +4563,21 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                 for (const auto &surface : tree.at("surfaces"))
                     surfaces.insert(surface.get<unsigned>());
                 for (const auto &model : tree.value("models", Json::array()))
-                    models.insert(model.get<unsigned>());
+                    cellModels.insert(model.get<unsigned>());
             }
         }
         Json tree = {{"bounds", {minimum, maximum}},
                      {"surfaces", std::vector<unsigned>(surfaces.begin(), surfaces.end())},
-                     {"models", std::vector<unsigned>(models.begin(), models.end())}};
+                     {"models", std::vector<unsigned>(cellModels.begin(), cellModels.end())}};
         if (visibility.nativeTopology)
         {
             tree["childCount"] = 0;
             tree["firstChild"] = 0;
         }
+        // The merged cell's nodes {1} reference no plane; drop IW3's planes
+        // when they exceed Replay's 16-bit table (mp_arnhem).
+        if (output["dpvs"]["planes"].size() > 65535)
+            output["dpvs"]["planes"] = Json::array();
         output["dpvs"]["nodes"] = Json::array({1});
         output["dpvs"]["cells"] = Json::array({{{"bounds", {minimum, maximum}},
                                                 {"portals", Json::array()},
@@ -5906,7 +5968,7 @@ void WriteFootsteps(const std::filesystem::path &path, const std::vector<BrushMo
                                                c.position[0], c.position[1],
                                                c.position[2], static_cast<float>(material)};
                 if (std::ranges::any_of(triangle, [](const float value) {
-                        return !std::isfinite(value) || std::abs(value) > 100000.0f;
+                        return !std::isfinite(value) || std::abs(value) > 262144.0f;
                     }))
                     throw std::runtime_error("IW3 footstep triangle contains invalid coordinates");
                 triangles.push_back(triangle);
@@ -6796,6 +6858,7 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
 
     iw8::impact::EffectOverrides overrides;
     overrides.reserve(targets.size() * (nonFleshCount + fleshCount) * 2);
+    std::set<std::string> unconvertedImpacts;
     for (std::size_t sourceRow = 0; sourceRow < sourceRowCount; ++sourceRow)
     {
         const auto &entry = entries.at(sourceRow);
@@ -6815,7 +6878,10 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
                 throw std::runtime_error("IW3 impact FX slot has an invalid effect name");
             const auto alias = effectAliases.find(value.get<std::string>());
             if (alias == effectAliases.end())
+            {
+                unconvertedImpacts.insert(value.get<std::string>());
                 return;
+            }
             // Nonflesh slots are IW3 surface types; Replay indexes the table by
             // its own surface type (trace surfaceFlags >> 19), the mapping the
             // collision tags use. IW3 flesh slots (body/head x nonfatal/fatal)
@@ -6840,6 +6906,15 @@ iw8::impact::EffectOverrides ReadImpactOverrides(
             append(nonFlesh.at(index), false, index);
         for (std::size_t index = 0; index < fleshCount; ++index)
             append(flesh.at(index), true, index);
+    }
+    if (!unconvertedImpacts.empty())
+    {
+        std::string names;
+        for (const auto &name : unconvertedImpacts)
+            names += (names.empty() ? "" : ", ") + name;
+        zt::warn("iw3: %zu IW3 impact effect(s) did not convert; their slots keep Replay's "
+                 "stock impact: %s",
+                 unconvertedImpacts.size(), names.c_str());
     }
     return overrides;
 }
@@ -6956,6 +7031,291 @@ std::filesystem::path ExtractionCacheDirectory(const std::filesystem::path &unli
     return options.scratchRoot / ".iw3-extract-cache" / text;
 }
 
+// IW3 gametype visuals (--iw3-mode-assets). With them, IW3's domination flag
+// props stand at each flag; Replay's domination only draws objective markers.
+// The "dom" gameobject name lets the gametype delete them outside domination,
+// as IW3 did. Without them, the IW3 headquarters radios keep their entities
+// (Replay's hq.gsc needs hqloc) but lose their IW3 laptop model.
+std::string WithIw3ModeAssets(const std::string &text, const bool enabled)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    const auto entities = ParseEntityFields(text, &spans);
+    const auto value = [](const EntityFields &entity, const char *key) {
+        const auto found = entity.find(key);
+        return found == entity.end() ? std::string{} : found->second;
+    };
+    std::string result;
+    std::size_t copied = 0;
+    std::size_t flags = 0;
+    std::size_t radios = 0;
+    for (std::size_t index = 0; index < entities.size(); ++index)
+    {
+        const auto &entity = entities[index];
+        const bool flag = value(entity, "classname") == "trigger_radius" &&
+                          value(entity, "targetname") == "flag_primary";
+        const bool radio = value(entity, "classname") == "script_model" &&
+                           value(entity, "targetname") == "hq_hardpoint";
+        if (enabled && flag)
+        {
+            result.append(text, copied, spans[index].second - copied);
+            copied = spans[index].second;
+            result += "\n{\n\"classname\" \"script_model\"\n\"targetname\" \"mw120r_dom_flag\"\n"
+                      "\"script_gameobjectname\" \"dom\"\n\"model\" \"prop_flag_neutral\"\n"
+                      "\"origin\" \"" +
+                      value(entity, "origin") + "\"\n}";
+            ++flags;
+        }
+        else if (!enabled && radio)
+        {
+            result.append(text, copied, spans[index].first - copied);
+            copied = spans[index].second;
+            result += "{\n";
+            for (const auto &[key, field] : entity)
+                if (key != "model")
+                    result += "\"" + key + "\" \"" + field + "\"\n";
+            result += "}";
+            ++radios;
+        }
+    }
+    result.append(text, copied, text.size() - copied);
+    if (enabled)
+        zt::info("iw3: mode assets on: placed %zu IW3 domination flag prop(s)", flags);
+    else
+        zt::info("iw3: mode assets off: removed the IW3 model from %zu headquarters radio(s)",
+                 radios);
+    return result;
+}
+
+// Capture the flag. IW3 had no stock CTF; custom maps place the flags from
+// their map script for mod CTF (`addobj("allied_flag", (x, y, z), ...)`, which
+// spawns a trigger_radius) or as allied_flag / axis_flag entities. Replay's
+// ctf.gsc reads ctf_zone_<team> (only its origin; it spawns its own trigger)
+// and ctf_flag_<team> (it sets the common_base_mp flag model on it), spawns
+// at mp_ctf_spawn for both teams, and the mp_ctf_spawn_<team>_start sets.
+// Without flags, no CTF entities are made and the gametype uses its fallbacks.
+std::string WithIw3CtfObjectives(const std::string &text, const std::string &mapScript)
+{
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    const auto entities = ParseEntityFields(text, &spans);
+    const auto value = [](const EntityFields &entity, const char *key) {
+        const auto found = entity.find(key);
+        return found == entity.end() ? std::string{} : found->second;
+    };
+    const auto parseOrigin = [](const std::string &origin) -> std::optional<Vec3> {
+        Vec3 result{};
+        if (std::sscanf(origin.c_str(), "%f %f %f", &result[0], &result[1], &result[2]) != 3)
+            return std::nullopt;
+        return result;
+    };
+    std::array<std::optional<Vec3>, 2> flags; // allies, axis
+    constexpr std::array<const char *, 2> teams{{"allies", "axis"}};
+    constexpr std::array<const char *, 2> flagNames{{"allied_flag", "axis_flag"}};
+    for (const auto &entity : entities)
+        for (std::size_t team = 0; team < 2; ++team)
+            if (value(entity, "targetname") == flagNames[team] && !flags[team])
+                flags[team] = parseOrigin(value(entity, "origin"));
+    for (std::size_t team = 0; team < 2; ++team)
+    {
+        // addobj("allied_flag", (x, y, z), ...) in the IW3 map script.
+        const std::string quoted = std::string("\"") + flagNames[team] + "\"";
+        for (std::size_t at = mapScript.find(quoted); !flags[team] && at != std::string::npos;
+             at = mapScript.find(quoted, at + 1))
+        {
+            const auto open = mapScript.find('(', at);
+            const auto close = mapScript.find(')', open);
+            if (open == std::string::npos || close == std::string::npos ||
+                mapScript.find_first_not_of(" \t,", at + quoted.size()) != open)
+                continue;
+            Vec3 origin{};
+            const auto inside = mapScript.substr(open + 1, close - open - 1);
+            if (std::sscanf(inside.c_str(), " %f , %f , %f", &origin[0], &origin[1],
+                            &origin[2]) == 3)
+                flags[team] = origin;
+        }
+    }
+    // Without placed flags, CoD4 CTF mods use each team's sabotage bomb site
+    // (sab_bomb_<team>, in that team's base) as its flag base.
+    const char *flagSource = "placed flags";
+    if (!flags[0] || !flags[1])
+    {
+        std::array<std::optional<Vec3>, 2> sites;
+        for (const auto &entity : entities)
+            for (std::size_t team = 0; team < 2; ++team)
+                if (value(entity, "targetname") == std::string("sab_bomb_") + teams[team] &&
+                    !sites[team])
+                    sites[team] = parseOrigin(value(entity, "origin"));
+        if (!sites[0] || !sites[1])
+            return text;
+        flags = sites;
+        flagSource = "sabotage bomb sites";
+    }
+
+    const auto distance =[](const Vec3 &a, const Vec3 &b) {
+        return std::hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    };
+    const auto originText = [](const Vec3 &origin) {
+        char buffer[96];
+        std::snprintf(buffer, sizeof(buffer), "%g %g %g", origin[0], origin[1], origin[2]);
+        return std::string(buffer);
+    };
+    const auto write = [](const EntityFields &entity, const std::string &classname) {
+        std::string block = "\n{\n\"classname\" \"" + classname + "\"\n";
+        for (const auto &[key, field] : entity)
+            if (key != "classname")
+                block += "\"" + key + "\" \"" + field + "\"\n";
+        return block + "}";
+    };
+
+    bool haveSpawns = false;
+    std::array<bool, 2> haveStarts{};
+    std::vector<const EntityFields *> tdmSpawns;
+    std::array<std::vector<const EntityFields *>, 2> tdmStarts;
+    std::string result;
+    std::size_t copied = 0;
+    for (std::size_t index = 0; index < entities.size(); ++index)
+    {
+        const auto &entity = entities[index];
+        const auto classname = value(entity, "classname");
+        const auto targetname = value(entity, "targetname");
+        const bool flag = targetname == flagNames[0] || targetname == flagNames[1];
+        const bool teamSpawn = classname == "mp_ctf_spawn_allies" || classname == "mp_ctf_spawn_axis";
+        haveSpawns = haveSpawns || teamSpawn || classname == "mp_ctf_spawn";
+        for (std::size_t team = 0; team < 2; ++team)
+        {
+            if (classname == std::string("mp_ctf_spawn_") + teams[team] + "_start")
+                haveStarts[team] = true;
+            if (classname == std::string("mp_tdm_spawn_") + teams[team] + "_start")
+                tdmStarts[team].push_back(&entity);
+        }
+        if (classname == "mp_tdm_spawn")
+            tdmSpawns.push_back(&entity);
+        if (!flag && !teamSpawn)
+            continue;
+        // Replay registers one mp_ctf_spawn class for both teams; the mod flag
+        // entities are replaced by the Replay zone and flag records below.
+        result.append(text, copied, spans[index].first - copied);
+        copied = spans[index].second;
+        if (teamSpawn)
+            result += write(entity, "mp_ctf_spawn");
+    }
+    result.append(text, copied, text.size() - copied);
+
+    for (std::size_t team = 0; team < 2; ++team)
+    {
+        const auto origin = originText(*flags[team]);
+        result += std::string("\n{\n\"classname\" \"trigger_radius\"\n\"targetname\" \"ctf_zone_") +
+                  teams[team] + "\"\n\"origin\" \"" + origin +
+                  "\"\n\"radius\" \"48\"\n\"height\" \"148\"\n}";
+        result += std::string("\n{\n\"classname\" \"script_model\"\n\"targetname\" \"ctf_flag_") +
+                  teams[team] + "\"\n\"origin\" \"" + origin + "\"\n}";
+    }
+    std::size_t spawns = 0, starts = 0;
+    if (!haveSpawns)
+        for (const auto *spawn : tdmSpawns)
+        {
+            result += write(*spawn, "mp_ctf_spawn");
+            ++spawns;
+        }
+    if (!haveStarts[0] && !haveStarts[1] && !tdmStarts[0].empty() && !tdmStarts[1].empty())
+    {
+        // Each team starts at the TDM start set nearer its own flag.
+        const auto centroid = [&](const std::vector<const EntityFields *> &set) {
+            Vec3 sum{};
+            for (const auto *spawn : set)
+                if (const auto origin = parseOrigin(value(*spawn, "origin")))
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                        sum[axis] += (*origin)[axis] / static_cast<float>(set.size());
+            return sum;
+        };
+        const Vec3 first = centroid(tdmStarts[0]);
+        const Vec3 second = centroid(tdmStarts[1]);
+        const bool swap = distance(first, *flags[1]) + distance(second, *flags[0]) <
+                          distance(first, *flags[0]) + distance(second, *flags[1]);
+        for (std::size_t team = 0; team < 2; ++team)
+            for (const auto *spawn : tdmStarts[swap ? 1 - team : team])
+            {
+                result += write(*spawn, std::string("mp_ctf_spawn_") + teams[team] + "_start");
+                ++starts;
+            }
+    }
+    zt::info("iw3: capture the flag from %s: allies flag (%s), axis flag (%s), %zu spawn(s) and "
+             "%zu start spawn(s) made from TDM",
+             flagSource, originText(*flags[0]).c_str(), originText(*flags[1]).c_str(), spawns,
+             starts);
+    return result;
+}
+
+// Replay's killstreak scripts read stock template entities at load (getent;
+// an undefined one errors when the streak runs): care packages clone
+// care_package_col into each crate, deployable cover clones tactical_cover_col
+// and white phosphorus moves white_phosphorus_damage to each strike. IW3 maps
+// have none. Shipped maps park them outside play; these sit below the world,
+// inside the broadphase. Sizes: the Replay crate and offhand_wm_deployable_cover
+// bounds, and mp_shipment's white phosphorus volume (1504 x 512 x 500).
+void AddReplayTemplateEntities(CollisionData &collision, Json &render, std::string &entities,
+                               const Vec3 &minimum, const Vec3 &maximum, const float floor)
+{
+    auto &brushModels = render.at("brushModels");
+    if (brushModels.size() != collision.models.size())
+        throw std::runtime_error("IW3 render and collision brush-model counts differ");
+    struct Box
+    {
+        const char *targetname;
+        Vec3 low;
+        Vec3 high;
+    };
+    const std::array<Box, 2> boxes{{
+        {"care_package_col", {-26.0f, -26.0f, 0.0f}, {26.0f, 26.0f, 55.0f}},
+        {"tactical_cover_col", {-5.0f, -30.0f, 0.0f}, {5.0f, 30.0f, 49.0f}},
+    }};
+    const auto surfaceCount = render.at("surfaces").size();
+    const float y = (minimum[1] + maximum[1]) * 0.5f;
+    float x = minimum[0] + 256.0f;
+    const auto originText = [](const Vec3 &origin) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%.1f %.1f %.1f", origin[0], origin[1], origin[2]);
+        return std::string(text);
+    };
+    for (const Box &box : boxes)
+    {
+        const Vec3 origin{x, y, floor};
+        x += 256.0f;
+        Vec3 low{}, high{};
+        std::vector<Vec4> planes;
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            low[axis] = origin[axis] + box.low[axis];
+            high[axis] = origin[axis] + box.high[axis];
+            Vec4 lower{};
+            lower[axis] = -1.0f;
+            lower[3] = -low[axis];
+            planes.push_back(lower);
+            Vec4 upper{};
+            upper[axis] = 1.0f;
+            upper[3] = high[axis];
+            planes.push_back(upper);
+        }
+        const auto modelIndex = static_cast<std::uint32_t>(collision.models.size());
+        collision.models.push_back({box.low, box.high});
+        CollisionHull hull;
+        hull.points = HullFromPlanes(planes);
+        hull.contents = 1;
+        hull.model = modelIndex;
+        collision.hulls.push_back(std::move(hull));
+        brushModels.push_back(
+            {{"firstSurface", surfaceCount}, {"surfaceCount", 0}, {"bounds", {low, high}}});
+        entities += "{\n\"classname\" \"script_brushmodel\"\n\"targetname\" \"" +
+                    std::string(box.targetname) + "\"\n\"origin\" \"" + originText(origin) +
+                    "\"\n\"model\" \"*" + std::to_string(modelIndex) + "\"\n}\n";
+    }
+    // A radius trigger needs no brush model and moves like the stock volume.
+    entities += "{\n\"classname\" \"trigger_radius\"\n\"targetname\" \"white_phosphorus_damage\"\n"
+                "\"origin\" \"" +
+                originText({x + 512.0f, y, floor}) + "\"\n\"radius\" \"500\"\n\"height\" \"500\"\n}\n";
+    zt::info("iw3: added Replay template entities care_package_col, tactical_cover_col and "
+             "white_phosphorus_damage below the world");
+}
+
 PreparedMap PrepareFastfile(const ImportOptions &options)
 {
     std::error_code error;
@@ -7030,6 +7390,15 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         throw std::runtime_error("IW3 map entity export is missing");
     }
 
+    entities = WithIw3ModeAssets(entities, options.iw3ModeAssets);
+    {
+        std::string mapScript;
+        const auto scriptPath =
+            worldPath.parent_path() /
+            (std::filesystem::path(sourceAsset).stem().string() + ".gsc");
+        zt::read_file_str(scriptPath.string(), mapScript);
+        entities = WithIw3CtfObjectives(entities, mapScript);
+    }
     const auto entityModelNames = convert::iw3ReplayEntityModels(entities);
     auto missingEntityModels = MissingEntityModels(exportRoot, entityModelNames);
     if (!cached && !missingEntityModels.empty())
@@ -7128,6 +7497,18 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         zt::write_file_str((skeletonRoot / "complete").string(), "1");
     }
 
+    // A map-local IWD beside the fastfile (mp_discovery_night.iwd) holds the
+    // map's loose images, vision file and sounds; the zone only names them.
+    if (const auto count = sound::ExtractIwdMembers(options.fastfile.parent_path(),
+                                                    {"images/", "vision/", "sound/"}, exportRoot))
+        zt::info("iw3: extracted %zu image, vision and sound file(s) from the map IWD(s)", count);
+    if (const auto preview = BuildLoadscreenPreview(exportRoot, options.searchPaths, sourceMap);
+        !preview.empty())
+    {
+        std::filesystem::create_directories(result.root);
+        if (!zt::write_file((result.root / "preview.rgba").string(), preview))
+            throw std::runtime_error("cannot write the loading-screen preview");
+    }
     result.rawFiles = ReadPreparedRawFiles(exportRoot, sourceMap);
     // setExpFog and the vision film grade become Replay's vision fog, a grading
     // CLUT and (below) the converted surface shader's fog.
@@ -7283,18 +7664,25 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     std::vector<std::string> scriptModels;
     {
         std::vector<scripts::Source> scriptSources;
-        const auto scriptDirectory = exportRoot / "maps" / "mp";
-        std::error_code scriptError;
-        if (std::filesystem::is_directory(scriptDirectory, scriptError))
+        // The map scripts, and the createfx (effect placement) and createart
+        // scripts the map's main calls.
+        for (const char *folder : {"mp", "createfx", "createart"})
+        {
+            const auto scriptDirectory = exportRoot / "maps" / folder;
+            std::error_code scriptError;
+            if (!std::filesystem::is_directory(scriptDirectory, scriptError))
+                continue;
             for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory))
             {
                 if (!entry.is_regular_file() || Lowercase(entry.path().extension().string()) != ".gsc")
                     continue;
                 std::string text;
                 if (zt::read_file_str(entry.path().string(), text))
-                    scriptSources.push_back(
-                        {"maps/mp/" + Lowercase(entry.path().filename().string()), std::move(text)});
+                    scriptSources.push_back({std::string("maps/") + folder + "/" +
+                                                 Lowercase(entry.path().filename().string()),
+                                             std::move(text)});
             }
+        }
         // Destroyed states of IW3 destructibles (<type>_destroyed, <model>_d).
         std::set<std::string> extraModels;
         for (const EntityFields &entity : ParseEntityFields(entities))
@@ -7320,8 +7708,10 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         generated += "}\n";
         try
         {
+            // The IW3 source name, which can differ from the Replay map id
+            // (mp_discovery_night built as mp_discovery).
             auto translation = scripts::Translate(
-                options.map, scriptSources,
+                sourceMap, scriptSources,
                 [](const std::string &effect) { return std::string(kScriptEffectMarker) + effect; },
                 generated);
             for (const auto &note : translation.notes)
@@ -7527,6 +7917,9 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     std::map<std::string, bool> soundAliases;
     {
         std::set<std::string> requestedSounds = sound::ReadScriptSoundNames(exportRoot / "maps" / "mp");
+        for (const char *folder : {"createfx", "createart"})
+            for (const auto &name : sound::ReadScriptSoundNames(exportRoot / "maps" / folder))
+                requestedSounds.insert(name);
         const bool hasDestructibleVehicles = std::ranges::any_of(
             ParseEntityFields(entities), [](const EntityFields &entity) {
                 const auto type = entity.find("destructible_type");
@@ -7661,7 +8054,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     AddStairRamps(nativeCollision);
     std::set<std::uint32_t> nativeGlassModels;
     std::set<std::string> nativeGlassTargets;
-    const Json render = BuildRender(world, visibility, brushModels, renderPlan, entities,
+    Json render = BuildRender(world, visibility, brushModels, renderPlan, entities,
                                     sourceStaticModels,
                                     result.staticModels, nativeCollision, triangles,
                                     nativeGlassModels, nativeGlassTargets, sourceEntityModels);
@@ -7803,7 +8196,6 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     WriteFootsteps(result.footsteps, brushModels, renderPlan);
 
     const std::string targetAsset = options.map + ".d3dbsp";
-    WriteJson(mapDirectory / (targetAsset + ".render.json"), render);
     WriteJson(mapDirectory / (targetAsset + ".lighting.json"),
               BuildLighting(world, commonWorld, entities));
     timing.lap("render json write");
@@ -7823,6 +8215,10 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         minimum[axis] -= 64.0f;
         maximum[axis] += 64.0f;
     }
+    const float templateFloor = minimum[2] - 1200.0f;
+    AddReplayTemplateEntities(nativeCollision, render, entities, minimum, maximum, templateFloor);
+    minimum[2] = templateFloor - 64.0f;
+    WriteJson(mapDirectory / (targetAsset + ".render.json"), render);
     WriteJson(mapDirectory / (targetAsset + ".bounds.json"),
               {{"schema", 1}, {"min", minimum}, {"max", maximum}});
 

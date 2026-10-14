@@ -30,6 +30,8 @@ struct ImportOptions
     std::filesystem::path unlinker;
     std::filesystem::path scratchRoot;
     std::vector<std::filesystem::path> searchPaths;
+    // Convert IW3 gametype visuals (flag props, headquarters radios).
+    bool iw3ModeAssets{true};
 };
 
 struct PreparedXModel

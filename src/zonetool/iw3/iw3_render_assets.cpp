@@ -100,6 +100,9 @@ struct SourceFxMaterial
     unsigned rows{1};
     unsigned columns{1};
     FxMaterialFamily family{FxMaterialFamily::unsupported};
+    // srcalpha/one blending, drawn by the one/one additive family with the
+    // colour map premultiplied by its alpha (the same result).
+    bool premultiplied{};
 };
 
 std::vector<std::uint8_t> ReadBytes(const std::filesystem::path &path)
@@ -883,6 +886,10 @@ std::vector<Image> LoadImage(const std::filesystem::path &root,
     std::error_code error;
     if (std::filesystem::is_regular_file(path, error))
         return DecodeDds(path);
+    // Extracted from a map-local IWD.
+    if (const auto iwi = root / "images" / (name + ".iwi");
+        std::filesystem::is_regular_file(iwi, error))
+        return DecodeIwi(iwi);
     for (const auto &source : sourcePaths)
     {
         for (const auto &candidate :
@@ -893,6 +900,38 @@ std::vector<Image> LoadImage(const std::filesystem::path &root,
              {source / "images" / (name + ".iwi"), source / "raw" / "images" / (name + ".iwi")})
             if (std::filesystem::is_regular_file(candidate, error))
                 return DecodeIwi(candidate);
+    }
+    // Composite images the IW3 converter generates (`~<name>~<hash>`) change
+    // hash on every recompile; a map IWD packed from another compile carries
+    // the same image under a different hash.
+    if (const auto tilde = name.rfind('~'); name.starts_with('~') && tilde != std::string::npos &&
+                                            tilde > 0 && name.size() - tilde == 9)
+    {
+        const std::string prefix = name.substr(0, tilde + 1);
+        std::vector<std::filesystem::path> directories{root / "images"};
+        for (const auto &source : sourcePaths)
+        {
+            directories.push_back(source / "images");
+            directories.push_back(source / "raw" / "images");
+        }
+        for (const auto &directory : directories)
+        {
+            if (!std::filesystem::is_directory(directory, error))
+                continue;
+            for (const auto &entry : std::filesystem::directory_iterator(directory, error))
+            {
+                const auto file = entry.path().filename().string();
+                const auto extension = entry.path().extension().string();
+                if (!file.starts_with(prefix) || entry.path().stem().string().size() != name.size())
+                    continue;
+                if (extension == ".dds" || extension == ".iwi")
+                {
+                    zt::warn("iw3: image '%s' is missing; using '%s' from another compile",
+                             name.c_str(), file.c_str());
+                    return extension == ".dds" ? DecodeDds(entry.path()) : DecodeIwi(entry.path());
+                }
+            }
+        }
     }
     throw std::runtime_error("missing IW3 image '" + name +
                              "'; add the matching IW3 main and raw directories with --search-path");
@@ -1343,9 +1382,26 @@ SourceFxMaterial ReadFxMaterial(const std::filesystem::path &root,
              material.techniqueSet == "effect_zfeather_add_nofog")
         material.family = FxMaterialFamily::additiveFeather;
     // particle_cloud_add is an additive cloud; Replay draws it as an additive sprite.
+    // The view-angle falloff and eye offset of the other additive variants have
+    // no Replay counterpart; they draw as plain additive sprites.
     else if (material.techniqueSet == "effect_add_nofog" || material.techniqueSet == "effect_add" ||
-             material.techniqueSet == "particle_cloud_add")
+             material.techniqueSet == "particle_cloud_add" ||
+             material.techniqueSet == "particle_cloud_outdoor_add" ||
+             material.techniqueSet == "effect_falloff_add" ||
+             material.techniqueSet == "effect_falloff_add_nofog" ||
+             material.techniqueSet == "effect_add_eyeoffset" ||
+             material.techniqueSet == "effect_add_nofog_eyeoffset")
         material.family = FxMaterialFamily::additive;
+    // Likewise the falloff and spot-shadowed alpha variants draw as plain
+    // (feathered) alpha sprites.
+    else if (material.techniqueSet == "effect_falloff" ||
+             material.techniqueSet == "effect_falloff_nofog")
+        material.family = FxMaterialFamily::alpha;
+    else if (material.techniqueSet == "effect_zfeather_falloff" ||
+             material.techniqueSet == "effect_zfeather_falloff_nofog" ||
+             material.techniqueSet == "effect_zfeather_spot" ||
+             material.techniqueSet == "effect_zfeather_spot_nofog")
+        material.family = FxMaterialFamily::alphaFeather;
     // The view-angle falloff of these additive sprites (IW3 fire roar) has no
     // Replay counterpart; the feathered additive family draws them unfaded.
     else if (material.techniqueSet == "effect_zfeather_falloff_add" ||
@@ -1471,12 +1527,12 @@ SourceFxMaterial ReadFxMaterial(const std::filesystem::path &root,
         !supportedFilter ||
         (mipMap != "disabled" && mipMap != "nearest" && mipMap != "linear"))
     {
-        if (noFogAlias)
-        {
-            material.family = FxMaterialFamily::unsupported;
-            return material;
-        }
-        throw std::runtime_error("IW3 FX material sampler has no pinned Replay mapping: " + name);
+        if (!noFogAlias)
+            zt::warn("iw3: FX material %s sampler has no pinned Replay mapping; its effect "
+                     "elements are not converted",
+                     name.c_str());
+        material.family = FxMaterialFamily::unsupported;
+        return material;
     }
 
     bool foundColorState = false;
@@ -1499,15 +1555,35 @@ SourceFxMaterial ReadFxMaterial(const std::filesystem::path &root,
                             state.at("srcBlendRgb") == "srcalpha" &&
                             state.at("dstBlendRgb") == "invsrcalpha") ||
                            cutout;
+        // invdestcolor/one (IW3 "screen" fire) is drawn additively.
         const bool additive = state.at("alphaTest") == "disabled" &&
-                              state.at("srcBlendRgb") == "one" &&
+                              (state.at("srcBlendRgb") == "one" ||
+                               state.at("srcBlendRgb") == "invdestcolor") &&
                               state.at("dstBlendRgb") == "one";
+        const bool alphaAdditive = state.at("srcBlendRgb") == "srcalpha" &&
+                                   state.at("dstBlendRgb") == "one";
         const bool wantsAlpha = material.family == FxMaterialFamily::alpha ||
                                  material.family == FxMaterialFamily::alphaFeather ||
                                  material.family == FxMaterialFamily::cloud;
+        if (shared && alphaAdditive)
+        {
+            material.family = material.family == FxMaterialFamily::alphaFeather ||
+                                      material.family == FxMaterialFamily::additiveFeather
+                                  ? FxMaterialFamily::additiveFeather
+                                  : FxMaterialFamily::additive;
+            material.premultiplied = true;
+            continue;
+        }
         if ((!shared && !cutout) || (wantsAlpha ? !alpha : !additive))
-            throw std::runtime_error("IW3 FX material blend state has no pinned Replay mapping: " +
-                                     name);
+        {
+            // An unmapped blend (srcalpha/one particle_cloud in mp_broadcast2)
+            // drops only the effect elements that use this material.
+            zt::warn("iw3: FX material %s blend state has no pinned Replay mapping; its effect "
+                     "elements are not converted",
+                     name.c_str());
+            material.family = FxMaterialFamily::unsupported;
+            return material;
+        }
     }
     if (!foundColorState)
         throw std::runtime_error("IW3 FX material has no color state: " + name);
@@ -1530,16 +1606,17 @@ SourceFxMaterial ReadFxMaterial(const std::filesystem::path &root,
             FxLiteral(constant.at("literal"), "feather parameters"), foundFeather = true;
         else if (key == "colorTint")
             material.tint = FxLiteral(constant.at("literal"), "color tint"), foundTint = true;
-        else if (key.starts_with("falloff") &&
-                 material.techniqueSet.starts_with("effect_zfeather_falloff_add"))
-            continue;
+        else if (material.techniqueSet.find("falloff") != std::string::npos ||
+                 material.techniqueSet.find("eyeoffset") != std::string::npos ||
+                 material.techniqueSet.find("_spot") != std::string::npos)
+            continue; // parameters of the unconverted falloff, eye offset and spot terms
         else
             throw std::runtime_error("IW3 FX material has an unsupported constant: " + name);
     }
     const bool requiresFeather = material.family == FxMaterialFamily::alphaFeather ||
                                  material.family == FxMaterialFamily::additiveFeather;
     // IW3 additive clouds carry no tint constant (white).
-    if (!foundTint && material.techniqueSet == "particle_cloud_add")
+    if (!foundTint && material.techniqueSet.starts_with("particle_cloud"))
         foundTint = true;
     if (!foundTint || (requiresFeather && !foundFeather))
         throw std::runtime_error("IW3 FX material is missing required constants: " + name);
@@ -1676,6 +1753,10 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
         material.flags |= 32u;
     if (!material.response.empty())
         material.flags |= 64u;
+    // IW3 unlit techniques (mc_unlit, mc_unlit_replace, lamp and screen
+    // materials) show their colour map as emitted light.
+    if (techset.find("unlit") != std::string::npos)
+        material.flags |= 128u;
     return material;
 }
 
@@ -2516,6 +2597,20 @@ void EncodeBc7Mode6Block(const std::uint8_t (&pixels)[16][4], std::uint8_t *out)
         put(bestIndex[pixel], 4);
 }
 
+// Encoded caches are reused only by the converter build that wrote them: an
+// encoder change keeps the input digest, so the key must name the encoder too.
+const std::string &ConverterIdentity()
+{
+    static const std::string identity = [] {
+        std::wstring path(MAX_PATH, L'\0');
+        path.resize(GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())));
+        const auto bytes = ReadBytes(std::filesystem::path(path));
+        const auto digest = Sha256(bytes);
+        return Hex(std::span(digest).first(8));
+    }();
+    return identity;
+}
+
 // BC7 encoding of a square RGBA8 mip chain laid out by MipChain.
 // Values pass through unchanged, so sRGB data stays sRGB for format 45.
 std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
@@ -2525,7 +2620,7 @@ std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
     const auto inputDigest = Sha256(rgba);
     const auto cacheFile =
         cacheRoot.empty() ? std::filesystem::path{}
-                          : cacheRoot / ("atlas_" + Hex(std::span(inputDigest).first(16)) + ".bc7");
+                          : cacheRoot / ("atlas_" + Hex(std::span(inputDigest).first(16)) + "_" + ConverterIdentity() + ".bc7");
     std::error_code cacheError;
     if (!cacheFile.empty() && std::filesystem::is_regular_file(cacheFile, cacheError))
         return ReadBytes(cacheFile);
@@ -2964,7 +3059,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     const auto probeDigest = Sha256(probeKey);
     const auto probeCache =
         cacheRoot.empty() ? std::filesystem::path{}
-                          : cacheRoot / ("probes_" + Hex(std::span(probeDigest).first(16)) + ".bc6h");
+                          : cacheRoot / ("probes_" + Hex(std::span(probeDigest).first(16)) + "_" + ConverterIdentity() + ".bc6h");
     std::vector<std::uint8_t> arrayPixels;
     std::error_code cacheError;
     if (!probeCache.empty() && std::filesystem::is_regular_file(probeCache, cacheError))
@@ -3193,6 +3288,13 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     for (std::size_t face = 0; face < plan.skyTiles.size(); ++face)
         plan.skyTiles[face] = freeTiles[nextTile++];
     const std::string skyName = world.at("sky").get<std::string>();
+    // A map with no sky surfaces (an enclosed map such as mp_gulag) exports no
+    // sky image. Nothing draws the sky then; a dark cubemap fills its tiles.
+    if (skyName.empty() && !images.contains(skyName))
+    {
+        images.emplace(skyName, std::vector<Image>(6, SolidImage({24, 26, 30, 255})));
+        zt::info("iw3: map has no sky image; using a dark placeholder sky cubemap");
+    }
     const auto &sky = image(skyName);
     if (sky.size() != 6)
         throw std::runtime_error("IW3 sky image is not a complete cubemap: " + skyName);
@@ -3983,7 +4085,22 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             const auto &sourceImage = image(source.image);
             if (sourceImage.size() != 1)
                 throw std::runtime_error("IW3 FX material color map is a cubemap: " + name);
-            residentImage(direct, 0, sourceImage.front(), {1, 1, 1, 1}, "fx");
+            if (source.premultiplied)
+            {
+                Image premultiplied = sourceImage.front();
+                const auto multiply = [](std::vector<std::uint8_t> &rgba) {
+                    for (std::size_t offset = 0; offset + 3 < rgba.size(); offset += 4)
+                        for (std::size_t channel = 0; channel < 3; ++channel)
+                            rgba[offset + channel] = static_cast<std::uint8_t>(
+                                (rgba[offset + channel] * rgba[offset + 3] + 127) / 255);
+                };
+                multiply(premultiplied.rgba);
+                for (auto &mip : premultiplied.mips)
+                    multiply(mip.rgba);
+                residentImage(direct, 0, premultiplied, {1, 1, 1, 1}, "fx");
+            }
+            else
+                residentImage(direct, 0, sourceImage.front(), {1, 1, 1, 1}, "fx");
         }
         WriteJson(mapDirectory / materialFile, direct);
         plan.assetMaterials.push_back(
@@ -3992,5 +4109,33 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             throw std::runtime_error("duplicate IW3 FX material alias: " + name);
     }
     return plan;
+}
+std::vector<std::uint8_t> BuildLoadscreenPreview(const std::filesystem::path &exportRoot,
+                                                 const std::vector<std::filesystem::path> &sourcePaths,
+                                                 const std::string &sourceMap)
+{
+    const std::string name = "loadscreen_" + sourceMap;
+    std::vector<Image> images;
+    try
+    {
+        images = LoadImage(exportRoot, sourcePaths, name);
+    }
+    catch (const std::exception &)
+    {
+        return {};
+    }
+    if (images.size() != 1 || !images.front().width || !images.front().height)
+        return {};
+    Image image = images.front();
+    const unsigned largest = (std::max)(image.width, image.height);
+    if (largest > 2048)
+        image = Resize(image, (std::max)(1u, image.width * 2048 / largest),
+                       (std::max)(1u, image.height * 2048 / largest), true);
+    std::vector<std::uint8_t> result(16);
+    const std::array<std::uint32_t, 4> header{0x4952574Du, 1u, image.width, image.height};
+    std::memcpy(result.data(), header.data(), sizeof(header));
+    result.insert(result.end(), image.rgba.begin(), image.rgba.end());
+    zt::info("iw3: loading-screen preview %s %ux%u", name.c_str(), image.width, image.height);
+    return result;
 }
 } // namespace iw3

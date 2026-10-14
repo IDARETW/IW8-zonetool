@@ -31,4 +31,10 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
                                        const std::vector<std::filesystem::path> &searchPaths,
                                        const std::string &map,
                                        const std::set<std::string> &requested);
+// Extracts the members of the IWD archives in `directory` whose lowercase path
+// starts with one of `prefixes` into `destination`. Existing files are kept and
+// later archives take priority. Returns the number of files written.
+std::size_t ExtractIwdMembers(const std::filesystem::path &directory,
+                              const std::vector<std::string> &prefixes,
+                              const std::filesystem::path &destination);
 } // namespace iw3::sound

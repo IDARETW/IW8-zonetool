@@ -122,6 +122,50 @@ iw3compat_soundexists( alias )
     return iw3compat_sound_kind( alias ) != 0;
 }
 
+// IW3 ambientPlay is a 2D loop for everyone. Each player carries the converted
+// loop, so it plays at the listener at full volume (players who connect later
+// get it too).
+iw3compat_ambientplay( alias, unused1 )
+{
+    if ( iw3compat_sound_kind( alias ) != 2 )
+        return;
+    level notify( "mw120r_ambient" );
+    level.mw120r_ambient = alias;
+    if ( isdefined( level.players ) )
+    {
+        foreach ( player in level.players )
+            player iw3compat_ambient_start();
+    }
+    level thread iw3compat_ambient_connect();
+}
+
+iw3compat_ambientstop( unused1 )
+{
+    level notify( "mw120r_ambient" );
+    level.mw120r_ambient = undefined;
+    if ( isdefined( level.players ) )
+    {
+        foreach ( player in level.players )
+            player stoploopsound();
+    }
+}
+
+iw3compat_ambient_connect()
+{
+    level endon( "mw120r_ambient" );
+    for ( ;; )
+    {
+        level waittill( "connected", player );
+        player iw3compat_ambient_start();
+    }
+}
+
+iw3compat_ambient_start()
+{
+    if ( isdefined( level.mw120r_ambient ) )
+        self playloopsound( level.mw120r_ambient );
+}
+
 // IW3 deleted every game object its gametype did not use. Replay's own
 // gametypes never use the IW3 ones, so drop their props in TDM/FFA.
 iw3compat_remove_gameobjects()
@@ -168,6 +212,100 @@ iw3compat_exploder( number )
         if ( isdefined( model.targetname ) && model.targetname == "mw120r_exploder" )
             continue;
         model delete();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// createfx placement (maps\createfx\<map>_fx): IW3 _utility createEffect()
+// records, played as IW3 _fx did once the map's main has run. One-shots are
+// fx entities (looping effects keep playing), loop effects repeat every
+// v["delay"] seconds, loop sounds play converted looping aliases.
+// ---------------------------------------------------------------------------
+iw3compat_createfx_add( type, fxid, delay )
+{
+    if ( !isdefined( level.mw120r_createfx ) )
+    {
+        level.mw120r_createfx = [];
+        level thread iw3compat_createfx_start();
+    }
+    ent = spawnstruct();
+    ent.v = [];
+    ent.v["type"] = type;
+    if ( isdefined( fxid ) )
+        ent.v["fxid"] = fxid;
+    ent.v["angles"] = ( 0, 0, 0 );
+    ent.v["origin"] = ( 0, 0, 0 );
+    ent.v["delay"] = delay;
+    level.mw120r_createfx[level.mw120r_createfx.size] = ent;
+    return ent;
+}
+
+iw3compat_createoneshoteffect( fxid )
+{
+    return iw3compat_createfx_add( "oneshotfx", fxid, -15 );
+}
+
+iw3compat_createloopeffect( fxid )
+{
+    return iw3compat_createfx_add( "loopfx", fxid, 0.5 );
+}
+
+iw3compat_createloopsound()
+{
+    return iw3compat_createfx_add( "soundfx", undefined, 0 );
+}
+
+// Exploder effects only play with their exploder, which the converted
+// exploder() does not drive; they are recorded and not played.
+iw3compat_createexploder( fxid )
+{
+    return iw3compat_createfx_add( "exploder", fxid, 0 );
+}
+
+iw3compat_createfx_start()
+{
+    wait 0.05;
+    foreach ( ent in level.mw120r_createfx )
+        ent thread iw3compat_createfx_play();
+}
+
+iw3compat_createfx_play()
+{
+    type = self.v["type"];
+    origin = self.v["origin"];
+    forward = anglestoforward( self.v["angles"] );
+    up = anglestoup( self.v["angles"] );
+    if ( type == "soundfx" )
+    {
+        alias = self.v["soundalias"];
+        if ( iw3compat_sound_kind( alias ) != 2 )
+            return;
+        self.looper = spawn( "script_origin", origin );
+        self.looper playloopsound( alias );
+        return;
+    }
+    if ( !isdefined( self.v["fxid"] ) || !isdefined( level._effect ) || !isdefined( level._effect[self.v["fxid"]] ) )
+        return;
+    fx = level._effect[self.v["fxid"]];
+    delay = self.v["delay"];
+    if ( type == "oneshotfx" )
+    {
+        if ( delay > 0 )
+            wait delay;
+        self.looper = spawnfx( fx, origin, forward, up );
+        if ( delay > 0 )
+            delay = 0;
+        triggerfx( self.looper, delay );
+    }
+    else if ( type == "loopfx" )
+    {
+        if ( delay < 0.05 )
+            delay = 0.05;
+        for ( ;; )
+        {
+            playfx( fx, origin, forward, up );
+            wait delay;
+        }
     }
 }
 
@@ -401,16 +539,16 @@ iw3compat_vehicle_parts_init()
         self.mw120r_part_min = level.mw120r_part_min[self.model];
         self.mw120r_part_max = level.mw120r_part_max[self.model];
     }
-    self iw3compat_vehicle_part( "tag_glass_front", 40, "tag_glass_front_d", 60, "tag_glass_front_fx", "props/car_glass_large", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_glass_back", 40, "tag_glass_back_d", 60, "tag_glass_back_fx", "props/car_glass_large", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_glass_left_front", 20, "tag_glass_left_front_d", 60, "tag_glass_left_front_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_glass_right_front", 20, "tag_glass_right_front_d", 60, "tag_glass_right_front_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_glass_left_back", 20, "tag_glass_left_back_d", 60, "tag_glass_left_back_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_glass_right_back", 20, "tag_glass_right_back_d", 60, "tag_glass_right_back_fx", "props/car_glass_med", "veh_glass_break_large", undefined );
-    self iw3compat_vehicle_part( "tag_light_left_front", 20, "tag_light_left_front_d", undefined, "tag_light_left_front", "props/car_glass_headlight", "veh_glass_break_small", 0.5 );
-    self iw3compat_vehicle_part( "tag_light_right_front", 20, "tag_light_right_front_d", undefined, "tag_light_right_front", "props/car_glass_headlight", "veh_glass_break_small", 0.5 );
-    self iw3compat_vehicle_part( "tag_light_left_back", 20, "tag_light_left_back_d", undefined, "tag_light_left_back", "props/car_glass_brakelight", "veh_glass_break_small", undefined );
-    self iw3compat_vehicle_part( "tag_light_right_back", 20, "tag_light_right_back_d", undefined, "tag_light_right_back", "props/car_glass_brakelight", "veh_glass_break_small", undefined );
+    self iw3compat_vehicle_part( "tag_glass_front", 40, "tag_glass_front_d", 60, "tag_glass_front_fx", "props/car_glass_large", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_glass_back", 40, "tag_glass_back_d", 60, "tag_glass_back_fx", "props/car_glass_large", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_glass_left_front", 20, "tag_glass_left_front_d", 60, "tag_glass_left_front_fx", "props/car_glass_med", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_glass_right_front", 20, "tag_glass_right_front_d", 60, "tag_glass_right_front_fx", "props/car_glass_med", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_glass_left_back", 20, "tag_glass_left_back_d", 60, "tag_glass_left_back_fx", "props/car_glass_med", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_glass_right_back", 20, "tag_glass_right_back_d", 60, "tag_glass_right_back_fx", "props/car_glass_med", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_light_left_front", 20, "tag_light_left_front_d", undefined, "tag_light_left_front", "props/car_glass_headlight", "window_entry_glass_med", 0.5 );
+    self iw3compat_vehicle_part( "tag_light_right_front", 20, "tag_light_right_front_d", undefined, "tag_light_right_front", "props/car_glass_headlight", "window_entry_glass_med", 0.5 );
+    self iw3compat_vehicle_part( "tag_light_left_back", 20, "tag_light_left_back_d", undefined, "tag_light_left_back", "props/car_glass_brakelight", "window_entry_glass_med", undefined );
+    self iw3compat_vehicle_part( "tag_light_right_back", 20, "tag_light_right_back_d", undefined, "tag_light_right_back", "props/car_glass_brakelight", "window_entry_glass_med", undefined );
     self iw3compat_vehicle_part( "tag_mirror_left", 40, undefined, undefined, undefined, undefined, undefined, undefined );
     self iw3compat_vehicle_part( "tag_mirror_right", 40, undefined, undefined, undefined, undefined, undefined, undefined );
     self iw3compat_vehicle_part( "tag_hood", undefined, undefined, undefined, undefined, undefined, undefined, 1 );

@@ -852,8 +852,10 @@ replaybounds::Bounds LoadBounds(const nlohmann::json &value)
     {
         const double minimum = value[0][axis].get<double>();
         const double maximum = value[1][axis].get<double>();
+        // Sanity range only: Replay's large (BR) worlds exceed 100000, and IW3
+        // maps such as mp_discovery_night place background terrain at 137k.
         if (!std::isfinite(minimum) || !std::isfinite(maximum) || minimum > maximum ||
-            std::abs(minimum) > 100000 || std::abs(maximum) > 100000)
+            std::abs(minimum) > 262144 || std::abs(maximum) > 262144)
             throw std::runtime_error("Invalid brush-model bounds");
         bounds.midpoint[axis] = float((minimum + maximum) * 0.5);
         const double required =

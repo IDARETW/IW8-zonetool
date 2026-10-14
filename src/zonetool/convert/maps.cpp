@@ -8,6 +8,7 @@
 #include <charconv>
 #include <cmath>
 #include <map>
+#include <set>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -179,12 +180,15 @@ bool isReplayEntity(const std::string &classname)
     // Keep this list closed.  An arbitrary `mp_*_spawn` or `trigger_*` class can
     // carry gameplay state that Replay does not understand; accepting it as a
     // generic entity would make a map appear converted while losing that state.
-    static constexpr std::array<const char *, 23> classes{{
+    static constexpr std::array<const char *, 27> classes{{
         "worldspawn",
         "info_player_start",
         "mp_global_intermission",
+        "mp_ctf_spawn",
         "mp_ctf_spawn_allies_start",
         "mp_ctf_spawn_axis_start",
+        "mp_dm_spawn",
+        "mp_dom_spawn",
         "mp_dom_spawn_allies_start",
         "mp_dom_spawn_axis_start",
         "mp_sab_spawn_allies_start",
@@ -197,6 +201,7 @@ bool isReplayEntity(const std::string &classname)
         "script_brushmodel",
         "script_model",
         "script_origin",
+        "script_struct",
         "trigger_damage",
         "trigger_hurt",
         "trigger_multiple",
@@ -209,14 +214,13 @@ bool isReplayEntity(const std::string &classname)
 
 bool isModeSpecificSpawn(const std::string &classname)
 {
-    // Replay's current custom-map contract consumes the TDM spawn set. Drop
-    // only these verified alternate-mode markers until their native game-mode
-    // consumers are part of the package contract.
-    static constexpr std::array<const char *, 6> classes{{
+    // Replay's free-for-all and domination register mp_dm_spawn and
+    // mp_dom_spawn exactly like TDM registers mp_tdm_spawn (spawnlogic
+    // addspawnpoints). Replay has no sabotage, and its CTF uses mp_ctf_spawn (the
+    // IW3 importer renames mod CTF team spawns to it).
+    static constexpr std::array<const char *, 4> classes{{
         "mp_ctf_spawn_allies",
         "mp_ctf_spawn_axis",
-        "mp_dm_spawn",
-        "mp_dom_spawn",
         "mp_sab_spawn_allies",
         "mp_sab_spawn_axis",
     }};
@@ -467,8 +471,33 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
     std::map<std::string, size_t> projectedSourceMarkers;
     std::map<std::string, std::pair<size_t, std::string>> unsupported;
 
-    for (const Entity &entity : parseEntities(input))
+    const std::vector<Entity> entities = parseEntities(input);
+    const auto field = [](const Entity &entity, const char *key) -> std::string {
+        const auto found = std::find_if(entity.begin(), entity.end(), [&](const KeyValue &pair) {
+            return lowercase(pair.key) == key;
+        });
+        return found == entity.end() ? std::string{} : found->value;
+    };
+    // IW3 old-school perk pickups are script models plus the use trigger they
+    // target; Replay has no old-school mode, so both would float in every mode.
+    std::set<std::string> oldSchoolTargets;
+    for (const Entity &entity : entities)
+        if (field(entity, "targetname") == "oldschool_pickup" && !field(entity, "target").empty())
+            oldSchoolTargets.insert(field(entity, "target"));
+    // Replay's headquarters and hardpoint read script_label-ordered
+    // hardpoint_zone triggers, each containing one hqloc radio (hq.gsc checks
+    // both counts and the containment). IW3 names the same pair radiotrigger
+    // and hq_hardpoint.
+    std::size_t hardpointZones = 0;
+
+    for (const Entity &entity : entities)
     {
+        const std::string targetName = field(entity, "targetname");
+        if (targetName == "oldschool_pickup" || oldSchoolTargets.contains(targetName))
+        {
+            ++projectedOldSchoolPickups;
+            continue;
+        }
         const auto classname = std::find_if(entity.begin(), entity.end(), [](const KeyValue &pair) {
             return lowercase(pair.key) == "classname";
         });
@@ -535,7 +564,14 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
             triggers->push_back({brushModelIndex(entity), true});
         }
 
+        const bool hqRadio = name == "script_model" && targetName == "hq_hardpoint";
+        const bool hqZone = name == "trigger_multiple" && targetName == "radiotrigger";
         std::string body;
+        const auto appendKey = [&body](const uint32_t keyId, const std::string &value) {
+            if (!body.empty())
+                body.push_back(' ');
+            body += std::to_string(keyId) + " \"" + value + "\"";
+        };
         for (const KeyValue &pair : entity)
         {
             const std::string key = lowercase(pair.key);
@@ -549,7 +585,17 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
                 if (lowered == "destructible" || lowered == "interactive_tv" ||
                     lowered == "exploder")
                     value = "mw120r_" + lowered;
+                else if (hqRadio)
+                    value = "hqloc";
+                else if (hqZone)
+                    value = "hardpoint_zone";
             }
+            if ((hqRadio || hqZone) && (key == "script_gameobjectname" || key == "script_label"))
+                continue;
+            // A domination flag's IW3 prop model is an IW3 asset; Replay draws
+            // the flag itself.
+            if (name == "trigger_radius" && key == "model")
+                continue;
             uint32_t keyId = 0;
             if (!iw3KeyToIw8KeyId(key, keyId))
             {
@@ -570,6 +616,14 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
             body += "\"";
         }
 
+        if (hqRadio)
+            appendKey(0xAB40, "hqloc");
+        if (hqZone)
+        {
+            appendKey(0xAB40, "hardpoint");
+            appendKey(0xAB6F, std::to_string(++hardpointZones));
+        }
+
         if (name == "worldspawn" &&
             std::none_of(entity.begin(), entity.end(), [](const KeyValue &pair) {
                 return lowercase(pair.key) == "northyaw";
@@ -586,7 +640,11 @@ size_t iw3ToIw8EntityString(const std::string &input, std::string &output,
         {
             if (!body.empty())
                 body.push_back(' ');
-            body += "37683 \"TriggerModelStaticDummyDefault\"";
+            // Script moves the white phosphorus volume to each strike; stock
+            // maps give movable triggers the dynamic dummy physics asset.
+            body += targetName == "white_phosphorus_damage"
+                        ? "37683 \"triggermodeldummydefault\""
+                        : "37683 \"TriggerModelStaticDummyDefault\"";
         }
 
         if (body.empty())

@@ -339,6 +339,14 @@ class Iwd
         return members_.contains(name);
     }
 
+    std::vector<std::string> Names() const
+    {
+        std::vector<std::string> names;
+        for (const auto &[name, member] : members_)
+            names.push_back(name);
+        return names;
+    }
+
     std::vector<uint8_t> Read(const std::string &name) const
     {
         const Member &member = members_.at(name);
@@ -548,6 +556,7 @@ struct Iw3Alias
     int startDelay{};
     bool looping{};
     std::string secondary;
+    std::string curve; // IW3 volume falloff curve (soundaliases/<curve>.vfcurve)
 };
 
 std::map<std::string, std::vector<Iw3Alias>> ReadZoneAliases(const std::filesystem::path &exportRoot)
@@ -588,6 +597,13 @@ std::map<std::string, std::vector<Iw3Alias>> ReadZoneAliases(const std::filesyst
             alias.looping = (source.value("flags", 0) & 1) != 0;
             if (source.contains("secondary_alias") && source.at("secondary_alias").is_string())
                 alias.secondary = Lower(source.at("secondary_alias").get<std::string>());
+            if (source.contains("volume_falloff_curve") && source.at("volume_falloff_curve").is_string())
+            {
+                // Curves from another zone carry IW3's ',' reference prefix.
+                alias.curve = Lower(source.at("volume_falloff_curve").get<std::string>());
+                while (!alias.curve.empty() && alias.curve.front() == ',')
+                    alias.curve.erase(alias.curve.begin());
+            }
             if (!alias.file.empty())
                 result[name].push_back(std::move(alias));
         }
@@ -778,6 +794,35 @@ Role RoleFor(const std::string &name, const bool looping)
 }
 
 // Stock Replay map-bank curves (mp_shipment.all vfCurves), copied by value.
+// IW3 SNDCURVE text: "SNDCURVE", the knot count, then "distance volume" knots,
+// both normalized; Replay vfCurves use the same (distance, volume) points.
+std::optional<iw8::sound::Curve> ReadIw3Curve(const std::filesystem::path &exportRoot,
+                                              const std::string &name)
+{
+    std::string text;
+    if (name.empty() || name.find_first_of("/\\.") != std::string::npos ||
+        !zt::read_file_str((exportRoot / "soundaliases" / (name + ".vfcurve")).string(), text))
+        return std::nullopt;
+    std::istringstream input(text);
+    std::string magic;
+    std::size_t count = 0;
+    if (!(input >> magic >> count) || magic != "SNDCURVE" || count < 2 || count > 16)
+        return std::nullopt;
+    iw8::sound::Curve curve{"mw120r_" + name, {}};
+    float previous = -1.0f;
+    for (std::size_t index = 0; index < count; ++index)
+    {
+        float distance{}, volume{};
+        if (!(input >> distance >> volume) || !std::isfinite(distance) || !std::isfinite(volume) ||
+            distance < 0.0f || distance > 1.0f || distance < previous || volume < 0.0f ||
+            volume > 1.0f)
+            return std::nullopt;
+        previous = distance;
+        curve.points.push_back({distance, volume});
+    }
+    return curve;
+}
+
 iw8::sound::Curve CurveNamed(const std::string &name)
 {
     if (name == "standard_concave")
@@ -793,8 +838,10 @@ std::set<std::string> ReadScriptSoundNames(const std::filesystem::path &scriptDi
     if (!std::filesystem::is_directory(scriptDirectory, error))
         return names;
     static const std::regex direct(
-        R"re(\b(?:playsound|playloopsound|playsoundasmaster|soundexists)\s*\(\s*"([^"]+)")re", std::regex::icase);
+        R"re(\b(?:playsound|playloopsound|playsoundasmaster|soundexists|ambientplay)\s*\(\s*"([^"]+)")re", std::regex::icase);
     static const std::regex positional(R"re(\bplaysoundatpos\s*\([^;]*?,\s*"([^"]+)"\s*\))re", std::regex::icase);
+    // createfx loop sounds: ent.v[ "soundalias" ] = "alias";
+    static const std::regex createfx(R"re(\[\s*"soundalias"\s*\]\s*=\s*"([^"]+)")re", std::regex::icase);
     for (const auto &entry : std::filesystem::directory_iterator(scriptDirectory, error))
     {
         if (Lower(entry.path().extension().string()) != ".gsc")
@@ -802,7 +849,7 @@ std::set<std::string> ReadScriptSoundNames(const std::filesystem::path &scriptDi
         std::string text;
         if (!zt::read_file_str(entry.path().string(), text))
             continue;
-        for (const std::regex *pattern : {&direct, &positional})
+        for (const std::regex *pattern : {&direct, &positional, &createfx})
             for (auto match = std::sregex_iterator(text.begin(), text.end(), *pattern);
                  match != std::sregex_iterator(); ++match)
                 names.insert(Lower((*match)[1].str()));
@@ -913,6 +960,7 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
     result.bank.zone = "vehicle_engine_type4_npc";
     result.bank.streamKey = Lower(map) + "_all_loaded";
     std::set<std::string> curves{"default"};
+    std::map<std::string, std::optional<iw8::sound::Curve>> iw3Curves;
     for (const auto &name : order)
     {
         if (!converted.contains(name))
@@ -942,8 +990,17 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
             alias.probability = source.probability > 0 ? source.probability : 1.0f;
             alias.lfePercentage = std::clamp(source.lfe, 0.0f, 1.0f);
             alias.startDelay = std::max(0, source.startDelay);
-            alias.volumeFalloffCurve = iw8::sound::HashName(role.curve);
-            curves.insert(role.curve);
+            // The alias's own IW3 falloff curve when it converts, else the role's.
+            auto found = iw3Curves.find(source.curve);
+            if (!source.curve.empty() && found == iw3Curves.end())
+                found = iw3Curves.emplace(source.curve, ReadIw3Curve(exportRoot, source.curve)).first;
+            if (!source.curve.empty() && found->second)
+                alias.volumeFalloffCurve = iw8::sound::HashName(found->second->name);
+            else
+            {
+                alias.volumeFalloffCurve = iw8::sound::HashName(role.curve);
+                curves.insert(role.curve);
+            }
             alias.reverbMultiplier = role.reverb;
             alias.farReverbMultiplier = role.farReverb;
             alias.stereoSpreadMinDist = role.spreadMin;
@@ -961,6 +1018,18 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
     }
     for (const auto &name : curves)
         result.bank.volumeCurves.push_back(CurveNamed(name));
+    std::size_t convertedCurves = 0;
+    for (const auto &[name, curve] : iw3Curves)
+        if (curve)
+        {
+            result.bank.volumeCurves.push_back(*curve);
+            ++convertedCurves;
+        }
+        else
+            zt::warn("iw3 sound: falloff curve %s did not convert; its aliases use the role curve",
+                     name.c_str());
+    if (convertedCurves)
+        zt::info("iw3 sound: converted %zu IW3 falloff curve(s)", convertedCurves);
     std::vector<iw8::sound::Sample> ordered;
     for (auto &[path, sample] : samples)
         ordered.push_back(std::move(sample));
@@ -976,5 +1045,58 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
         zt::info("iw3 sound: wrote SAB copy to %s", dump);
     }
     return result;
+}
+std::size_t ExtractIwdMembers(const std::filesystem::path &directory,
+                              const std::vector<std::string> &prefixes,
+                              const std::filesystem::path &destination)
+{
+    std::error_code error;
+    if (!std::filesystem::is_directory(directory, error))
+        return 0;
+    std::vector<std::filesystem::path> archives;
+    for (const auto &entry : std::filesystem::directory_iterator(directory, error))
+        if (entry.is_regular_file() && Lower(entry.path().extension().string()) == ".iwd")
+            archives.push_back(entry.path());
+    // IW3 searches later archives first, so they extract first and win.
+    std::sort(archives.rbegin(), archives.rend());
+    std::size_t extracted = 0;
+    for (const auto &archive : archives)
+    {
+        try
+        {
+            const Iwd iwd(archive);
+            for (const auto &name : iwd.Names())
+            {
+                if (name.empty() || name.back() == '/' ||
+                    std::ranges::none_of(prefixes, [&](const std::string &prefix) {
+                        return name.starts_with(prefix);
+                    }))
+                    continue;
+                // Archive member names are untrusted: keep each one inside
+                // the destination.
+                const std::filesystem::path relative(name);
+                if (relative.is_absolute() || relative.has_root_name() ||
+                    std::ranges::any_of(relative, [](const std::filesystem::path &part) {
+                        return part == "..";
+                    }))
+                    continue;
+                const auto target = destination / relative;
+                if (std::filesystem::exists(target, error))
+                    continue;
+                std::filesystem::create_directories(target.parent_path(), error);
+                const auto data = iwd.Read(name);
+                std::ofstream file(target, std::ios::binary);
+                file.write(reinterpret_cast<const char *>(data.data()),
+                           static_cast<std::streamsize>(data.size()));
+                if (file)
+                    ++extracted;
+            }
+        }
+        catch (const std::exception &failure)
+        {
+            zt::warn("iw3: skipped IWD %s: %s", archive.string().c_str(), failure.what());
+        }
+    }
+    return extracted;
 }
 } // namespace iw3::sound

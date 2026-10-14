@@ -275,7 +275,9 @@ float4 main(Input input) : SV_TARGET0 {
     float3 bounce = 1 - min(texel.rgb, .85) * (1 - gtao);
     indirect *= replayLighting[43].z * gtao / max(bounce, 1e-3);
     float3 light = indirect + visibility * ndotl * sun;
-    if (sky)
+    // Sky and IW3 unlit materials (flag 128) show their colour unlit.
+    bool unlit = sky || (flags & 128) != 0;
+    if (unlit)
         light = 1;
     // Build-time diagnostics keep depth coverage and native postprocessing.
 #if MAP_DEBUG_MODE == 1
@@ -291,7 +293,7 @@ float4 main(Input input) : SV_TARGET0 {
 #endif
     float3 specular = 0;
 #if MAP_SOURCE_CHANNELS && MAP_DEBUG_MODE == 0
-    if (!sky && nativeSun)
+    if (!unlit && nativeSun)
         specular = SourceSunSpecular(input, flags, sampleUV, lod, shadingNormal, direction,
                                      sun, visibility);
 #endif

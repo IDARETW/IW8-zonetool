@@ -56,7 +56,7 @@ std::string CompatText()
 const std::set<std::string> &DroppedBuiltins()
 {
     static const std::set<std::string> names{
-        "ambientplay",        "ambientstop",       "setexpfog",          "setculldist",
+        "setexpfog",          "setculldist",
         "visionsetnaked",     "visionsetnight",    "setdvar",            "setsaveddvar",
         "makedvarserverinfo", "setsunlight",       "resetsunlight",      "precacheshader",
         "precachestring",     "precacheitem",      "precacherumble",     "precacheturret",
@@ -81,6 +81,8 @@ std::string CompatBuiltin(const std::string &name)
         {"playsoundatpos", "iw3compat_playsoundatpos"},
         {"playsoundinspace", "iw3compat_playsoundinspace"},
         {"soundexists", "iw3compat_soundexists"},
+        {"ambientplay", "iw3compat_ambientplay"},
+        {"ambientstop", "iw3compat_ambientstop"},
     };
     const auto found = names.find(name);
     return found != names.end() ? found->second : std::string{};
@@ -95,6 +97,15 @@ std::string CommonFunction(const std::string &file, const std::string &name)
         return "iw3compat_exploder";
     if (file == "maps/mp/_utility" && name == "playsoundinspace")
         return "iw3compat_playsoundinspace";
+    // createfx placement (maps\createfx\<map>_fx): IW3 defines these in both
+    // _utility and _createfx.
+    if (file == "maps/mp/_utility" || file == "maps/mp/_createfx")
+    {
+        for (const char *known :
+             {"createoneshoteffect", "createloopeffect", "createloopsound", "createexploder"})
+            if (name == known)
+                return "iw3compat_" + name;
+    }
     return {};
 }
 
@@ -353,7 +364,13 @@ class Translator
                 continue;
             File file;
             file.path = path;
-            const std::string stem = path.substr(path.rfind('/') + 1);
+            // maps/createfx/<map>_fx and maps/mp/<map>_fx share a stem.
+            std::string stem = path.substr(path.rfind('/') + 1);
+            if (!path.starts_with("maps/mp/"))
+            {
+                const auto directory = path.substr(0, path.rfind('/'));
+                stem = directory.substr(directory.rfind('/') + 1) + "_" + stem;
+            }
             file.prefix = "mw120r_" + stem + "_";
             file.lexed = Lex(available_.at(path)->text);
             file.functions = ParseFunctions(file.lexed.tokens, path);

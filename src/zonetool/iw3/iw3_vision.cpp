@@ -192,16 +192,28 @@ bool IsIdentity(const Film &film)
            !film.invert && film.lightTint == std::array<float, 3>{1.0f, 1.0f, 1.0f} &&
            film.darkTint == std::array<float, 3>{1.0f, 1.0f, 1.0f};
 }
+// The map script plus its createart script (maps\createart\<map>_art), where
+// Radiant's art tools write setExpFog and VisionSetNaked; comments removed.
+std::string ReadMapArtScripts(const std::filesystem::path &exportRoot, const std::string &sourceMap)
+{
+    std::string result;
+    for (const auto &path : {exportRoot / "maps" / "mp" / (sourceMap + ".gsc"),
+                             exportRoot / "maps" / "createart" / (sourceMap + "_art.gsc")})
+    {
+        std::string text;
+        if (zt::read_file_str(path.string(), text))
+            result += StripGscComments(text) + "\n";
+    }
+    return result;
+}
 } // namespace
 
 std::optional<ExpFog> ReadMapExpFog(const std::filesystem::path &exportRoot,
                                     const std::string &sourceMap)
 {
-    const auto path = exportRoot / "maps" / "mp" / (sourceMap + ".gsc");
-    std::string text;
-    if (!zt::read_file_str(path.string(), text))
+    const std::string text = ReadMapArtScripts(exportRoot, sourceMap);
+    if (text.empty())
         return std::nullopt;
-    text = StripGscComments(text);
     static const std::regex call(R"(\bsetexpfog\s*\(([^()]*)\))", std::regex::icase);
     std::optional<ExpFog> result;
     for (auto match = std::sregex_iterator(text.begin(), text.end(), call);
@@ -250,7 +262,19 @@ std::optional<ExpFog> ReadMapExpFog(const std::filesystem::path &exportRoot,
 std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
                                 const std::string &sourceMap)
 {
-    const auto path = exportRoot / "vision" / (sourceMap + ".vision");
+    // The map (or its createart script) names its vision with VisionSetNaked;
+    // IW3 also loads vision/<map>.vision by default.
+    std::string visionName = sourceMap;
+    {
+        const std::string scripts = ReadMapArtScripts(exportRoot, sourceMap);
+        static const std::regex naked(R"re(\bvisionsetnaked\s*\(\s*"([^"]+)")re",
+                                      std::regex::icase);
+        std::smatch match;
+        if (std::regex_search(scripts, match, naked) &&
+            std::filesystem::exists(exportRoot / "vision" / (match[1].str() + ".vision")))
+            visionName = match[1].str();
+    }
+    const auto path = exportRoot / "vision" / (visionName + ".vision");
     std::string text;
     if (!zt::read_file_str(path.string(), text))
         return std::nullopt;

@@ -62,6 +62,7 @@ struct Args
     std::string lightingProfile = "source";
     float sunIntensityScale = 1.0f;
     bool navigation = true;
+    bool iw3ModeAssets = true;
     std::string gscTool;
 };
 
@@ -177,6 +178,13 @@ bool parseArgs(const int argc, char **argv, Args &args)
         else if (value == "--no-navigation")
         {
             args.navigation = false;
+        }
+        else if (value == "--iw3-mode-assets" && index + 1 < argc)
+        {
+            const std::string mode = argv[++index];
+            if (mode != "on" && mode != "off")
+                return false;
+            args.iw3ModeAssets = mode == "on";
         }
         else if (value == "-v")
         {
@@ -356,6 +364,24 @@ bool writeMetadata(const std::string &directory, const MapMetadata &metadata)
     return output.good();
 }
 
+// Optional package file: the map's loading-screen artwork for the custom-map
+// UI ("MWRI", version 1, width, height, then RGBA8; 1..2048 on each side).
+constexpr char kPreviewFile[] = "preview.rgba";
+
+bool validPreview(const std::filesystem::path &path)
+{
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    if (!input)
+        return false;
+    const auto size = static_cast<std::uint64_t>(input.tellg());
+    input.seekg(0);
+    std::uint32_t header[4]{};
+    if (!input.read(reinterpret_cast<char *>(header), sizeof(header)) || header[0] != 0x4952574Du ||
+        header[1] != 1 || header[2] < 1 || header[2] > 2048 || header[3] < 1 || header[3] > 2048)
+        return false;
+    return size == sizeof(header) + std::uint64_t(header[2]) * header[3] * 4;
+}
+
 bool prepareOutputDirectory(const std::string &outputDirectory, const std::string &map)
 {
     std::error_code error;
@@ -373,8 +399,9 @@ bool prepareOutputDirectory(const std::string &outputDirectory, const std::strin
     for (const auto &entry : std::filesystem::directory_iterator(outputDirectory, error))
     {
         if (error || !entry.is_regular_file(error) ||
-            std::find(expected.begin(), expected.end(), entry.path().filename().string()) ==
-                expected.end())
+            (std::find(expected.begin(), expected.end(), entry.path().filename().string()) ==
+                 expected.end() &&
+             entry.path().filename() != kPreviewFile))
         {
             err("build-map: output directory must be empty or contain only this map's files");
             return false;
@@ -564,9 +591,20 @@ bool validatePackage(const std::string &packageDirectory, const std::string &map
         return false;
     }
     std::sort(actual.begin(), actual.end());
+    if (const auto preview = std::find(actual.begin(), actual.end(), kPreviewFile);
+        preview != actual.end())
+    {
+        if (!validPreview(std::filesystem::path(packageDirectory) / kPreviewFile))
+        {
+            err("validate: preview.rgba is not a valid MWRI image");
+            return false;
+        }
+        actual.erase(preview);
+    }
     if (actual != expectedFiles(map))
     {
-        err("validate: output must contain exactly five map fastfiles and map.json");
+        err("validate: output must contain exactly five map fastfiles and map.json "
+            "(and optionally preview.rgba)");
         return false;
     }
 
@@ -1281,6 +1319,18 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
     {
         result = 1;
     }
+    if (const auto preview = std::filesystem::path(dumpDirectory) / kPreviewFile;
+        result == 0 && std::filesystem::is_regular_file(preview))
+    {
+        std::error_code copyError;
+        std::filesystem::copy_file(preview, std::filesystem::path(outputDirectory) / kPreviewFile,
+                                   std::filesystem::copy_options::overwrite_existing, copyError);
+        if (copyError)
+        {
+            err("build-map: cannot copy preview.rgba: %s", copyError.message().c_str());
+            result = 1;
+        }
+    }
 
     if (result == 0 && !validatePackage(outputDirectory, map))
     {
@@ -1646,6 +1696,7 @@ int buildIw3(const Args &args)
     options.fastfile = args.positional[0];
     options.map = map;
     options.unlinker = args.unlinkerExecutable;
+    options.iw3ModeAssets = args.iw3ModeAssets;
     const auto requestedOutput = args.outputDirectory.empty()
                                      ? std::filesystem::path(args.positional[0]).parent_path() /
                                            (map + "_iw8")

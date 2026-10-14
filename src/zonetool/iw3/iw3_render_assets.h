@@ -118,4 +118,12 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot,
                                const std::filesystem::path &cacheRoot = {},
                                const std::string &surfaceShaderDefines = {});
 
+// The map's IW3 loading-screen image (images/loadscreen_<map>, from its _load
+// zone or IWD) as a custom-map package preview: "MWRI", version 1, width,
+// height, then top-down RGBA8, at most 2048 on each side. Empty when the map
+// has no loading-screen image.
+std::vector<std::uint8_t> BuildLoadscreenPreview(const std::filesystem::path &exportRoot,
+                                                 const std::vector<std::filesystem::path> &sourcePaths,
+                                                 const std::string &sourceMap);
+
 } // namespace iw3

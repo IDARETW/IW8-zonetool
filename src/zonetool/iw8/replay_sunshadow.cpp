@@ -190,6 +190,29 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
         component /= rightLength;
     const Vec3 up = cross(sunDirection, right);
     std::vector<Surface> projected = scene.surfaces;
+    // Distant background geometry (IW3 terrain past 100000 units) casts no
+    // shadow on the play space and would stretch the shadow crop; drop it.
+    for (auto &surface : projected)
+    {
+        if (surface.vertices.size() % 3)
+            continue;
+        std::vector<decltype(surface.vertices)::value_type> kept;
+        kept.reserve(surface.vertices.size());
+        for (std::size_t first = 0; first < surface.vertices.size(); first += 3)
+        {
+            bool inRange = true;
+            for (std::size_t corner = 0; corner < 3; ++corner)
+                for (const float value : surface.vertices[first + corner].position)
+                    inRange = inRange && std::isfinite(value) && std::abs(value) <= 100000.0f;
+            if (inRange)
+                kept.insert(kept.end(), surface.vertices.begin() + first,
+                            surface.vertices.begin() + first + 3);
+        }
+        surface.vertices = std::move(kept);
+    }
+    std::erase_if(projected, [](const Surface &surface) { return surface.vertices.empty(); });
+    if (projected.empty())
+        return {};
     Vec3 minimum{INFINITY, INFINITY, INFINITY}, maximum{-INFINITY, -INFINITY, -INFINITY};
     for (auto &surface : projected)
     {
@@ -242,7 +265,7 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
         if (!std::isfinite(receiverBounds.midpoint[axis]) ||
             !std::isfinite(receiverBounds.halfSize[axis]) ||
             receiverBounds.halfSize[axis] < 0 ||
-            std::abs(receiverBounds.midpoint[axis]) + receiverBounds.halfSize[axis] > 100001)
+            std::abs(receiverBounds.midpoint[axis]) + receiverBounds.halfSize[axis] > 262145)
             throw std::runtime_error("invalid compressed sun-shadow receiver bounds");
         receiverRadius += std::abs(sunDirection[axis]) * receiverBounds.halfSize[axis];
     }
