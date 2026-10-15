@@ -65,7 +65,7 @@ struct Args
     float sunIntensityScale = 1.0f;
     bool navigation = true;
     bool iw3ModeAssets = true;
-    std::string lightingStyle = "iw3";
+    std::string style = "iw3";
     std::string gscTool;
 };
 
@@ -79,7 +79,12 @@ struct MapMetadata
     bool compassRotationSet{};
     // Contraction of the IW3 minimap region about its centre (see the compass
     // bounds below); build-time only, not written to the package map.json.
-    float minimapScale{0.875f};
+    // 1.0 = IW3's own squared region: Nuketown's art measures about 12 units per
+    // pixel over it (playable strip 378 x 170 px against ~4500 x 2100 units of
+    // playable geometry). The former 0.875, from one in-game point (fixes-25),
+    // left the marker drifting (owner test 2026-10-14). In game the console dvar
+    // mw120r_minimap_scale overrides it (see iw3compat_minimap).
+    float minimapScale{1.0f};
 };
 
 void printUsage()
@@ -104,7 +109,9 @@ void printUsage()
                 "  --metadata <map.json>\n"
                 "  --lighting-profile source|aniyah-incursion\n"
                 "  --sun-intensity-scale <positive multiplier>\n"
-                "  --lighting-style iw3|iw8  (iw8: Replay native fog, atmosphere and volumetrics)\n"
+                "  --style iw3|iw8  (iw3: IW3 colour grading, lighting, shadows and effects;\n"
+                "                    iw8: the converted map with Replay's own fog, atmosphere,\n"
+                "                    tonemapping, reflections, shadows and stock effects)\n"
                 "  --no-navigation  (skip generated bot aipaths/navmesh/tacgraph)\n"
                 "  --gsc-tool <gsc-tool.exe>  (compile converted IW3 map scripts; or IW8_GSC_TOOL)\n"
                 "  -v  -q\n");
@@ -183,10 +190,12 @@ bool parseArgs(const int argc, char **argv, Args &args)
         {
             args.navigation = false;
         }
-        else if (value == "--lighting-style" && index + 1 < argc)
+        else if ((value == "--style" || value == "--lighting-style") && index + 1 < argc)
         {
-            args.lightingStyle = argv[++index];
-            if (args.lightingStyle != "iw3" && args.lightingStyle != "iw8")
+            args.style = argv[++index];
+            std::transform(args.style.begin(), args.style.end(), args.style.begin(),
+                           [](const unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (args.style != "iw3" && args.style != "iw8")
                 return false;
         }
         else if (value == "--iw3-mode-assets" && index + 1 < argc)
@@ -455,7 +464,7 @@ bool validateZoneFile(const std::string &path, ZoneValidation *details = nullptr
     }
 
     if (header.transientFileType != 0 || header.residentHash != 0 ||
-        header.xfileHeader.preloadWalkSize != 0 ||
+        header.xfileHeader.preloadWalkSize == 0 ||
         header.xfileHeader.blockSize[iw8::XFILE_BLOCK_TEMP] != sizeof(IW8_XAssetList) ||
         header.xfileHeader.blockSize[iw8::XFILE_BLOCK_CALLBACK] != 0 ||
         header.xfileHeader.blockSize[iw8::XFILE_BLOCK_SCRIPT] != 0 ||
@@ -798,6 +807,10 @@ template <typename Buffer> Iw8WriteParams writeParams(const Buffer &buffer)
         params.totalDecompressed += params.blockSize[index];
     }
     params.calcSize = buffer.calcSize();
+    // Converted maps record ~2.5 plan entries of ~3.5 bytes per top-level asset
+    // (Nuketown 19905 bytes / 2535 assets, Gulag 26469 / 2908).
+    params.preloadWalkSize =
+        (std::max)(params.preloadWalkSize, uint64_t(128) * buffer.assetCount());
     return params;
 }
 
@@ -1257,12 +1270,24 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             std::string generated = "iw3compat_minimap()\n{\n";
             if (assets.hasCompass && compassBounds)
             {
-                char line[320];
-                std::snprintf(line, sizeof(line),
-                              "    setminimap( \"compass_map_%s\", %.3f, %.3f, %.3f, %.3f, 1, "
-                              "\"compass_map_%s\" );\n",
-                              map.c_str(), compassBounds->northwestX, compassBounds->northwestY,
-                              compassBounds->southeastX, compassBounds->southeastY, map.c_str());
+                // The console dvar mw120r_minimap_scale overrides the region scale
+                // relative to IW3's squared region (restart the match to apply), so
+                // the minimap can be calibrated in game without a rebuild.
+                const float cx = (compassBounds->northwestX + compassBounds->southeastX) * 0.5f;
+                const float cy = (compassBounds->northwestY + compassBounds->southeastY) * 0.5f;
+                const float base = metadata.minimapScale;
+                char line[1024];
+                std::snprintf(
+                    line, sizeof(line),
+                    "    scale = getdvarfloat( \"mw120r_minimap_scale\" );\n"
+                    "    if ( scale <= 0 )\n"
+                    "        scale = %.4f;\n"
+                    "    k = scale / %.4f;\n"
+                    "    setminimap( \"compass_map_%s\", %.3f + %.3f * k, %.3f + %.3f * k, "
+                    "%.3f + %.3f * k, %.3f + %.3f * k, 1, \"compass_map_%s\" );\n",
+                    base, base, map.c_str(), cx, compassBounds->northwestX - cx, cy,
+                    compassBounds->northwestY - cy, cx, compassBounds->southeastX - cx, cy,
+                    compassBounds->southeastY - cy, map.c_str());
                 generated += line;
             }
             generated += "}\n";
@@ -1331,9 +1356,13 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             for (const auto &model : scriptModels)
                 if (zoneModels.contains(model))
                     models.insert(model);
+            // Stock stand-ins (--style iw8 effects, unconverted graphs) live in the
+            // always-loaded common MP zones; loadfx still needs their name in a
+            // loaded "vfx" table.
             std::set<std::string> effects;
             for (const auto &effect : scriptEffects)
-                if (zoneEffects.contains(effect))
+                if (zoneEffects.contains(effect) ||
+                    (effect.starts_with("vfx/") && !effect.starts_with("vfx/mw120r/")))
                     effects.insert(effect);
             levelStrings[0].assign(models.begin(), models.end());  // "mdl"
             levelStrings[6].assign(effects.begin(), effects.end()); // "vfx"
@@ -1496,13 +1525,10 @@ int buildMap(const Args &args, const iw3::PreparedMap *prepared = nullptr)
                  compassBounds.northwestX, compassBounds.northwestY, compassBounds.southeastX,
                  compassBounds.southeastY);
         }
-        // Replay draws a converted IW3 minimap too large about the map centre:
-        // the player's position on it drifts toward the centre with distance.
-        // Calibrated on Nuketown (fixes-25): a player located from the scene at
-        // (1206, 630) was shown on the art for (1072, 545), i.e. at 0.86-0.89 of
-        // the true distance from the centre. Contracting the declared region by
-        // that factor puts the art under the player again; the centre (where
-        // the minimap already lined up) and the orientation are unchanged.
+        // Optional contraction of the declared region about its centre (metadata
+        // minimapScale; default 1.0 = IW3's region). fixes-25 used 0.875 from one
+        // in-game point ((1206, 630) shown at (1072, 545)); measured against the
+        // art that over-contracted, and the marker drifted (owner test 2026-10-14).
         if (metadata.minimapScale != 1.0f)
         {
             const float centerX = (compassBounds.northwestX + compassBounds.southeastX) * 0.5f;
@@ -1759,8 +1785,8 @@ int buildIw3(const Args &args)
     options.map = map;
     options.unlinker = args.unlinkerExecutable;
     options.iw3ModeAssets = args.iw3ModeAssets;
-    options.lightingStyle =
-        args.lightingStyle == "iw8" ? iw3::LightingStyle::iw8 : iw3::LightingStyle::iw3;
+    options.style =
+        args.style == "iw8" ? iw3::MapStyle::iw8 : iw3::MapStyle::iw3;
     const auto requestedOutput = args.outputDirectory.empty()
                                      ? std::filesystem::path(args.positional[0]).parent_path() /
                                            (map + "_iw8")

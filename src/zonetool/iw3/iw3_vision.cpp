@@ -330,16 +330,15 @@ std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
     return film;
 }
 
-std::string FogShaderDefines(const std::optional<ExpFog> &fog, const LightingStyle style)
+std::string FogShaderDefines(const std::optional<ExpFog> &fog, const MapStyle style)
 {
-    // iw8: opaque surfaces get Replay's native fog pass (stock opaque forward+
-    // shaders apply no fog of their own; only translucent ones do), and the
-    // surface shader adds Replay's probe reflections (MAP_IW8_LIGHTING).
-    if (style == LightingStyle::iw8)
-        return "#define MAP_IW8_LIGHTING 1\n";
+    // iw8: the surface shader adds Replay's probe reflections and sun specular
+    // (MAP_IW8_LIGHTING). Both styles bake IW3's own exponential fog: the owner
+    // wants IW3's fog colour and placement in --style iw8 too (2026-10-14).
+    const std::string lighting = style == MapStyle::iw8 ? "#define MAP_IW8_LIGHTING 1\n" : "";
     if (!fog)
-        return {};
-    return "#define MAP_FOG 1\n#define MAP_FOG_START " + Number(fog->start) +
+        return lighting;
+    return lighting + "#define MAP_FOG 1\n#define MAP_FOG_START " + Number(fog->start) +
            "\n#define MAP_FOG_DENSITY " +
            Number(static_cast<float>(0.69314718055994531 / fog->halfway)) +
            "\n#define MAP_FOG_COLOR float3(" + Number(fog->color[0]) + "," +
@@ -382,10 +381,10 @@ std::vector<std::uint8_t> BuildGradingClutPixels(const Film &film)
 }
 
 std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut,
-                              const LightingStyle style, const std::array<float, 3> &sunDirection)
+                              const MapStyle style, const std::array<float, 3> &sunDirection)
 {
     std::map<std::string_view, std::string> overrides;
-    if (style == LightingStyle::iw8)
+    if (style == MapStyle::iw8)
     {
         // Stock mp_shipment's fog, atmospheric scattering and volumetric fields
         // (replay_vision_iw8_template.inc), lit by this map's sun. A map with
@@ -396,16 +395,33 @@ std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::strin
         for (const auto &[token, value] : kTemplate)
             overrides[token] = std::string(value);
         overrides["RLNQONPKS"] = Vector(sunDirection); // fogSunDir
-        if (fog)
-        {
-            const float start = std::clamp(fog->start, 0.0f, 20000.0f);
-            const float halfway = std::clamp(fog->halfway, 1.0f, 70000.0f);
-            overrides["MSTOLQOTKN"] = Number(halfway);    // fogDensity
-            overrides["RPNOKKL"] = Number(start);         // fogStartDist
-            overrides["NMLMMNQLSQ"] = Vector(fog->color); // fogColor
-        }
+        // IW3 sky textures already carry their haze; scattering on top washed the
+        // sky out (owner test, 2026-10-14). Stock skies are HDR, ours are not.
+        overrides["NORQKLTPTR"] = "0"; // fogSkyIntensity
+        // Shipment's veil and sun-lit volumetric haze (fields 137-147: veil .09,
+        // air density .002, warm albedo, sun anisotropy .6) lit every view ray,
+        // the sky most, toward the sun: "saturated by the sun yet bland" in
+        // zt-28..zt-31 whatever the fog or exposure. They stay at the defaults
+        // --style iw3 uses (no veil, no volumetric air).
+        for (const std::string_view token :
+             {"MMQLTMKTPK", "NSKNLMKQSR", "MQMPKLKK", "NKKRQROOQK", "LKNNNKTPTM", "MQSQOLLMRM",
+              "MQRSTPRORQ", "NPKPLTKRNS", "MLPOMNQPPK", "MTNSRNMTKN"})
+            overrides.erase(token);
+        // Shipment's auto exposure (exposure 10.5, adjust curve, mid EV 12.1)
+        // is calibrated for stock HDR light levels. IW3 suns and skies are near
+        // 1, so it drove the image up: the sky clipped toward white around the
+        // sun and the rest flattened (owner tests 2026-10-14: too bright, then
+        // "saturated by the sun yet bland"). Exposure and the tonemap curve
+        // (fields 63-76) stay at the defaults --style iw3 uses: fixed exposure 10.
+        for (const std::string_view token :
+             {"LTTOTTRLTS", "NLMSSPLMPK", "MRKQQMPTKN", "LPKQPKSRKQ", "NOOTTPORTQ", "LTNRTLQOKQ",
+              "NNRKNLLSQN", "MMQMQKSTS", "LSLPLPRQNO", "NLPRMSTSMM", "MOPORNQOTQ", "MTPSRMRRLP",
+              "LRPSSPPPPT", "NMKNKNMKNN"})
+            overrides.erase(token);
+        // Fog: IW3's own, baked by the surface shader exactly as --style iw3
+        // does it (below); the native fog pass stays off.
     }
-    else if (!fog)
+    if (!fog)
     {
         // IW3 maps without setExpFog have no fog; Replay's default vision fog
         // (70000-unit half distance, full opacity) would still haze big maps.

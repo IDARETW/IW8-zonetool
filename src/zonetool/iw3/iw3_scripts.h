@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -35,6 +36,10 @@ Translation Translate(const std::string &map, const std::vector<Source> &sources
 
 // Common MP zone effect standing in for an IW3 effect name.
 std::string StockEffectFor(const std::string &iw3Effect);
+
+// --style iw8: the stock common MP zone effect that plays the IW3 effect's role,
+// when there is one (vehicle explosions, damage smoke and fire, car glass, fires).
+std::optional<std::string> Iw8StyleEffectFor(const std::string &iw3Effect);
 
 // Compiles IW8 GSC with gsc-tool (-m comp -g iw8 -s pc) and returns the gscbin.
 std::vector<std::uint8_t> Compile(const std::string &gsc, const std::filesystem::path &gscTool,

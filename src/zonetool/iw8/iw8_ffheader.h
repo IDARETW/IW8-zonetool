@@ -18,7 +18,7 @@ static_assert(sizeof(IW8_EncryptionHeader) == 20, "EncryptionHeader must be 20 b
 struct IW8_XFile
 {
     uint64_t size;            // 0x00  decompressed total zone size (mp_shipment: 0x175FD16F)
-    uint64_t preloadWalkSize; // 0x08  (mp_shipment: 0x87F3)
+    uint64_t preloadWalkSize; // 0x08  postload stream-plan capacity (mp_shipment: 0x8725, exact)
     uint64_t
         blockSize[11]; // 0x10  per-stream (DBStreamStart) decompressed sizes — IW8 has 11 streams
     IW8_EncryptionHeader encryption; // 0x68  (file 0x88) "IWffs100" + sig

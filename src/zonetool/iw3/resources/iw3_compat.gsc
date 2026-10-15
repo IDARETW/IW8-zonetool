@@ -68,13 +68,35 @@ iw3compat_precache()
     level.mw120r_fx["glass_shatter"] = iw3compat_fx( "impacts/small_glass", "vfx/code/glass/glass_shatter_32x32" );
     level.mw120r_fx["sparks"] = iw3compat_fx( "impacts/small_metalhit_1", "vfx/iw8_mp/equipment/flashbang/vfx_spark_crack_npop" );
     // IW3's own explosion carries its fire; only the stock stand-in needs one.
-    if ( !iw3compat_has_iw3fx( "explosions/small_vehicle_explosion" ) )
+    if ( iw3compat_slot_stock( "veh_explosion" ) )
         level.mw120r_fx["veh_fire_linger"] = loadfx( "vfx/iw8/veh/scriptables/vfx_veh_fire_linger_med" );
 }
 
 iw3compat_has_iw3fx( iw3name )
 {
     return isdefined( level.mw120r_iw3fx ) && isdefined( level.mw120r_iw3fx[iw3name] );
+}
+
+// A slot holds a stock Replay effect when the IW3 effect did not convert, or
+// when --style iw8 maps it to a stock one (level.mw120r_iw3fx_stock, generated).
+iw3compat_fx_is_stock( iw3name )
+{
+    if ( !iw3compat_has_iw3fx( iw3name ) )
+        return 1;
+    return isdefined( level.mw120r_iw3fx_stock ) && isdefined( level.mw120r_iw3fx_stock[iw3name] );
+}
+
+iw3compat_slot_stock( key )
+{
+    if ( key == "veh_smoke_light" )
+        return iw3compat_fx_is_stock( "smoke/car_damage_whitesmoke" );
+    if ( key == "veh_smoke_heavy" )
+        return iw3compat_fx_is_stock( "smoke/car_damage_blacksmoke" );
+    if ( key == "veh_fire" )
+        return iw3compat_fx_is_stock( "smoke/car_damage_blacksmoke_fire" );
+    if ( key == "veh_explosion" )
+        return iw3compat_fx_is_stock( "explosions/small_vehicle_explosion" );
+    return 1;
 }
 
 // IW3 loadfx( name ) with a runtime name: the converted effect when the map
@@ -660,6 +682,21 @@ iw3compat_vehicle_drain()
     }
 }
 
+// Stock Replay vehicle effects are authored in the vehicle's frame (X forward,
+// Z up) above a ground-level origin; IW3 effects keep IW3's tags and axes.
+iw3compat_vehicle_playfx( fx, origin )
+{
+    playfx( fx, origin, anglestoforward( self.angles ), anglestoup( self.angles ) );
+}
+
+// Stock vehicle effects add their own 20-30 units of height above the point
+// they play at (vfx_veh_fire_linger boxes at z 20..30), so they start at the
+// engine bay rather than on IW3's hood tag.
+iw3compat_vehicle_hood_stock()
+{
+    return self.origin + anglestoforward( self.angles ) * 45 + anglestoup( self.angles ) * 16;
+}
+
 iw3compat_vehicle_hood()
 {
     return self.origin + anglestoforward( self.angles ) * 64 + ( 0, 0, 40 );
@@ -671,8 +708,33 @@ iw3compat_vehicle_loopfx( name, stage, rate )
     self endon( "death" );
     self endon( "mw120r_exploded" );
     ontag = isdefined( self gettagorigin( "tag_hood_fx", 1 ) );
+    // The stock hood fire (vfx_veh_fire_linger) burns 20 s per play; replayed
+    // on IW3's 0.4 s rhythm it stacked into a wall of fire drifting off the car
+    // (owner tests 2026-10-14). It plays once, as an effect entity removed when
+    // the stage ends or the vehicle explodes.
+    if ( name == "veh_fire" && iw3compat_slot_stock( name ) )
+    {
+        fx = spawnfx( level.mw120r_fx[name], self iw3compat_vehicle_hood_stock(), anglestoforward( self.angles ), anglestoup( self.angles ) );
+        triggerfx( fx );
+        self.mw120r_stagefx = fx;
+        while ( self.mw120r_stage == stage )
+            wait 0.2;
+        self.mw120r_stagefx = undefined;
+        fx delete();
+        return;
+    }
     while ( self.mw120r_stage == stage )
     {
+        // Stock Replay effects rise along their Z axis; IW3's tag_hood_fx
+        // points X up, so they burned sideways on the tag.
+        if ( iw3compat_slot_stock( name ) )
+        {
+            // Stock smoke particles live 2.5-5 s; one burst a second keeps the
+            // plume without IW3's 0.4 s rhythm (frame-rate cost, owner 2026-10-14).
+            self iw3compat_vehicle_playfx( level.mw120r_fx[name], self iw3compat_vehicle_hood_stock() );
+            wait max( rate, 1 );
+            continue;
+        }
         if ( ontag )
             playfxontag( level.mw120r_fx[name], self, "tag_hood_fx" );
         else
@@ -684,6 +746,11 @@ iw3compat_vehicle_loopfx( name, stage, rate )
 iw3compat_vehicle_explode()
 {
     self notify( "mw120r_exploded" );
+    if ( isdefined( self.mw120r_stagefx ) )
+    {
+        self.mw120r_stagefx delete();
+        self.mw120r_stagefx = undefined;
+    }
     self setcandamage( 0 );
     self stoploopsound();
     self iw3compat_playsound( "car_explode" );
@@ -692,7 +759,13 @@ iw3compat_vehicle_explode()
     fxorigin = self gettagorigin( "tag_death_fx", 1 );
     if ( !isdefined( fxorigin ) )
         fxorigin = self.origin + ( 0, 0, 32 );
-    playfx( level.mw120r_fx["veh_explosion"], fxorigin, ( 0, 0, 1 ), ( 1, 0, 0 ) );
+    // Stock vehicle effects place their own heights above a ground-level vehicle
+    // origin (linger fire boxes at z -2..40); from IW3's raised tags they hovered
+    // over the wreck (owner test 2026-10-14).
+    if ( iw3compat_slot_stock( "veh_explosion" ) )
+        self iw3compat_vehicle_playfx( level.mw120r_fx["veh_explosion"], self.origin );
+    else
+        playfx( level.mw120r_fx["veh_explosion"], fxorigin, ( 0, 0, 1 ), ( 1, 0, 0 ) );
     center = self.origin + ( 0, 0, 80 );
 
     attacker = self.mw120r_attacker;
@@ -708,19 +781,24 @@ iw3compat_vehicle_explode()
         self setmodel( self.mw120r_destroyed_model );
 
     // IW3's own explosion carries its fire; the stock stand-in needs a burn.
-    if ( !iw3compat_has_iw3fx( "explosions/small_vehicle_explosion" ) )
-        self thread iw3compat_vehicle_burn( 12 );
+    if ( iw3compat_slot_stock( "veh_explosion" ) )
+        self thread iw3compat_vehicle_burn( 15 );
 }
 
+// The stock wreck fire (vfx_veh_fire_linger_med) burns 15-130 s per play on a
+// ground-level vehicle origin: one play, removed after the burn. Replaying it
+// every 0.5 s stacked 24 of them into the floating wall (owner tests).
 iw3compat_vehicle_burn( seconds )
 {
-    self endon( "death" );
-    end = gettime() + seconds * 1000;
-    while ( gettime() < end )
-    {
-        playfx( level.mw120r_fx["veh_fire_linger"], self.origin + ( 0, 0, 24 ) );
-        wait 0.5;
-    }
+    // Starting with the blast stacked the fire's opening bursts on the stock
+    // explosion's (frame drops as explosions start, owner test 2026-10-14).
+    wait 1;
+    if ( !isdefined( self ) )
+        return;
+    fx = spawnfx( level.mw120r_fx["veh_fire_linger"], self.origin, anglestoforward( self.angles ), anglestoup( self.angles ) );
+    triggerfx( fx );
+    wait seconds;
+    fx delete();
 }
 
 // ---------------------------------------------------------------------------

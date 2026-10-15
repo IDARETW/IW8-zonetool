@@ -713,10 +713,47 @@ std::string StockEffectFor(const std::string &iw3Effect)
     if (name.find("explo") != std::string::npos)
         return "vfx/iw8/veh/scriptables/vfx_veh_explosion_civ";
     if (name.find("fire") != std::string::npos || name.find("flame") != std::string::npos)
-        return "vfx/iw8/veh/scriptables/vfx_veh_fire_linger_med";
+        return "vfx/iw8/veh/scriptables/shared/vfx_veh_fire_linger_med";
     if (name.find("smoke") != std::string::npos || name.find("steam") != std::string::npos)
         return "vfx/iw8/veh/scriptables/vfx_smoke_light_ch";
     return "vfx/iw8_mp/equipment/flashbang/vfx_spark_crack_npop";
+}
+
+std::optional<std::string> Iw8StyleEffectFor(const std::string &iw3Effect)
+{
+    // Stock Replay effects in the always-loaded MP zones (common_mp,
+    // common_core_mp, common_base_mp; listed with ACTS 2026-10-14) that play the
+    // same role as the IW3 effect. Ambient map effects (dust, leaves, haze) have
+    // no counterpart there and stay converted. The stock vehicle fires burn for
+    // 15-130 s per play; iw3_compat.gsc plays them once (spawnfx) instead of on
+    // IW3's 0.4 s effect rhythm, which stacked dozens into a floating wall of
+    // fire beside the wreck (owner tests 2026-10-14, zt-28..zt-30).
+    static const std::map<std::string, std::string, std::less<>> exact{
+        {"explosions/small_vehicle_explosion", "vfx/iw8/veh/scriptables/vfx_veh_explosion_civ"},
+        {"explosions/grenadeexp_default", "vfx/core/expl/grenadeexp_default"},
+        {"smoke/car_damage_blacksmoke_fire", "vfx/iw8/veh/scriptables/vfx_veh_fire_linger"},
+        {"smoke/car_damage_blacksmoke", "vfx/iw8/veh/scriptables/vfx_smoke_heavy_ch"},
+        {"smoke/car_damage_whitesmoke", "vfx/iw8/veh/scriptables/vfx_smoke_light_ch"},
+        {"smoke/damaged_vehicle_smoke", "vfx/iw8/veh/scriptables/vfx_veh_hood_smoke"},
+        {"props/car_glass_large", "vfx/iw8/veh/scriptables/vfx_veh_glass_windshield"},
+        {"props/car_glass_med", "vfx/iw8/veh/scriptables/vfx_veh_glass_window_side"},
+        {"props/car_glass_headlight", "vfx/iw8/veh/scriptables/vfx_veh_glass_lamp"},
+        {"props/car_glass_brakelight", "vfx/iw8/veh/scriptables/vfx_veh_glass_lamp"},
+        {"fire/firelp_barrel_pm", "vfx/props/barrel_fire"},
+        {"misc/insects_carcass_flies", "vfx/misc/insects_carcass_flies"},
+        {"props/glow_latern", "vfx/props/glow_latern"},
+        {"misc/flare_ambient", "vfx/misc/flare_ambient"},
+    };
+    const std::string name = Lower(iw3Effect);
+    if (const auto found = exact.find(name); found != exact.end())
+        return found->second;
+    if (name.find("vehicle_explosion") != std::string::npos ||
+        name.find("car_explosion") != std::string::npos)
+        return "vfx/iw8/veh/scriptables/vfx_veh_explosion_civ";
+    // Map fires (fire/firelp_*) stay converted: createfx loopfx replays its
+    // effect every few tenths of a second for the whole match, and the stock
+    // vehicle fires burn 15-130 s per play.
+    return std::nullopt;
 }
 
 Translation Translate(const std::string &map, const std::vector<Source> &sources,

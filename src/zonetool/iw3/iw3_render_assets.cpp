@@ -653,6 +653,9 @@ Image DecodeDdsLevel(const std::span<const std::uint8_t> source, const unsigned 
     return image;
 }
 
+float Linear(float value);
+std::uint8_t SrgbByte(float linear);
+
 Cubemap DecodeDdsCubemap(const std::filesystem::path &path)
 {
     const auto bytes = ReadBytes(path);
@@ -705,14 +708,27 @@ Cubemap DecodeDdsCubemap(const std::filesystem::path &path)
     }
     if (offset != bytes.size())
         throw std::runtime_error("reflection-probe DDS contains trailing data " + path.string());
-    // IW3 reflection captures are stored as RGBA bytes, but the unlinker labels
-    // them A8R8G8B8 (red mask 0xFF0000). Nuketown's sky faces read (151,223,244)
-    // as RGB and peach as BGR; honour the byte order the capture actually used.
-    if (!fourCC && bits == 32 && masks[0] == 0x00FF0000u && masks[2] == 0x000000FFu)
-        for (auto &face : result.faces)
-            for (auto &image : face)
-                for (std::size_t pixel = 0; pixel < image.rgba.size(); pixel += 4)
-                    std::swap(image.rgba[pixel], image.rgba[pixel + 2]);
+    // IW3 captured probes from its D3D9 A8R8G8B8 framebuffer (B, G, R, A bytes),
+    // which the DDS masks describe. Read by those masks, every Nuketown probe's
+    // up face is light-blue sky (209,237,242) and its sides wood and siding
+    // (149,121,95); an earlier red/blue swap turned the surroundings blue in
+    // every reflection (owner test 2026-10-14: blue weapons and car metal).
+    // The captures are clipped and far more saturated than the map renders
+    // (Nuketown's grass and fences read neon); Replay's stock and probe-lit
+    // materials reflected that as miscoloured highlights. At 40% desaturation
+    // the brown fences still tinted weapons and ground red (owner test
+    // 2026-10-14, both styles), so reflections keep only each texel's
+    // luminance (linear light): their brightness and shapes, no hue.
+    for (auto &face : result.faces)
+        for (auto &image : face)
+            for (std::size_t pixel = 0; pixel < image.rgba.size(); pixel += 4)
+            {
+                const float luminance = 0.2126f * Linear(image.rgba[pixel] / 255.0f) +
+                                        0.7152f * Linear(image.rgba[pixel + 1] / 255.0f) +
+                                        0.0722f * Linear(image.rgba[pixel + 2] / 255.0f);
+                const std::uint8_t grey = SrgbByte(luminance);
+                image.rgba[pixel] = image.rgba[pixel + 1] = image.rgba[pixel + 2] = grey;
+            }
     for (unsigned level = 0; level < mipCount; ++level)
         for (unsigned face = 0; face < 6; ++face)
         {
@@ -1028,10 +1044,13 @@ std::array<std::array<float, 9>, 4> ProjectReflectionSh(const Cubemap &cubemap)
                                                   0.546274 * (dx * dx - dy * dy)};
                 const double weight = 1.0 / std::pow(1.0 + u * u + v * v, 1.5);
                 const std::size_t offset = (static_cast<std::size_t>(y) * image.width + x) * 4;
-                const std::array<double, 4> sample{Linear(image.rgba[offset + 0] / 255.0f),
-                                                   Linear(image.rgba[offset + 1] / 255.0f),
-                                                   Linear(image.rgba[offset + 2] / 255.0f),
-                                                   image.rgba[offset + 3] / 255.0};
+                const double red = Linear(image.rgba[offset + 0] / 255.0f);
+                const double green = Linear(image.rgba[offset + 1] / 255.0f);
+                const double blue = Linear(image.rgba[offset + 2] / 255.0f);
+                // The fourth vector tracks probe brightness in stock Replay probes
+                // (mp_backlot2: median 0.93 x luminance), not the IW3 capture alpha.
+                const std::array<double, 4> sample{red, green, blue,
+                                                   0.2126 * red + 0.7152 * green + 0.0722 * blue};
                 for (unsigned channel = 0; channel < 4; ++channel)
                     for (unsigned coefficient = 0; coefficient < 9; ++coefficient)
                         accumulated[channel][coefficient] +=
@@ -1232,6 +1251,58 @@ std::vector<std::uint8_t> BuildReflectionProbeArray(const std::vector<Cubemap> &
         result.resize((result.size() + 15) & ~std::size_t{15});
     }
     return result;
+}
+
+// Alpha-tested colour maps carry black (or unrelated) colour in their cut-away
+// texels. Filtering, mips and the atlas's BC7 blocks pulled it into the visible
+// edge texels: dark, speckled outlines on IW3 cut-out decals (owner test
+// 2026-10-14, zz_trailer_decal "INDEPENDENT MOVING & DELIVERY"). Grow the visible
+// colour outward through the cut-away texels; alpha is unchanged.
+void BleedCutoutColor(Image &level)
+{
+    const std::size_t width = level.width, height = level.height;
+    std::vector<std::uint8_t> known(width * height);
+    std::size_t knownCount = 0;
+    for (std::size_t index = 0; index < known.size(); ++index)
+        knownCount += known[index] = level.rgba[index * 4 + 3] >= 128;
+    if (knownCount == 0 || knownCount == known.size())
+        return;
+    for (unsigned pass = 0; pass < 32; ++pass)
+    {
+        std::vector<std::uint8_t> next = known;
+        std::vector<std::uint8_t> rgba = level.rgba;
+        bool grew = false;
+        for (std::size_t y = 0; y < height; ++y)
+            for (std::size_t x = 0; x < width; ++x)
+            {
+                const std::size_t index = y * width + x;
+                if (known[index])
+                    continue;
+                unsigned sum[3]{}, count = 0;
+                for (int dy = -1; dy <= 1; ++dy)
+                    for (int dx = -1; dx <= 1; ++dx)
+                    {
+                        const std::size_t nx = (x + width + dx) % width;
+                        const std::size_t ny = (y + height + dy) % height;
+                        const std::size_t neighbour = ny * width + nx;
+                        if (!known[neighbour])
+                            continue;
+                        for (unsigned channel = 0; channel < 3; ++channel)
+                            sum[channel] += level.rgba[neighbour * 4 + channel];
+                        ++count;
+                    }
+                if (!count)
+                    continue;
+                for (unsigned channel = 0; channel < 3; ++channel)
+                    rgba[index * 4 + channel] = static_cast<std::uint8_t>(sum[channel] / count);
+                next[index] = 1;
+                grew = true;
+            }
+        level.rgba = std::move(rgba);
+        known = std::move(next);
+        if (!grew)
+            break;
+    }
 }
 
 Image Resize(const Image &source, const unsigned width, const unsigned height, const bool color,
@@ -2123,7 +2194,8 @@ void ReplaceAtlasTokens(std::string &source, const unsigned columns, const unsig
 Json BuildTechset(const std::string &map, const unsigned columns, const unsigned atlasSize,
                   const TechniqueGeometry geometry,
                   const std::string &glassEnvironment, const bool instanceLighting = false,
-                  const std::string &lightVolumeDefines = {})
+                  const std::string &lightVolumeDefines = {},
+                  const std::string &lightmapDefines = {})
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
     const bool entity = geometry == TechniqueGeometry::entity;
@@ -2140,6 +2212,9 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         pixelSource += "#define MAP_INSTANCE_LIGHTING 1\n";
     if (entity && !lightVolumeDefines.empty())
         pixelSource += lightVolumeDefines;
+    const bool lightmapTextures = !model && !lightmapDefines.empty();
+    if (lightmapTextures)
+        pixelSource += lightmapDefines;
     pixelSource += ResourceText(IDR_IW3_PIXEL_SHADER);
     ReplaceAtlasTokens(pixelSource, columns, atlasSize);
     // Model coverage passes bind no view mip bias; sample with the gradients alone.
@@ -2176,6 +2251,11 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         "TECHNIQUE_LIT_FORWARDPLUS_BITMASK_" + techset.at("name").get<std::string>().substr(3);
     if ((staticModel && instanceLighting) || (entity && !lightVolumeDefines.empty()))
         AppendTextureArgument(lit, "051006003d00"); // type 5, pixel stage, t6, slot 0x3D
+    if (lightmapTextures)
+    {
+        AppendTextureArgument(lit, "051007003e00"); // t7, slot 0x3E: lightmap A + direction X
+        AppendTextureArgument(lit, "051008003f00"); // t8, slot 0x3F: lightmap B + direction Y
+    }
     PatchStateIdentity(lit, pixel);
 
     const auto depthProgram =
@@ -2616,19 +2696,13 @@ void EncodeBc7Mode6Block(const std::uint8_t (&pixels)[16][4], std::uint8_t *out)
         put(bestIndex[pixel], 4);
 }
 
-// Encoded caches are reused only by the converter build that wrote them: an
-// encoder change keeps the input digest, so the key must name the encoder too.
-const std::string &ConverterIdentity()
-{
-    static const std::string identity = [] {
-        std::wstring path(MAX_PATH, L'\0');
-        path.resize(GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size())));
-        const auto bytes = ReadBytes(std::filesystem::path(path));
-        const auto digest = Sha256(bytes);
-        return Hex(std::span(digest).first(8));
-    }();
-    return identity;
-}
+// Encoded caches are keyed by the input digest and the encoder that wrote them.
+// The key names the encoder by version, not by converter executable: keyed by
+// the executable's hash, every rebuild missed and re-encoded identical probes
+// (BC6H, about 5 minutes per map) and atlases. Bump a version whenever its
+// encoder changes.
+constexpr const char *kBc7AtlasEncoderVersion = "bc7-mode6-v1";
+constexpr const char *kBc6hProbeEncoderVersion = "bc6h-dxtex-v1";
 
 // BC7 encoding of a square RGBA8 mip chain laid out by MipChain.
 // Values pass through unchanged, so sRGB data stays sRGB for format 45.
@@ -2639,10 +2713,7 @@ std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
     const auto inputDigest = Sha256(rgba);
     const auto cacheFile =
         cacheRoot.empty() ? std::filesystem::path{}
-                          : cacheRoot / ("atlas_" + Hex(std::span(inputDigest).first(16)) + "_" + ConverterIdentity() + ".bc7");
-    std::error_code cacheError;
-    if (!cacheFile.empty() && std::filesystem::is_regular_file(cacheFile, cacheError))
-        return ReadBytes(cacheFile);
+                          : cacheRoot / ("atlas_" + Hex(std::span(inputDigest).first(16)) + "_" + kBc7AtlasEncoderVersion + ".bc7");
     struct Level
     {
         unsigned width;
@@ -2661,6 +2732,12 @@ std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
     }
     if (source != rgba.size())
         throw std::runtime_error("BC7 atlas input does not match its mip chain");
+    // A cached chain counts only at its exact encoded size: a full disk once left
+    // an empty atlas file that the next conversion read back (zt-34).
+    std::error_code cacheError;
+    if (!cacheFile.empty() && std::filesystem::is_regular_file(cacheFile, cacheError) &&
+        std::filesystem::file_size(cacheFile, cacheError) == target && !cacheError)
+        return ReadBytes(cacheFile);
     std::vector<std::uint8_t> output(target);
     std::vector<std::pair<unsigned, unsigned>> rows; // level, block row
     for (unsigned level = 0; level < table.size(); ++level)
@@ -2692,8 +2769,27 @@ std::vector<std::uint8_t> EncodeBc7Chain(const std::vector<std::uint8_t> &rgba,
         workers.emplace_back(encode);
     for (auto &worker : workers)
         worker.join();
+    // The cache is an optimisation: write through a temporary file renamed when
+    // complete, and keep converting when the disk is full.
     if (!cacheFile.empty())
-        WriteBytes(cacheFile, output);
+    {
+        // Per process: both styles of a map convert in parallel, and a shared
+        // temporary name made their renames fail.
+        auto partial = cacheFile;
+        partial += "." + std::to_string(GetCurrentProcessId()) + ".partial";
+        try
+        {
+            WriteBytes(partial, output);
+            std::filesystem::rename(partial, cacheFile, cacheError);
+            if (cacheError)
+                zt::warn("iw3: atlas cache not written (%s)", cacheError.message().c_str());
+        }
+        catch (const std::exception &error)
+        {
+            zt::warn("iw3: atlas cache not written (%s)", error.what());
+        }
+        std::filesystem::remove(partial, cacheError);
+    }
     return output;
 }
 
@@ -2847,6 +2943,21 @@ Json BuildFxMaterialDefinition(const SourceFxMaterial &source)
         std::vector<std::uint8_t> vertexConstants(160);
         std::memcpy(vertexConstants.data() + 128, atlas.data(), 16);
         std::memcpy(vertexConstants.data() + 144, atlasBits.data(), 16);
+        // Buffer 0 serves technique 29 (shadow), buffer 1 technique 30 (the
+        // emissive pass that draws the particle). Stock atlas effect materials
+        // (techsets_common vfx_pyro_exp_rise, vfx_vol_dust_turbulent_corner_anim_1)
+        // give buffer 1 the vertex rows and a 144-byte pixel block: row 1 the
+        // effect-colour setup (additive only), row 2 tint, row 8 atlas. An empty
+        // buffer 1 zeroed the atlas scale and drew every particle as one texel
+        // (owner test 2026-10-14: grey smoke squares, impact rectangles).
+        std::vector<std::uint8_t> pixelConstants(144);
+        if (additive)
+        {
+            const std::array<std::uint32_t, 4> effectColor{0xFFFFFFFFu, 0x00FF17E7u, 0x4C2B5CAFu, 0u};
+            std::memcpy(pixelConstants.data() + 16, effectColor.data(), 16);
+        }
+        std::memcpy(pixelConstants.data() + 32, source.tint.data(), 16);
+        std::memcpy(pixelConstants.data() + 128, atlas.data(), 16);
         std::vector<std::uint8_t> bufferIndices(195, 0xFF);
         bufferIndices[29] = 0;
         bufferIndices[30] = 1;
@@ -2860,7 +2971,8 @@ Json BuildFxMaterialDefinition(const SourceFxMaterial &source)
                 {"constants", Hex(constants)},
                 {"bufferIndices", Hex(bufferIndices)},
                 {"buffers", Json::array({Json::array({Hex(vertexConstants), "", "", ""}),
-                                          Json::array({"", "", "", ""})})},
+                                          Json::array({Hex(vertexConstants), "", "",
+                                                       Hex(pixelConstants)})})},
                 {"imageDefinitions", Json::array()}};
     }
 
@@ -3080,10 +3192,12 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     const auto probeDigest = Sha256(probeKey);
     const auto probeCache =
         cacheRoot.empty() ? std::filesystem::path{}
-                          : cacheRoot / ("probes_" + Hex(std::span(probeDigest).first(16)) + "_" + ConverterIdentity() + ".bc6h");
+                          : cacheRoot / ("probes_" + Hex(std::span(probeDigest).first(16)) + "_" + kBc6hProbeEncoderVersion + ".bc6h");
     std::vector<std::uint8_t> arrayPixels;
     std::error_code cacheError;
-    if (!probeCache.empty() && std::filesystem::is_regular_file(probeCache, cacheError))
+    if (!probeCache.empty() && std::filesystem::is_regular_file(probeCache, cacheError) &&
+        std::filesystem::file_size(probeCache, cacheError) == probeCubemaps.size() * 87360 &&
+        !cacheError)
     {
         arrayPixels = ReadBytes(probeCache);
         zt::info("iw3: reusing cached reflection-probe array %s", probeCache.string().c_str());
@@ -3092,7 +3206,24 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     {
         arrayPixels = BuildReflectionProbeArray(probeCubemaps, arrayWidth, arrayMipCount);
         if (!probeCache.empty())
-            WriteBytes(probeCache, arrayPixels);
+        {
+            // Per process: both styles of a map encode the same probes in
+            // parallel, and a shared temporary name made both renames fail.
+            auto partial = probeCache;
+            partial += "." + std::to_string(GetCurrentProcessId()) + ".partial";
+            try
+            {
+                WriteBytes(partial, arrayPixels);
+                std::filesystem::rename(partial, probeCache, cacheError);
+                if (cacheError)
+                    zt::warn("iw3: probe cache not written (%s)", cacheError.message().c_str());
+            }
+            catch (const std::exception &error)
+            {
+                zt::warn("iw3: probe cache not written (%s)", error.what());
+            }
+            std::filesystem::remove(partial, cacheError);
+        }
     }
     timing.lap("probe BC6H array");
     constexpr std::size_t bytesPerSlice = 87360;
@@ -3200,6 +3331,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
 
     plan.columns = columns;
     std::set<std::size_t> writtenTiles;
+    std::set<std::string> bledColors;
     for (const SourceMaterial &material : materials)
     {
         MaterialPlan item;
@@ -3223,6 +3355,14 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                         atlasTileMips[channel].push_back(
                             {item.tile, name, material.tint});
                 };
+                if (material.kind == SurfaceKind::cutout && bledColors.insert(material.color).second)
+                {
+                    image(material.color);
+                    Image &source = images.at(material.color).front();
+                    BleedCutoutColor(source);
+                    for (Image &mip : source.mips)
+                        BleedCutoutColor(mip);
+                }
                 const Image color =
                     Resize(image(material.color).front(), cell, cell, true, material.tint);
                 Paste(atlases[0], color, static_cast<unsigned>(item.tile % columns) * cell,
@@ -3324,6 +3464,28 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
               static_cast<unsigned>(plan.skyTiles[face] % columns) * cell,
               static_cast<unsigned>(plan.skyTiles[face] / columns) * cell);
 
+    // IW3's two lightmap layers (A colour + direction X, B colour + direction Y)
+    // also go to uncompressed RGBA8 textures over the atlas region the lightmaps
+    // occupy. In the BC7 atlases the A colour shares mode-6 blocks with unrelated
+    // channels (direction, B colour), which shifted its hue: on Nuketown 2.2% of
+    // lit texels lost over 15% green (purple), with errors up to 173/255 at seams.
+    unsigned lightmapLeft = atlasSize, lightmapTop = atlasSize, lightmapRight = 0,
+             lightmapBottom = 0;
+    for (const auto &rectangle : plan.lightmaps)
+    {
+        lightmapLeft = std::min(lightmapLeft, rectangle.x);
+        lightmapTop = std::min(lightmapTop, rectangle.y);
+        lightmapRight = std::max(lightmapRight, rectangle.x + rectangle.width);
+        lightmapBottom = std::max(lightmapBottom, rectangle.y + rectangle.height);
+    }
+    Image lightmapPrimary, lightmapSecondary;
+    if (!plan.lightmaps.empty())
+    {
+        lightmapPrimary = {lightmapRight - lightmapLeft, lightmapBottom - lightmapTop,
+                           std::vector<std::uint8_t>(std::size_t{lightmapRight - lightmapLeft} *
+                                                     (lightmapBottom - lightmapTop) * 4)};
+        lightmapSecondary = lightmapPrimary;
+    }
     std::size_t lightmapIndex = 0;
     for (const auto &pair : world.value("lightmaps", Json::array()))
     {
@@ -3371,6 +3533,17 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             response.rgba[index * 4 + 1] = b[1];
             response.rgba[index * 4 + 2] = b[0];
             response.rgba[index * 4 + 3] = a[0];
+            const std::size_t target =
+                ((rectangle.y - lightmapTop + index / width) * std::size_t{lightmapPrimary.width} +
+                 rectangle.x - lightmapLeft + index % width) * 4;
+            for (const auto &[layer, source] :
+                 {std::pair{&lightmapPrimary, a}, std::pair{&lightmapSecondary, b}})
+            {
+                layer->rgba[target + 0] = source[2];
+                layer->rgba[target + 1] = source[1];
+                layer->rgba[target + 2] = source[0];
+                layer->rgba[target + 3] = source[3];
+            }
         }
         // Replay 1.20's native temporary lightmap atlas takes one BC4 ambient
         // fraction, one R11G11B10F irradiance image and one BC5 octahedral
@@ -3653,11 +3826,49 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     zt::info("iw3: source atlas %ux%u, %u columns, %u-pixel material tiles, %u mips", atlasSize,
              atlasSize, columns, cell, mipCount);
     timing.lap("atlas mips");
-    Json techset =
-        BuildTechset(map, columns, plan.atlasSize, TechniqueGeometry::world, plan.glassEnvironment);
+    // World materials (and their variants and glass panes, which share the world
+    // technique) add the two uncompressed lightmap layers; model materials keep
+    // the three atlas textures.
+    Json worldMaterial = material;
+    std::string lightmapDefines;
+    if (!plan.lightmaps.empty())
+    {
+        const auto emitLightmap = [&](Image &layer, const std::string &suffix,
+                                      const char *header) {
+            const std::string file = map + "_lightmap_" + suffix + ".rgba";
+            const std::string name = "mw120r/" + map + "_lightmap_" + suffix;
+            // Replay's resident loader pads each mip to 16 bytes.
+            layer.rgba.resize((layer.rgba.size() + 15) & ~std::size_t{15});
+            WriteBytes(mapDirectory / file, layer.rgba);
+            worldMaterial["textures"].push_back({{"header", header}, {"image", name}});
+            worldMaterial["imageDefinitions"].push_back({{"name", name},
+                                                         {"width", layer.width},
+                                                         {"height", layer.height},
+                                                         {"rgba8", file},
+                                                         {"format", 6},
+                                                         {"mipCount", 1}});
+        };
+        auto info = Unhex(worldMaterial.at("info").get<std::string>());
+        if (info[0x14] != worldMaterial.at("textures").size())
+            throw std::runtime_error("world material texture count does not match its textures");
+        emitLightmap(lightmapPrimary, "primary", "3e00000000000000");
+        emitLightmap(lightmapSecondary, "secondary", "3f00000000000000");
+        info[0x14] = static_cast<std::uint8_t>(worldMaterial.at("textures").size());
+        worldMaterial["info"] = Hex(info);
+        lightmapDefines = "#define MAP_LIGHTMAP_TEXTURES 1\n#define MAP_LIGHTMAP_ORIGIN float2(" +
+                          std::to_string(lightmapLeft) + ", " + std::to_string(lightmapTop) +
+                          ")\n#define MAP_LIGHTMAP_SIZE float2(" +
+                          std::to_string(lightmapPrimary.width) + ", " +
+                          std::to_string(lightmapPrimary.height) + ")\n";
+        zt::info("iw3: lightmap layers %ux%u at (%u, %u) as uncompressed textures",
+                 lightmapPrimary.width, lightmapPrimary.height, lightmapLeft, lightmapTop);
+    }
+    Json techset = BuildTechset(map, columns, plan.atlasSize, TechniqueGeometry::world,
+                                plan.glassEnvironment, false, {}, lightmapDefines);
     timing.lap("world techset");
     material["techset"] = techset.at("name");
-    WriteJson(mapDirectory / plan.materialDefinition, material);
+    worldMaterial["techset"] = techset.at("name");
+    WriteJson(mapDirectory / plan.materialDefinition, worldMaterial);
     WriteJson(mapDirectory / (stem + ".techset.json"), techset);
     std::vector<std::string> worldVariants;
     std::set<std::string> cutoutKinds;
@@ -3678,7 +3889,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         {
             Json biased = techset;
             ApplyDepthBias(biased);
-            Json biasedMaterial = material;
+            Json biasedMaterial = worldMaterial;
             biasedMaterial["techset"] = biased.at("name");
             biasedMaterial["techsetDefinition"] = stem + "." + name + ".techset.json";
             variant = {{"definition", stem + "." + name + ".material.json"},
@@ -3688,7 +3899,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         }
         else if (name.starts_with("foliage_"))
         {
-            variant = CreateVariant(techset, material, stem, map, "foliage");
+            variant = CreateVariant(techset, worldMaterial, stem, map, "foliage");
             if (name.find("_back") != std::string::npos)
             {
                 Json &cutout = variant["techset"];
@@ -3713,7 +3924,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             variant["material"]["techsetDefinition"] = variant.at("techsetFile");
         }
         else
-            variant = CreateVariant(techset, material, stem, map, kind);
+            variant = CreateVariant(techset, worldMaterial, stem, map, kind);
         WriteJson(mapDirectory / variant.at("definition").get<std::string>(),
                   variant.at("material"));
         WriteJson(mapDirectory / variant.at("techsetFile").get<std::string>(),
@@ -3861,7 +4072,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                             return existing.at("material") == entry.glassMaterial;
                         }))
             continue;
-        Json variant = CreateVariant(techset, material, stem, map, kind);
+        Json variant = CreateVariant(techset, worldMaterial, stem, map, kind);
         Json &paneTechset = variant.at("techset");
         const auto &environment = entry.environment;
         const std::string vertexSource = "#define GLASS_PANE 1\n#define GLASS_TILE " +

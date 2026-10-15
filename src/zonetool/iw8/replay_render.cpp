@@ -87,6 +87,10 @@ std::optional<uint8_t> generatedTextureSlot(const char *name)
         return uint8_t{59};
     if (!std::strcmp(name, "instanceLighting") || !std::strcmp(name, "lightVolume"))
         return uint8_t{0x3D};
+    if (!std::strcmp(name, "lightmapPrimary"))
+        return uint8_t{0x3E};
+    if (!std::strcmp(name, "lightmapSecondary"))
+        return uint8_t{0x3F};
     return std::nullopt;
 }
 
@@ -672,12 +676,15 @@ Material LoadMaterial(const std::string &path, const nlohmann::json &j,
                 m.buffers.size() == 1 && m.buffers.front()[0].empty() &&
                 m.buffers.front()[1].empty() && m.buffers.front()[2].empty() &&
                 m.buffers.front()[3].size() == 48;
+            // Stock atlas effect materials (techsets_common vfx_pyro_exp_rise):
+            // shadow buffer = vertex rows; emissive buffer = vertex rows + 144-byte
+            // pixel block (effect colour, tint, atlas).
             const bool featherBuffers =
                 m.buffers.size() == 2 && m.buffers.front()[0].size() == 160 &&
                 m.buffers.front()[1].empty() && m.buffers.front()[2].empty() &&
-                m.buffers.front()[3].empty() && m.buffers.back()[0].empty() &&
+                m.buffers.front()[3].empty() && m.buffers.back()[0].size() == 160 &&
                 m.buffers.back()[1].empty() && m.buffers.back()[2].empty() &&
-                m.buffers.back()[3].empty();
+                m.buffers.back()[3].size() == 144;
             if (!common || (oneBuffer ? !oneBufferBindings : !featherBuffers))
                 throw std::runtime_error("Replay effect material alias has invalid bindings");
         }

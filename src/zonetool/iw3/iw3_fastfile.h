@@ -34,7 +34,7 @@ struct ImportOptions
     // Convert IW3 gametype visuals (flag props, headquarters radios).
     bool iw3ModeAssets{true};
     // IW3's look, or Replay's native fog/atmosphere/volumetrics (iw3_vision.h).
-    LightingStyle lightingStyle{LightingStyle::iw3};
+    MapStyle style{MapStyle::iw3};
 };
 
 struct PreparedXModel

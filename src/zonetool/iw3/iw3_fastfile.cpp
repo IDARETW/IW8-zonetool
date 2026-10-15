@@ -6322,7 +6322,7 @@ iw8::vfx::Module VfxAttributesModule()
     return VfxValueModule(iw8_focus::ParticleModuleType::initAttributes, payload);
 }
 
-void AddVfxSpawnShape(const PreparedFxElement &source, iw8::vfx::State &state)
+void AddVfxSpawnShape(const PreparedFxElement &source, const bool impact, iw8::vfx::State &state)
 {
     const auto radius = VfxRange(source.spawnOffsetRadius);
     const auto height = VfxRange(source.spawnOffsetHeight);
@@ -6363,7 +6363,9 @@ void AddVfxSpawnShape(const PreparedFxElement &source, iw8::vfx::State &state)
     payload.base.base.type = static_cast<std::uint16_t>(
         iw8_focus::ParticleModuleType::initSpawnShapeCylinder);
     payload.base.axisFlags = 0x3F;
-    payload.base.normalAxis = 0;
+    // IW3's spawn cylinder runs along the effect's X; impact effects are rotated
+    // so that X is Replay's Z (ToImpactFrame).
+    payload.base.normalAxis = impact ? 2 : 0;
     payload.base.spawnType = 1;
     for (std::size_t axis = 0; axis < 3; ++axis)
         payload.base.offset.v[axis] =
@@ -6384,53 +6386,76 @@ void AddVfxVelocity(const PreparedFxElement &source, iw8::vfx::State &state)
 {
     if (source.velocitySamples.empty())
         return;
-    constexpr std::int32_t runMask = 0x1C0;
-    const bool world = (source.flags & runMask) == 0;
-    std::array<std::vector<float>, 6> values;
-    for (const auto &sample : source.velocitySamples)
-    {
-        const auto &velocity = world ? sample.world.velocity : sample.local.velocity;
-        for (std::size_t axis = 0; axis < 3; ++axis)
+    // IW3 sums two velocity graphs: "local" along the effect's axes at spawn (X is the
+    // surface normal of an impact) and "world" along world axes. Replay states may carry
+    // both; graph flag 0x80 marks the world one (stock offhand_wm_deployable_cover_panel_1).
+    const auto curves = [&](const bool world) {
+        std::array<std::vector<float>, 6> values;
+        for (const auto &sample : source.velocitySamples)
         {
-            values[axis].push_back(velocity.base[axis] * 1000.0f);
-            values[axis + 3].push_back(
-                (velocity.base[axis] + velocity.amplitude[axis]) * 1000.0f);
+            const auto &velocity = world ? sample.world.velocity : sample.local.velocity;
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+                values[axis].push_back(velocity.base[axis] * 1000.0f);
+                values[axis + 3].push_back(
+                    (velocity.base[axis] + velocity.amplitude[axis]) * 1000.0f);
+            }
         }
-    }
-    if (std::ranges::all_of(values, [](const auto &curve) {
-            return std::ranges::all_of(curve,
-                                       [](const float value) { return value == 0.0f; });
-        }))
+        return values;
+    };
+    const auto zero = [](const std::array<std::vector<float>, 6> &values) {
+        return std::ranges::all_of(values, [](const auto &curve) {
+            return std::ranges::all_of(curve, [](const float value) { return value == 0.0f; });
+        });
+    };
+    auto local = curves(false), world = curves(true);
+    if (zero(local) && zero(world))
         return;
 
+    // Replay velocity types (stock enum): 0 local, 1 world, 2 relative to the effect
+    // origin (radial), 3-5 the same with bolt info. zt-28 used 2, zt-29 0/3 and
+    // zt-30 no module; IW3 impacts sprayed sideways with all three (owner tests
+    // 2026-10-14), so the frame mode is not the cause. zt-30's missing module
+    // crashed Particle_HandleSuccessfulTest (bad per-particle stream,
+    // impacts/large_brick -> brickimpact_em2); zt-29's types stay: 3 (bolt) when
+    // IW3 runs the element relative to the effect (run modes 0x80/0xC0; 0x100 is
+    // the collision bit), else 0.
+    constexpr std::int32_t runMask = 0xC0;
     iw8_focus::ParticleModuleInitRelativeVelocity relative{};
     relative.base.type = static_cast<std::uint16_t>(
         iw8_focus::ParticleModuleType::initRelativeVelocity);
-    relative.velocityType = world ? 1u : 2u;
+    relative.velocityType = zero(local) ? 1u : (source.flags & runMask) >= 0x80 ? 3u : 0u;
+    relative.useBoltInfo = relative.velocityType == 3u;
     state.groups[0].push_back(
         VfxValueModule(iw8_focus::ParticleModuleType::initRelativeVelocity, relative));
 
-    iw8_focus::ParticleModuleVelocityGraph payload{};
-    payload.base.type =
-        static_cast<std::uint16_t>(iw8_focus::ParticleModuleType::velocityGraph);
-    if (world)
-        payload.base.flags |= 0x80;
-    auto module = VfxValueModule(iw8_focus::ParticleModuleType::velocityGraph, payload);
-    module.curves.resize(6);
-    for (std::size_t axis = 0; axis < 3; ++axis)
-    {
-        const float scale = VfxCurveScale(values[axis], values[axis + 3]);
-        module.curves[axis] = VfxCurve(values[axis], scale);
-        module.curves[axis + 3] = VfxCurve(values[axis + 3], scale);
-        iw8_focus::ParticleModuleVelocityGraph stored{};
-        std::memcpy(&stored, module.native.moduleData, sizeof(payload));
-        stored.curves[axis].scale = scale;
-        stored.curves[axis + 3].scale = scale;
-        if (values[axis] != values[axis + 3])
-            stored.base.flags |= 0x10;
-        std::memcpy(module.native.moduleData, &stored, sizeof(stored));
-    }
-    state.groups[1].push_back(std::move(module));
+    const auto addGraph = [&](const std::array<std::vector<float>, 6> &values, const bool inWorld) {
+        iw8_focus::ParticleModuleVelocityGraph payload{};
+        payload.base.type =
+            static_cast<std::uint16_t>(iw8_focus::ParticleModuleType::velocityGraph);
+        if (inWorld)
+            payload.base.flags |= 0x80;
+        auto module = VfxValueModule(iw8_focus::ParticleModuleType::velocityGraph, payload);
+        module.curves.resize(6);
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            const float scale = VfxCurveScale(values[axis], values[axis + 3]);
+            module.curves[axis] = VfxCurve(values[axis], scale);
+            module.curves[axis + 3] = VfxCurve(values[axis + 3], scale);
+            iw8_focus::ParticleModuleVelocityGraph stored{};
+            std::memcpy(&stored, module.native.moduleData, sizeof(payload));
+            stored.curves[axis].scale = scale;
+            stored.curves[axis + 3].scale = scale;
+            if (values[axis] != values[axis + 3])
+                stored.base.flags |= 0x10;
+            std::memcpy(module.native.moduleData, &stored, sizeof(stored));
+        }
+        state.groups[1].push_back(std::move(module));
+    };
+    if (!zero(local))
+        addGraph(local, false);
+    if (!zero(world))
+        addGraph(world, true);
 }
 
 void AddVfxRotation(const PreparedFxElement &source, const bool model,
@@ -6654,11 +6679,68 @@ void AddVfxAtlas(const PreparedFxElement &source, iw8::vfx::State &state)
     state.groups[0].push_back(std::move(module));
 }
 
-iw8::vfx::Emitter ConvertFxElement(
-    const PreparedMap &map, const PreparedFxElement &source,
-    const std::unordered_map<std::string, std::string> &effectAliases,
-    const std::string &lightDef)
+// Replay plays bullet-impact effects with Z along the surface normal: the impact
+// player (0x1733E10) copies the normal into axis row 2 and derives rows 0 and 1
+// from it (sub_1413DBBE0) before spawning the effect. IW3 plays them with X along
+// the normal, so every IW3 element thrown out of the surface went sideways across
+// it (owner tests 2026-10-14, zt-28..zt-30). Rotate the element's local frame
+// X -> Z, Z -> -X (Y stays): velocities, spawn offsets, model spin and collision
+// bounds. World-space velocity is untouched. IW3's one-sided local +Z "rise" of
+// impact dust (small_concrete_1: 75..114 u/s along a tangent IW3 picks) first
+// joins the outward velocity, so the dust rises instead of drifting along the
+// arbitrary tangent Replay picks.
+PreparedFxElement ToImpactFrame(const PreparedFxElement &source)
 {
+    PreparedFxElement result = source;
+    const auto negate = [](PreparedFxFloatRange range) {
+        range.base = -range.base;
+        range.amplitude = -range.amplitude;
+        return range;
+    };
+    const auto rotateRanges = [&](std::array<PreparedFxFloatRange, 3> &ranges) {
+        const auto old = ranges;
+        ranges = {negate(old[2]), old[1], old[0]};
+    };
+    bool oneSidedRise = true;
+    for (const auto &sample : source.velocitySamples)
+    {
+        const auto &velocity = sample.local.velocity;
+        oneSidedRise = oneSidedRise && velocity.base[2] >= 0.0f &&
+                       velocity.base[2] + velocity.amplitude[2] >= 0.0f;
+    }
+    for (auto &sample : result.velocitySamples)
+    {
+        auto &velocity = sample.local.velocity;
+        if (oneSidedRise)
+        {
+            velocity.base[0] += velocity.base[2];
+            velocity.amplitude[0] += velocity.amplitude[2];
+            velocity.base[2] = 0.0f;
+            velocity.amplitude[2] = 0.0f;
+        }
+        for (auto *vector : {&velocity.base, &velocity.amplitude, &sample.local.totalDelta.base,
+                             &sample.local.totalDelta.amplitude})
+        {
+            const auto old = *vector;
+            *vector = {-old[2], old[1], old[0]};
+        }
+    }
+    rotateRanges(result.spawnOrigin);
+    rotateRanges(result.spawnAngles);
+    rotateRanges(result.angularVelocity);
+    result.collisionMins = {-source.collisionMaxs[2], source.collisionMins[1], source.collisionMins[0]};
+    result.collisionMaxs = {-source.collisionMins[2], source.collisionMaxs[1], source.collisionMaxs[0]};
+    return result;
+}
+
+iw8::vfx::Emitter ConvertFxElement(
+    const PreparedMap &map, const PreparedFxElement &sourceElement,
+    const std::unordered_map<std::string, std::string> &effectAliases,
+    const std::string &lightDef, const bool impact)
+{
+    const std::optional<PreparedFxElement> rotated =
+        impact ? std::optional(ToImpactFrame(sourceElement)) : std::nullopt;
+    const PreparedFxElement &source = rotated ? *rotated : sourceElement;
     iw8::vfx::Emitter emitter;
     const auto burst = VfxRange(source.spawn.oneShotCount);
     const std::uint32_t maxCount = static_cast<std::uint32_t>(std::max(1, burst.max));
@@ -6731,9 +6813,14 @@ iw8::vfx::Emitter ConvertFxElement(
         emitter.native.dataFlags = 26409215;
         break;
     case 9:
+        // Stock bullet-impact decals (vfx_40mm_imp_asphalt, riotshield hits):
+        // state 0x100040, emitter 0x400002, spawn/attributes/decal/rotation
+        // only, the size in INIT_ATTRIBUTES (below). The former sprite-style
+        // family (state 0x8000007840, size graph) never showed (owner tests
+        // 2026-10-14, zt-33/zt-34).
         state.native.elementType = 2;
-        state.native.flags = 549755844672ull;
-        emitter.native.flags = 2;
+        state.native.flags = 0x100040ull;
+        emitter.native.flags = 0x400002;
         emitter.native.dataFlags = 26409215;
         break;
     case 10:
@@ -6768,8 +6855,38 @@ iw8::vfx::Emitter ConvertFxElement(
             throw std::runtime_error("IW3 FX impact conversion is pinned only for model and sprite particles");
     }
 
+    // Every stock state with a test module (impact, birth, death) allocates
+    // the 0x10000 per-particle stream that Particle_HandleSuccessfulTest
+    // writes its result flags through; without it IW3 debris with a birth
+    // effect (impacts/large_brick -> brickimpact_em2) crashed the game there
+    // (owner tests 2026-10-14, zt-30 and zt-34).
+    if (!source.effectOnImpact.empty() || !source.effectOnDeath.empty() ||
+        !source.effectEmitted.empty())
+        emitter.native.dataFlags |= 0x10000;
     state.groups[0].push_back(VfxSpawnModule());
-    state.groups[0].push_back(VfxAttributesModule());
+    if (source.type == 9)
+    {
+        // IW3 decals give a radius in size[0] (impacts/small_concrete_1: 4);
+        // stock decals carry it in INIT_ATTRIBUTES (vfx_semtex_bolt_decal 50, 50).
+        auto attributes = VfxAttributesModule();
+        iw8_focus::ParticleModuleInitAttributes payload{};
+        std::memcpy(&payload, attributes.native.moduleData, sizeof(payload));
+        float low = 1.0f, high = 1.0f;
+        if (!source.visualSamples.empty())
+        {
+            const auto &first = source.visualSamples.front();
+            low = first.base.size[0];
+            high = first.base.size[0] + first.amplitude.size[0];
+            if (low > high)
+                std::swap(low, high);
+        }
+        VfxSetVec(payload.sizeMin, low, low, 0.0f);
+        VfxSetVec(payload.sizeMax, high, high, 0.0f);
+        std::memcpy(attributes.native.moduleData, &payload, sizeof(payload));
+        state.groups[0].push_back(std::move(attributes));
+    }
+    else
+        state.groups[0].push_back(VfxAttributesModule());
     if (source.type == 10)
     {
         iw8_focus::ParticleModuleInitRunner payload{};
@@ -6832,6 +6949,16 @@ iw8::vfx::Emitter ConvertFxElement(
         iw8_focus::ParticleModuleInitDecal payload{};
         payload.base.type =
             static_cast<std::uint16_t>(iw8_focus::ParticleModuleType::initDecal);
+        // As every stock decal (vfx_explo_symtex_gren_a, vfx_semtex_bolt_decal,
+        // footstep ripples): no stop fade (0xFFFF) and a white lerp colour. The
+        // projection runs into the surface: FX_MARK_PROJECTION_AXIS_NEG_Z (5)
+        // for an impact effect, whose frame has Z along the normal
+        // (ToImpactFrame), else IW3's own -X (FX_MARK_PROJECTION_AXIS_NEG_X, 1).
+        // The zeroed fields projected IW3 bullet holes along +X, a tangent, with
+        // a black lerp colour: none showed (owner test 2026-10-14, zt-33).
+        payload.stoppableFadeOutTime = 0xFFFF;
+        VfxSetVec(payload.lerpColor, 1.0f, 1.0f, 1.0f, 1.0f);
+        payload.projectionAxis = impact ? 5 : 1;
         auto module = VfxValueModule(iw8_focus::ParticleModuleType::initDecal, payload);
         for (const auto &visual : source.visuals)
         {
@@ -6895,14 +7022,15 @@ iw8::vfx::Emitter ConvertFxElement(
     }
 
     AddVfxAtlas(source, state);
-    AddVfxSpawnShape(source, state);
+    AddVfxSpawnShape(source, impact, state);
     AddVfxVelocity(source, state);
     AddVfxRotation(source, model, state);
     AddVfxGravity(source, state);
     AddVfxImpact(source, effectAliases, state);
     AddVfxBirth(source, effectAliases, state);
     AddVfxDeath(source, effectAliases, state);
-    AddVfxVisualCurves(source, state);
+    if (source.type != 9)
+        AddVfxVisualCurves(source, state);
     emitter.states.push_back(std::move(state));
     return emitter;
 }
@@ -6926,7 +7054,8 @@ iw8::vfx::Effect ConvertFx(
     effect.native.sunDistance = 100000.0f;
     effect.emitters.reserve(source.elements.size());
     for (const auto &element : source.elements)
-        effect.emitters.push_back(ConvertFxElement(map, element, effectAliases, lightDef));
+        effect.emitters.push_back(ConvertFxElement(map, element, effectAliases, lightDef,
+                                                   source.name.starts_with("impacts/")));
     return effect;
 }
 
@@ -7878,19 +8007,21 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     // setExpFog and the vision film grade become Replay's vision fog, a grading
     // CLUT and (below) the converted surface shader's fog.
     const auto expFog = ReadMapExpFog(exportRoot, sourceMap);
+    // Both styles grade with the map's IW3 film (Nuketown's warm brown tint):
+    // the owner wants --style iw8 to carry it too (2026-10-14).
     if (const auto film = ReadMapFilm(exportRoot, sourceMap))
     {
         result.gradingClutName = "mw120r_" + options.map + "_clut";
         result.gradingClutPixels = BuildGradingClutPixels(*film);
     }
     {
-        const std::string vision = BuildReplayVision(expFog, result.gradingClutName, options.lightingStyle,
+        const std::string vision = BuildReplayVision(expFog, result.gradingClutName, options.style,
                                                      SunDirection(world, entities));
         result.rawFiles.push_back(
             {"vision/" + options.map + ".vision",
              std::vector<std::uint8_t>(vision.begin(), vision.end())});
         zt::info("iw3: converted vision (%s lighting, fog %s, grading CLUT %s)",
-                 options.lightingStyle == LightingStyle::iw8 ? "iw8" : "iw3", expFog ? "yes" : "no",
+                 options.style == MapStyle::iw8 ? "iw8" : "iw3", expFog ? "yes" : "no",
                  result.gradingClutName.empty() ? "none" : result.gradingClutName.c_str());
     }
     result.fxEffects = ReadPreparedFx(exportRoot);
@@ -8239,7 +8370,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                             modelMaterialNames, entityMaterialNames, fxMaterials, shadowWorldMaterialNames,
                             shadowModelMaterialNames, options.searchPaths, mapDirectory,
                             options.map, options.scratchRoot / ".iw3-render-cache",
-                            FogShaderDefines(expFog, options.lightingStyle),
+                            FogShaderDefines(expFog, options.style),
                             static_cast<unsigned>(sourceStaticModels.instances.size()),
                             entityLightVolume ? &*entityLightVolume : nullptr);
     timing.lap("render assets");
@@ -8425,7 +8556,9 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     if (!result.smallGlassEffect.empty())
         zt::info("iw3: converted impacts/small_glass to native Replay VFX '%s'",
                  result.smallGlassEffect.c_str());
-    result.impactOverrides = ReadImpactOverrides(exportRoot, options.searchPaths, effectAliases);
+    // --style iw8 keeps Replay's own surface impact effects.
+    if (options.style == MapStyle::iw3)
+        result.impactOverrides = ReadImpactOverrides(exportRoot, options.searchPaths, effectAliases);
     zt::info("iw3: mapped %zu native IW3 impact slots into Replay's impact table",
              static_cast<std::size_t>(std::ranges::count(result.impactOverrides, std::size_t{0},
                                                          &iw8::impact::EffectOverride::pack)));
@@ -8464,6 +8597,13 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     {
         // Translated loadfx( "<marker><iw3 name>" ) calls load the converted
         // effect, or a stock Replay stand-in when the graph did not convert.
+        // --style iw8 plays the stock Replay effect wherever one has the IW3
+        // effect's role (the converted graph stays for converted parents).
+        const auto scriptEffect = [&](const std::string &name) -> std::optional<std::string> {
+            if (options.style == MapStyle::iw8)
+                return scripts::Iw8StyleEffectFor(name);
+            return std::nullopt;
+        };
         std::string &gsc = result.mapScript;
         for (std::size_t at = gsc.find(kScriptEffectMarker); at != std::string::npos;
              at = gsc.find(kScriptEffectMarker, at))
@@ -8474,15 +8614,19 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             const std::string name =
                 gsc.substr(at + kScriptEffectMarker.size(), end - at - kScriptEffectMarker.size());
             const auto alias = effectAliases.find(name);
-            const std::string replacement =
-                alias != effectAliases.end() ? alias->second : scripts::StockEffectFor(name);
+            const std::string replacement = scriptEffect(name).value_or(
+                alias != effectAliases.end() ? alias->second : scripts::StockEffectFor(name));
             zt::info("iw3: script effect %s -> %s", name.c_str(), replacement.c_str());
             gsc.replace(at, end - at, replacement);
             at += replacement.size();
         }
         // iw3compat_iw3fx(): IW3 effects the compatibility layer plays itself
         // (destructible vehicles), keyed by IW3 name.
-        gsc += "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n";
+        gsc += "\niw3compat_iw3fx()\n{\n    level.mw120r_iw3fx = [];\n"
+               "    level.mw120r_iw3fx_stock = [];\n";
+        // --style iw8: the compatibility layer plays stock effects upright.
+        if (options.style == MapStyle::iw8)
+            gsc += "    level.mw120r_iw8_fx = 1;\n";
         std::vector<const char *> compatEffects(std::begin(kIw3VehicleDestructibleEffects),
                                                 std::end(kIw3VehicleDestructibleEffects));
         compatEffects.insert(compatEffects.end(), std::begin(kIw3CompatPropEffects),
@@ -8530,21 +8674,30 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             if (placed)
                 zt::info("iw3: placed %zu IW3 _global_fx effect(s)", placed);
         }
+        const auto compatEffect = [&](const std::string &name) -> std::optional<std::string> {
+            if (const auto stock = scriptEffect(name))
+                return stock;
+            if (const auto alias = effectAliases.find(name); alias != effectAliases.end())
+                return alias->second;
+            return std::nullopt;
+        };
+        // level.mw120r_iw3fx_stock marks slots holding a stock Replay effect
+        // (--style iw8); the vehicle code plays those in the vehicle's frame.
         for (const char *name : compatEffects)
-        {
-            const auto alias = effectAliases.find(name);
-            if (alias == effectAliases.end())
-                continue;
-            gsc += "    level.mw120r_iw3fx[\"" + std::string(name) + "\"] = loadfx( \"" +
-                   alias->second + "\" );\n";
-        }
+            if (const auto effect = compatEffect(name))
+            {
+                gsc += "    level.mw120r_iw3fx[\"" + std::string(name) + "\"] = loadfx( \"" +
+                       *effect + "\" );\n";
+                if (scriptEffect(name))
+                    gsc += "    level.mw120r_iw3fx_stock[\"" + std::string(name) + "\"] = 1;\n";
+            }
         for (const auto &name : literalFx)
         {
-            const auto alias = effectAliases.find(name);
-            if (alias == effectAliases.end() ||
+            const auto effect = compatEffect(name);
+            if (!effect ||
                 std::ranges::any_of(compatEffects, [&](const char *known) { return name == known; }))
                 continue;
-            gsc += "    level.mw120r_iw3fx[\"" + name + "\"] = loadfx( \"" + alias->second + "\" );\n";
+            gsc += "    level.mw120r_iw3fx[\"" + name + "\"] = loadfx( \"" + *effect + "\" );\n";
         }
         gsc += "}\n" + globalFxGsc;
         // iw3compat_structs(): the map's keyed script_structs for IW3

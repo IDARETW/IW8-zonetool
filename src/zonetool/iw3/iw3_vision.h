@@ -36,17 +36,21 @@ std::optional<ExpFog> ReadMapExpFog(const std::filesystem::path &exportRoot,
 std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
                                 const std::string &sourceMap);
 
-// iw3: IW3's look (shader-baked setExpFog, Replay's native fog off).
-// iw8: Replay's native atmospheric fog and volumetric scattering (godrays) from a
-// stock vision template; the surface shader adds no fog of its own.
-enum class LightingStyle
+// --style. iw3: IW3's look (film colour grading, shader-baked setExpFog with
+// Replay's native fog off, the baked IW3 sun mask over native shadows, IW3 sun
+// specular, converted IW3 effects).
+// iw8: the converted map data shown with Replay's own systems: stock fog,
+// atmospheric scattering, volumetrics and auto-exposure tonemapping, no IW3
+// grading, probe reflections and GGX sun specular, native sun shadows only, and
+// stock Replay effects where one matches the IW3 effect.
+enum class MapStyle
 {
     iw3,
     iw8,
 };
 
 // HLSL preamble for the converted world/static-model pixel shader; empty without fog.
-std::string FogShaderDefines(const std::optional<ExpFog> &fog, LightingStyle style);
+std::string FogShaderDefines(const std::optional<ExpFog> &fog, MapStyle style);
 
 // Replay GfxGradingClut payload: 32^3 R16G16B16A16_UNORM texels (red fastest), each
 // the ST2084-encoded BT.2020 output for the ST2084-encoded BT.2020 input at its grid
@@ -57,5 +61,5 @@ std::vector<std::uint8_t> BuildGradingClutPixels(const Film &film);
 // Replay-format vision file (all 218 fields, engine defaults unless converted).
 // sunDirection points toward the sun (iw8 atmospheric scattering).
 std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut,
-                              LightingStyle style, const std::array<float, 3> &sunDirection);
+                              MapStyle style, const std::array<float, 3> &sunDirection);
 } // namespace iw3

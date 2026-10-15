@@ -40,6 +40,7 @@ bool iw8_write(const std::string &outputPath, const std::vector<uint8_t> &zoneBo
     header.residentPartSize = static_cast<uint32_t>(residentSize);
     header.alwaysLoadedPartSize = static_cast<uint32_t>(zoneBody.size());
     header.xfileHeader.size = zoneBody.size();
+    header.xfileHeader.preloadWalkSize = params.preloadWalkSize;
     for (int index = 0; index < kNumStreams; ++index)
     {
         header.xfileHeader.blockSize[index] = params.blockSize[index];

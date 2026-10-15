@@ -16,8 +16,8 @@
 #define MAP_LIGHTING_ROWS 84
 #endif
 // The stock lit forward+ shaders declare 187 lighting rows (probe clusters
-// cb7[48..52], probe roughness fallback cb7[186]).
-#if defined(MAP_IW8_LIGHTING) && MAP_LIGHTING_ROWS < 187
+// cb7[48..52], decal clusters cb7[116..118], probe roughness fallback cb7[186]).
+#if MAP_LIGHTING_ROWS < 187
 #undef MAP_LIGHTING_ROWS
 #define MAP_LIGHTING_ROWS 187
 #endif
@@ -109,12 +109,27 @@ SourceWorldNormal(Input input, uint flags, float2 atlasUV, float lod, out float3
     return normalize(tangentNormal.x * tangent + tangentNormal.y * bitangent +
                      tangentNormal.z * normal);
 }
+#ifdef MAP_LIGHTMAP_TEXTURES
+// IW3's two lightmap layers, uncompressed over the atlas region the lightmaps
+// occupy: primary = A colour + direction X, secondary = B colour + direction Y.
+Texture2D<float4> lightmapPrimary : register(t7);
+Texture2D<float4> lightmapSecondary : register(t8);
+#endif
 float3 SourceIndirect(float2 uv, float3 first, float3 tangentNormal) {
+#ifdef MAP_LIGHTMAP_TEXTURES
+    float2 lightmapUV = (uv * ATLAS_SIZE.0 - MAP_LIGHTMAP_ORIGIN) / MAP_LIGHTMAP_SIZE;
+    float4 primary = lightmapPrimary.SampleLevel(colorSampler, lightmapUV, 0);
+    float4 secondary = lightmapSecondary.SampleLevel(colorSampler, lightmapUV, 0);
+    first = primary.rgb;
+    float3 second = secondary.rgb;
+    float2 raw = float2(primary.a, secondary.a);
+#else
     float4 responseData = sourceResponseAtlas.SampleLevel(colorSampler, uv, 0);
     float4 normalData = sourceNormalAtlas.SampleLevel(colorSampler, uv, 0);
     first = float3(normalData.ba, responseData.a);
     float3 second = responseData.rgb;
     float2 raw = normalData.rg;
+#endif
     float2 slope = raw * float2(4.08, 4.06451607) - float2(2.08, 2.06451607);
     float response = saturate(dot(normalize(float3(slope, 1)), tangentNormal));
     return first * tangentNormal.z + second * response;
@@ -289,6 +304,106 @@ float3 ProbeReflection(float2 screenPixel, float viewDepth, float3 relativePosit
 }
 #endif
 
+// Replay decal volumes (bullet holes, blast marks, converted IW3 FX decals),
+// ported from the stock world lit forward+ pixel shader (2026-10-14): the
+// stock shaders blend them into albedo and normal themselves, so surfaces
+// drawn by this shader showed none. Clusters: cb7[117].xyz dims, cb7[116].zw
+// view-depth slice scale/bias, t57 per-cluster [count:10][first:22] lists of
+// t56 indices. A 256-byte volume: rows 0-2 camera-relative position -> box
+// (x, y in [0,1), |z| < 1), row 3 xyz projection direction and w flags (512 off,
+// 32/64 masks, 128 opacity mode, 4 albedo, 8 normal), row 4 mask atlas rects,
+// row 5 fade parameters, rows 6-7 tiling, rows 8-9 tangent frame, row 10 tint,
+// row 11 albedo/normal atlas rects (uint16 origin and size / 4096). cb7[116].x
+// is the visibility threshold, cb7[118] the angle fade and edge feather.
+// The colour, normal and mask atlases are sampled with the material sampler.
+struct DecalVolume {
+    uint4 rows[16];
+};
+StructuredBuffer<DecalVolume> decalVolumes : register(t56);
+StructuredBuffer<uint> decalLists : register(t57);
+Texture2D<float4> decalColorAtlas : register(t116);
+Texture2D<float4> decalNormalAtlas : register(t117);
+Texture2D<float4> decalMaskAtlas : register(t118);
+
+float2 DecalRectUv(uint2 rect, float2 uv, out float2 size) {
+    size = float2(rect >> 16) * (1.0 / 4096);
+    return float2(rect & 0xffff) * (1.0 / 4096) + uv * size;
+}
+
+void ApplyDecals(float3 relativePosition, float3 vertexNormal, float2 screenUV, float viewDepth,
+                 inout float3 albedo, inout float3 shadingNormal) {
+    float3 dims = replayLighting[117].xyz;
+    if (dims.x < 1 || dims.y < 1 || dims.z < 1)
+        return;
+    uint2 cell = min((uint2)max(screenUV * dims.xy, 0), (uint2)dims.xy - 1);
+    uint slice = (uint)clamp(viewDepth * replayLighting[116].z - replayLighting[116].w, 0, dims.z - 1);
+    uint list = decalLists[(slice * (uint)dims.y + cell.y) * (uint)dims.x + cell.x];
+    uint count = list & 1023, first = list >> 10;
+    float4 position = float4(relativePosition, 1);
+    float3 positionDx = ddx(relativePosition), positionDy = ddy(relativePosition);
+    for (uint i = 0; i < count && i < 64; ++i) {
+        DecalVolume v = decalVolumes[decalLists[first + i]];
+        uint flags = v.rows[3].w;
+        if (flags & 512)
+            continue;
+        float4 r0 = asfloat(v.rows[0]), r1 = asfloat(v.rows[1]), r2 = asfloat(v.rows[2]);
+        float3 box = float3(dot(r0, position), dot(r1, position), dot(r2, position));
+        if (abs(floor(box.x)) + abs(floor(box.y)) + floor(abs(box.z)) != 0)
+            continue;
+        float3 projection = asfloat(v.rows[3].xyz);
+        float facing = saturate(dot(projection, vertexNormal) + replayLighting[118].z);
+        if (!(replayLighting[118].x < facing))
+            continue;
+        float2 boxDx = float2(dot(r0.xyz, positionDx), dot(r1.xyz, positionDx));
+        float2 boxDy = float2(dot(r0.xyz, positionDy), dot(r1.xyz, positionDy));
+        float2 size;
+        float mask = 1;
+        if (flags & 32) {
+            float2 uv = DecalRectUv(v.rows[4].xy, box.xy, size);
+            mask = decalMaskAtlas.SampleGrad(colorSampler, uv, boxDx * size, boxDy * size).r;
+        }
+        float2 edge = saturate((abs(box.xy * 2 - 1) - replayLighting[118].w) * 256);
+        float fade = (1 - max(edge.x, edge.y)) * mask;
+        float4 r5 = asfloat(v.rows[5]);
+        fade *= saturate(fade * r5.x + r5.y);
+        if (!(replayLighting[116].x < fade))
+            continue;
+        float4 r6 = asfloat(v.rows[6]), r7 = asfloat(v.rows[7]);
+        float2 tiled = frac(float2(dot(float3(r6.xy, r7.x), float3(box.xy, 1)),
+                                   dot(float3(r6.zw, r7.y), float3(box.xy, 1))));
+        float2 tiling = float2(r6.x, r6.w) * replayLighting[116].y;
+        float2 tiledDx = tiling * boxDx, tiledDy = tiling * boxDy;
+        float mask2 = 1;
+        if (flags & 64) {
+            float2 uv = DecalRectUv(v.rows[4].zw, tiled, size);
+            mask2 = decalMaskAtlas.SampleGrad(colorSampler, uv, tiledDx * size, tiledDy * size).r;
+        }
+        fade *= mask2 * saturate(abs(box.z) * r5.z - r5.z);
+        fade = (flags & 128) ? saturate(fade * r7.z + r5.w * r7.z - r7.z) : r5.w * fade;
+        fade *= saturate((facing - replayLighting[118].x) * replayLighting[118].y);
+        if (!(replayLighting[116].x < fade))
+            continue;
+        float3 tint = asfloat(v.rows[10].xyz);
+        if (flags & 4) {
+            float2 uv = DecalRectUv(v.rows[11].xy, tiled, size);
+            float3 color = decalColorAtlas.SampleGrad(colorSampler, uv, tiledDx * size, tiledDy * size).rgb;
+            albedo = lerp(albedo, color * tint, fade);
+        }
+        if (flags & 8) {
+            float2 uv = DecalRectUv(v.rows[11].zw, tiled, size);
+            float4 packed = decalNormalAtlas.SampleGrad(colorSampler, uv, tiledDx * size, tiledDy * size);
+            float scale = (((v.rows[8].w >> 16) & 255) + 1) * (1.0 / 256);
+            float2 n = ((packed.yw - .5) * scale + .5) * 2 - 1;
+            float3 o = float3((n.x + n.y) * .5, (n.x - n.y) * .5, 0);
+            o.z = 1 - abs(o.x) - abs(o.y);
+            o = normalize(o);
+            float3 world = normalize(asfloat(v.rows[8].xyz) * o.x + projection * o.z +
+                                     asfloat(v.rows[9].xyz) * o.y);
+            shadingNormal = normalize(lerp(shadingNormal, world, fade));
+        }
+    }
+}
+
 #ifdef MAP_GLASS_SH
 // Linear radiance SH9 (RGB) averaged over the map's IW3 reflection captures.
 static const float3 glassSh[9] = MAP_GLASS_SH;
@@ -375,6 +490,9 @@ float4 main(Input input) : SV_TARGET0 {
     // direction, irradiance and sun visibility texture.
     float2 screenPixel = input.position.xy * replayView[7].x;
     float2 screenUV = screenPixel * replayView[6].zw;
+    if (!sky && (kind == 0 || kind == 3))
+        ApplyDecals(input.relativePosition, normalize(input.normal), screenUV, input.position.w,
+                    texel.rgb, shadingNormal);
     float3 direction = replayLighting[56].xyz;
     float3 sun = max(0, replayLighting[57].xyz);
     bool nativeSun = replayLighting[56].w != 0;
@@ -434,7 +552,8 @@ float4 main(Input input) : SV_TARGET0 {
 #endif
     if ((flags & 4) != 0) {
         float4 lm = sourceAtlas.SampleLevel(colorSampler, saturate(input.lightmapUV), 0);
-#if MAP_SOURCE_SUN_MASK
+        // --style iw8 shades with Replay's native sun shadows alone.
+#if MAP_SOURCE_SUN_MASK && !defined(MAP_IW8_LIGHTING)
         // The source profile preserves the direction used to bake this mask.
         // Keep static occlusion at every distance; native shadows add moving
         // casters and nearby detail without erasing the authored building shade.
@@ -467,24 +586,40 @@ float4 main(Input input) : SV_TARGET0 {
     // maps give F0 (sRGB reflectance) and gloss; other surfaces are rough
     // dielectrics.
     float3 environmentSpecular = 0;
+    // Rough dielectric unless an IW3 specular map gives F0 and gloss (owner
+    // test: .25 left untextured ground reflective at grazing angles).
+    float3 f0 = .04;
+    float gloss = .15;
+    // Grazing reflectance limit (f90 = saturate(16.5 (r + g + b)) of F0): with
+    // Schlick to 1 Nuketown's near-black grass specular (21/255) read wet toward
+    // the sun (owner test 2026-10-14).
+    float f90 = 1;
+#if MAP_SOURCE_CHANNELS
+    if ((flags & 64) != 0) {
+#ifdef STATIC_MODEL
+        float4 response = sourceResponseAtlas.SampleBias(colorSampler, sampleUV, replayView[7].y);
+#else
+        float4 response = sourceResponseAtlas.SampleLevel(colorSampler, sampleUV, lod);
+#endif
+        // IW3 paints its specular maps far brighter than physical reflectance
+        // (Nuketown wall paint 158/255 = .34 linear, garage door .23) and tamed
+        // them with envMapParms and dim LDR probe captures. Read as F0 they made
+        // painted walls and ceilings mirror-like indoors (owner test 2026-10-14,
+        // zt-33); a quarter keeps ordinary surfaces near .04-.09 and bright
+        // (metal) specular visibly reflective.
+        f0 = .25 * lerp(response.rgb / 12.92, pow(max((response.rgb + .055) / 1.055, 0), 2.4),
+                        step(.04045, response.rgb));
+        // IW3 stores gloss as the exponent 2^(9.3775 a) + 7; Replay's is
+        // 2^(13 gloss). Read directly, asphalt (a .68) drew a ~5x tighter, hotter
+        // highlight than IW3's.
+        gloss = log2(exp2(response.a * 9.3775177) + 7) / 13;
+        f90 = saturate(dot(f0, 16.5));
+    }
+#endif
     if (!sky && (flags & 128) == 0 && (kind == 0 || kind == 3)) {
         float3 view = normalize(-input.relativePosition);
         float ndotv = saturate(dot(shadingNormal, view));
         float3 reflected = reflect(-view, shadingNormal);
-        float3 f0 = .04;
-        float gloss = .25;
-#if MAP_SOURCE_CHANNELS
-        if ((flags & 64) != 0) {
-#ifdef STATIC_MODEL
-            float4 response = sourceResponseAtlas.SampleBias(colorSampler, sampleUV, replayView[7].y);
-#else
-            float4 response = sourceResponseAtlas.SampleLevel(colorSampler, sampleUV, lod);
-#endif
-            f0 = lerp(response.rgb / 12.92, pow(max((response.rgb + .055) / 1.055, 0), 2.4),
-                      step(.04045, response.rgb));
-            gloss = response.a;
-        }
-#endif
         float gate = saturate(gloss * replayLighting[186].x + replayLighting[186].y);
         float3 environment = indirect;
         if (gate < 1) {
@@ -504,7 +639,7 @@ float4 main(Input input) : SV_TARGET0 {
         float3 floorLight = lerp(environment, indirect, .85) * .18;
         environment = floorLight + occlusion * (environment - floorLight);
         float2 brdf = environmentBrdf.SampleLevel(gtaoSampler, float2(ndotv, gloss) * .984375 + .0078125, 0).xy;
-        float3 fresnel = f0 * brdf.x + brdf.y;
+        float3 fresnel = f0 * brdf.x + f90 * brdf.y;
         environmentSpecular = fresnel * environment * replayLighting[43].w;
         indirect *= 1 - max(fresnel.r, max(fresnel.g, fresnel.b));
     }
@@ -528,15 +663,43 @@ float4 main(Input input) : SV_TARGET0 {
     light = 1;
 #endif
     float3 specular = 0;
-#if MAP_SOURCE_CHANNELS && MAP_DEBUG_MODE == 0
-    if (!unlit && nativeSun)
-        specular = SourceSunSpecular(input, flags, sampleUV, lod, shadingNormal, direction,
-                                     sun, visibility);
+    float3 color = texel.rgb * light;
+#if defined(MAP_IW8_LIGHTING) && MAP_DEBUG_MODE == 0
+    // --style iw8: a glowing sun in the sky (owner request 2026-10-14) along
+    // the map's sun direction: a disc about a degree across, a halo and a
+    // wide glow, in the sun's colour.
+    if (sky && nativeSun) {
+        float toSun = saturate(dot(normalize(input.relativePosition), direction));
+        // zt-33's 4 / .35 / .08 read too faint (owner test); about 3x brighter.
+        color += sun * (pow(toSun, 2000) * 12 + pow(toSun, 200) * 1 + pow(toSun, 12) * .2);
+    }
 #endif
 #if defined(MAP_IW8_LIGHTING) && MAP_DEBUG_MODE == 0
+    // --style iw8: direct sun specular in Call of Duty's physically based form
+    // (normalised Blinn-Phong, power 2^(13 gloss), Schlick Fresnel and the
+    // matching visibility term), from the environment specular's F0 and gloss.
+    if (!unlit && nativeSun && (kind == 0 || kind == 3)) {
+        float3 view = normalize(-input.relativePosition);
+        float3 halfway = normalize(view + direction);
+        float ndotv = max(dot(shadingNormal, view), 1e-3);
+        float power = exp2(13 * min(gloss, .98));
+        float distribution = (power + 2) * .5 * pow(saturate(dot(shadingNormal, halfway)), power);
+        float k = 2 / sqrt(3.14159265 * (power + 2));
+        float visibilityTerm = .25 / ((ndotl * (1 - k) + k) * (ndotv * (1 - k) + k));
+        float3 fresnel = f0 + (f90 - f0) * pow(1 - saturate(dot(view, halfway)), 5);
+        specular = fresnel * distribution * visibilityTerm * ndotl * sun * visibility;
+    }
     specular += environmentSpecular;
+    color += specular;
+#elif MAP_SOURCE_CHANNELS && MAP_DEBUG_MODE == 0
+    // --style iw3: IW3 added its sun specular in the gamma-encoded framebuffer
+    // (like its fog); added linearly it over-brightened dark surfaces.
+    if (!unlit && nativeSun) {
+        specular = SourceSunSpecular(input, flags, sampleUV, lod, shadingNormal, direction,
+                                     pow(sun, 1.0 / 2.2), visibility);
+        color = pow(pow(max(color, 0), 1.0 / 2.2) + specular, 2.2);
+    }
 #endif
-    float3 color = texel.rgb * light + specular;
     float alpha = kind == 2 ? texel.a : 1;
 #ifdef MAP_GLASS_SH
     // IW3 clear glass is a nearly transparent colour map; its visibility comes
