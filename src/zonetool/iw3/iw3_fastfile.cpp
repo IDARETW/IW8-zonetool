@@ -1243,6 +1243,23 @@ constexpr std::string_view kScriptEffectMarker = "@mw120r_iw3fx@";
 constexpr const char *kIw3VehicleDestructibleSounds[] = {
     "fire_vehicle_flareup_med", "fire_vehicle_med", "car_explode", "window_entry_glass_med"};
 
+// --style iw8: IW3 sound roles played with Replay's own always-loaded
+// common_mp aliases (common_mp.all, verified by structured dump 2026-10-16:
+// one-shots carry the precache flag 0x80000, loops the loop bit).
+// veh_gen_mtl_expl chains its environment layer (veh_gen_mtl_expl_env) itself.
+struct Iw8StyleSound
+{
+    const char *iw3;
+    const char *stock;
+    bool looping;
+};
+constexpr Iw8StyleSound kIw8StyleSounds[] = {
+    {"car_explode", "veh_gen_mtl_expl", false},
+    {"fire_vehicle_flareup_med", "weap_molotov_fire_whoosh", false},
+    {"fire_vehicle_med", "vehicle_fire_medium", true},
+    {"window_entry_glass_med", "glass_pane_breakout", false},
+};
+
 // IW3 maps\mp\_destructible_types vehicle effects (sedan, wagon, hatchback, ...).
 constexpr const char *kIw3VehicleDestructibleEffects[] = {
     "smoke/car_damage_whitesmoke",    "smoke/car_damage_blacksmoke",
@@ -9145,9 +9162,16 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         for (const auto *entry : UsedGlobalFx(entities))
             if (entry->sound)
                 requestedSounds.insert(entry->sound);
+        // --style iw8 plays stock aliases for these roles: skip their IW3 audio.
+        if (options.style == MapStyle::iw8)
+            for (const auto &sound : kIw8StyleSounds)
+                requestedSounds.erase(sound.iw3);
         std::set<std::string> literals;
         for (const char *folder : {"mp", "createfx", "createart"})
             literals.merge(sound::ReadScriptStringLiterals(exportRoot / "maps" / folder));
+        if (options.style == MapStyle::iw8)
+            for (const auto &sound : kIw8StyleSounds)
+                literals.erase(sound.iw3);
         if (auto sounds = sound::Convert(exportRoot, options.searchPaths, options.map, requestedSounds,
                                          literals))
         {
@@ -9302,9 +9326,19 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                 zt::info("iw3: %zu IW3 script_struct(s) available to getstructarray", count);
         }
         // iw3compat_sounds(): converted aliases, 1 = playsound, 2 = playloopsound.
-        gsc += "\niw3compat_sounds()\n{\n    level.mw120r_sounds = [];\n";
+        // --style iw8: level.mw120r_sound_alias maps IW3 roles to stock aliases.
+        gsc += "\niw3compat_sounds()\n{\n    level.mw120r_sounds = [];\n"
+               "    level.mw120r_sound_alias = [];\n";
         for (const auto &[name, looping] : soundAliases)
             gsc += "    level.mw120r_sounds[\"" + name + "\"] = " + (looping ? "2" : "1") + ";\n";
+        if (options.style == MapStyle::iw8)
+            for (const auto &sound : kIw8StyleSounds)
+            {
+                gsc += "    level.mw120r_sounds[\"" + std::string(sound.iw3) + "\"] = " +
+                       (sound.looping ? "2" : "1") + ";\n";
+                gsc += "    level.mw120r_sound_alias[\"" + std::string(sound.iw3) + "\"] = \"" +
+                       sound.stock + "\";\n";
+            }
         gsc += "}\n";
         // iw3compat_model_parts(): each skinned entity model's bones with
         // geometry and their bind-pose boxes in model space (LOD0), which the

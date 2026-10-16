@@ -158,16 +158,25 @@ iw3compat_sound_kind( alias )
     return level.mw120r_sounds[alias];
 }
 
+// --style iw8 plays Replay's own alias for an IW3 sound role (generated
+// level.mw120r_sound_alias); otherwise the converted IW3 alias.
+iw3compat_sound_name( alias )
+{
+    if ( isdefined( level.mw120r_sound_alias ) && isdefined( level.mw120r_sound_alias[alias] ) )
+        return level.mw120r_sound_alias[alias];
+    return alias;
+}
+
 iw3compat_playsound( alias, unused1, unused2 )
 {
     if ( iw3compat_sound_kind( alias ) == 1 )
-        self playsound( alias );
+        self playsound( iw3compat_sound_name( alias ) );
 }
 
 iw3compat_playloopsound( alias, unused1 )
 {
     if ( iw3compat_sound_kind( alias ) == 2 )
-        self playloopsound( alias );
+        self playloopsound( iw3compat_sound_name( alias ) );
 }
 
 iw3compat_stoploopsound( unused1 )
@@ -178,7 +187,7 @@ iw3compat_stoploopsound( unused1 )
 iw3compat_playsoundatpos( origin, alias )
 {
     if ( isdefined( origin ) && iw3compat_sound_kind( alias ) == 1 )
-        playsoundatpos( origin, alias );
+        playsoundatpos( origin, iw3compat_sound_name( alias ) );
 }
 
 iw3compat_playsoundinspace( alias, origin, unused1 )
@@ -371,7 +380,7 @@ iw3compat_soundfx( alias, origin, endonnotify )
     if ( iw3compat_sound_kind( alias ) != 2 )
         return;
     org = spawn( "script_origin", origin );
-    org playloopsound( alias );
+    org playloopsound( iw3compat_sound_name( alias ) );
     if ( isdefined( endonnotify ) )
         org thread iw3compat_soundfx_delete( endonnotify );
 }
@@ -448,7 +457,7 @@ iw3compat_play_sound_on_tag( alias, tag )
         org.angles = self.angles;
         org linkto( self );
     }
-    org playsound( alias );
+    org playsound( iw3compat_sound_name( alias ) );
     wait 5;
     org delete();
 }
@@ -527,7 +536,7 @@ iw3compat_createfx_play()
         if ( iw3compat_sound_kind( alias ) != 2 )
             return;
         self.looper = spawn( "script_origin", origin );
-        self.looper playloopsound( alias );
+        self.looper playloopsound( iw3compat_sound_name( alias ) );
         return;
     }
     if ( !isdefined( self.v["fxid"] ) || !isdefined( level._effect ) || !isdefined( level._effect[self.v["fxid"]] ) )
@@ -540,7 +549,7 @@ iw3compat_createfx_play()
          iw3compat_sound_kind( self.v["soundalias"] ) == 2 )
     {
         self.sound = spawn( "script_origin", origin );
-        self.sound playloopsound( self.v["soundalias"] );
+        self.sound playloopsound( iw3compat_sound_name( self.v["soundalias"] ) );
     }
     if ( type == "oneshotfx" )
     {
