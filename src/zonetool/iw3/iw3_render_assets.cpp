@@ -2393,6 +2393,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         ApplyStaticModelTechniqueLayout(techset);
     std::string pixelSource =
         "#define MAP_SOURCE_SUN_MASK 1\n#define MAP_SOURCE_CHANNELS 1\n" + glassEnvironment;
+    if (const char *diag = std::getenv("IW8_ZONETOOL_DIAG_NO_PROBES"); diag && *diag == '1')
+        pixelSource += "#define MAP_DIAG_NO_PROBES 1\n";
     if (model)
         pixelSource += "#define STATIC_MODEL 1\n";
     if (staticModel && instanceLighting)

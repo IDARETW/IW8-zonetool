@@ -881,6 +881,10 @@ float4 main(Input input) : SV_TARGET0 {
         float3 reflected = reflect(-view, shadingNormal);
         float gate = saturate(gloss * replayLighting[186].x + replayLighting[186].y);
         float3 environment = indirect;
+#ifdef MAP_DIAG_NO_PROBES
+        // Diagnostic build (IW8_ZONETOOL_DIAG_NO_PROBES): no probe images.
+        gate = 1;
+#endif
         if (gate < 1) {
             float luminance = dot(indirect, float3(.2126, .7152, .0722));
 #if defined(STATIC_MODEL) && defined(MAP_INSTANCE_LIGHTING)
@@ -1035,8 +1039,9 @@ float4 main(Input input) : SV_TARGET0 {
     // Multiply layers scale what is behind them by their colour; fog fades
     // them to neutral. Additive layers add light that fog fades out (IW3
     // fogged additive techniques toward black).
+    // IW3 ps_mul: lerp(1, texture * vertex colour, vertex alpha).
     if ((flags & 512) != 0)
-        return float4(lerp(1, texel.rgb, fogFactor), 1);
+        return float4(lerp(1, texel.rgb, input.color.a * fogFactor), 1);
     // IW3's additive pixel shaders (vertcol_simple_add, zfeather_add_nf) output
     // colour * texture alpha * vertex alpha (texel carries both): god-ray cards
     // fade along their length through vertex alpha, and drew as uniform

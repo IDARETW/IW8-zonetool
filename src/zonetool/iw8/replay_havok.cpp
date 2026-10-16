@@ -1549,7 +1549,15 @@ std::vector<std::uint8_t> BuildShapeList(ReplayHavok &havok, const std::vector<H
                                                   center[2] / 32.0f,
                                                   1};
             std::memcpy(instance, transform.data(), sizeof(transform));
-            Write(instance + 12, std::uint32_t{0x3F000040});
+            // hknpShapeInstance flags live in the low bits of column 0's w
+            // (0x3F000040 = 0.5 + flags). Shipped instances with a translation
+            // carry 0x2 (0x3F000042, 14 of 14 in mp_hideout). Without it the
+            // simulation's contact path placed every brush hull at the world
+            // origin while queries used the full transform: ragdolls, dropped
+            // weapons and clutter fell through brush floors and walls, terrain
+            // (triangles, no instance) held (owner test 2026-10-16).
+            const bool translated = center[0] != 0.0f || center[1] != 0.0f || center[2] != 0.0f;
+            Write(instance + 12, std::uint32_t{translated ? 0x3F000042u : 0x3F000040u});
             const std::array<float, 4> scale{1, 1, 1, 1};
             std::memcpy(instance + 64, scale.data(), sizeof(scale));
             Write(instance + 80, reinterpret_cast<std::uintptr_t>(shape));
@@ -1698,6 +1706,25 @@ std::vector<std::uint8_t> BuildShapeList(ReplayHavok &havok, const std::vector<H
             Read<std::uint32_t>(reinterpret_cast<void *>(restored + countOffset)) !=
                 shapeCounts[groupIndex])
             throw std::runtime_error("Native collision round trip lost child shapes");
+        {
+            // Simulation pairs bodies through the broadphase by the root
+            // shape's own AABB; queries walk the shape directly. Report it.
+            auto *identity = static_cast<float *>(havok.Allocate(64));
+            const std::array<float, 16> unit{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            std::memcpy(identity, unit.data(), sizeof(unit));
+            const auto rootVtable = Read<std::uintptr_t>(reinterpret_cast<void *>(restored));
+            const auto rootAabb = Read<std::uintptr_t>(reinterpret_cast<void *>(rootVtable + 32));
+            havok.Function<void(void *, void *, void *)>(rootAabb - havok.Base())(
+                reinterpret_cast<void *>(restored), identity, queryBounds);
+            const auto *aabb = static_cast<const float *>(queryBounds);
+            zt::info("collision: shape list %zu root AABB %.1f %.1f %.1f .. %.1f %.1f %.1f "
+                     "(expected %.1f %.1f %.1f .. %.1f %.1f %.1f, game units)",
+                     groupIndex, aabb[0] * 32, aabb[1] * 32, aabb[2] * 32, aabb[4] * 32,
+                     aabb[5] * 32, aabb[6] * 32, bounds[groupIndex * 2][0] * 32,
+                     bounds[groupIndex * 2][1] * 32, bounds[groupIndex * 2][2] * 32,
+                     bounds[groupIndex * 2 + 1][0] * 32, bounds[groupIndex * 2 + 1][1] * 32,
+                     bounds[groupIndex * 2 + 1][2] * 32);
+        }
         const auto restoredChildren =
             Read<std::uintptr_t>(reinterpret_cast<void *>(restored + childrenOffset));
         const auto originalChildren = Read<std::uintptr_t>(
