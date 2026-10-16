@@ -1753,6 +1753,22 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     lighting[57][0] = impl.sunColor.x;
     lighting[57][1] = impl.sunColor.y;
     lighting[57][2] = impl.sunColor.z;
+    // Diagnostic: SIM_LIGHTING="row.component=value;..." overrides cb7 rows
+    // (e.g. "56.3=0" turns the sun off) to bisect a shading problem.
+    if (const char *overrides = std::getenv("SIM_LIGHTING"); overrides && *overrides)
+    {
+        const char *cursor = overrides;
+        int row = 0, component = 0, consumed = 0;
+        float value = 0;
+        while (std::sscanf(cursor, "%d.%d=%f%n", &row, &component, &value, &consumed) == 3)
+        {
+            if (row >= 0 && row < int(std::size(lighting)) && component >= 0 && component < 4)
+                lighting[row][component] = value;
+            cursor += consumed;
+            while (*cursor == ';' || *cursor == ' ')
+                ++cursor;
+        }
+    }
     impl.Update(impl.cbLighting.Get(), lighting, sizeof(lighting));
 
     const bool idPass = options.view != View::exact;

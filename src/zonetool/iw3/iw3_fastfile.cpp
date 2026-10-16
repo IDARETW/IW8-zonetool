@@ -2821,8 +2821,14 @@ unsigned ReflectionProbeTag(const std::size_t sourceProbe, const std::size_t sou
     return sourceProbeCount > 1 ? static_cast<unsigned>(sourceProbe) : 1u;
 }
 
-Vec2 EncodedLightmap(const Vertex &vertex, const Surface &surface, const MaterialPlan &material,
-                     const RenderPlan &plan, const bool nativeWorld)
+// Atlas surfaces pack the lightmap UV as fractions of the tile and flag words
+// (word + 0.25 + uv * 0.25). Computed in double: the flag word reaches 2^19
+// (polygon-offset level in bits 18-19), where a float keeps only 1/16 and the
+// lightmap V of offset decals snapped onto black padding rows (Nuketown's
+// trailer lettering drew black, owner test 2026-10-16).
+std::array<double, 2> EncodedLightmap(const Vertex &vertex, const Surface &surface,
+                                      const MaterialPlan &material, const RenderPlan &plan,
+                                      const bool nativeWorld)
 {
     float x = 0, y = 0;
     if (surface.lightmap >= 0 && static_cast<std::size_t>(surface.lightmap) >= plan.lightmaps.size())
@@ -2855,8 +2861,8 @@ Vec2 EncodedLightmap(const Vertex &vertex, const Surface &surface, const Materia
     const unsigned kind = material.kind == SurfaceKind::cutout  ? 3u
                           : material.kind == SurfaceKind::glass ? 2u
                                                                 : 0u;
-    return {static_cast<float>(material.tile) + 0.25f + x * 0.25f,
-            static_cast<float>(kind + material.flags + (baked ? 4u : 0u)) + 0.25f + y * 0.25f};
+    return {static_cast<double>(material.tile) + 0.25 + x * 0.25,
+            static_cast<double>(kind + material.flags + (baked ? 4u : 0u)) + 0.25 + y * 0.25};
 }
 
 using EntityFields = std::unordered_map<std::string, std::string>;
@@ -4737,7 +4743,7 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                                 "IW3 surface references an invalid reflection probe");
                         addProbePoint(surface.reflectionProbe, vertex.position);
                         const std::uint32_t index = static_cast<std::uint32_t>(targetVertices++);
-                        const Vec2 lightmap =
+                        const auto lightmap =
                             EncodedLightmap(vertex, surface, material, plan, nativeWorld);
                         // The tile word carries the surface's IW3 reflection probe
                         // as converted slot + 1 above bit 16 (the shader reflects
@@ -4748,7 +4754,7 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                         {
                             if (material.tile >= 0x10000)
                                 throw std::runtime_error("IW3 atlas tile exceeds the 16-bit tile word");
-                            encoded[0] = static_cast<double>(lightmap[0]) +
+                            encoded[0] = lightmap[0] +
                                          65536.0 * ReflectionProbeTag(surface.reflectionProbe,
                                                                       geometryProbeBounds.size());
                         }
