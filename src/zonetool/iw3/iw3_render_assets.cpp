@@ -1831,7 +1831,15 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
     // by sort order alone, without polygon offset. Replay's depth prepass and
     // reversed depth make such layers z-fight unless they are biased.
     material.sortKey = source.value("sortKey", 4u);
-    if (material.sortKey >= 9 && material.sortKey <= 23)
+    // Every layered material (any sort above opaque, 8) takes the same
+    // hardware bias: its slope term varies per triangle and with the view, so
+    // biasing only decal sorts let an opaque decal-sort base (Discovery's
+    // dsc_ter_ice_icicle_wall, sort 12) out-pull the blended layer drawn on
+    // the same triangles (mtl_p_dec_ice_cliffs, sort 43) on steep triangles,
+    // and the reflective layer came and went in triangle patches as the
+    // camera turned (owner test, map simulator 2026-10-16). With equal bias
+    // on stacked layers the rank nudge below alone orders them, as IW3's sort.
+    if (material.sortKey >= 9)
         material.depthBias = true;
     // Layer rank (flags bits 12-17) = IW3 sort - 8. The vertex shaders pull a
     // ranked surface toward the camera by rank * 1.2e-5 of its distance, which

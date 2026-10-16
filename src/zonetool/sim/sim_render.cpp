@@ -2010,7 +2010,15 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
                 size_t last = first;
                 while (last < items.size() && (prepass || group(items[last]) == group(items[first])))
                     ++last;
-                std::reverse(items.begin() + first, items.begin() + last);
+                // World surfaces keep their fixed surface order (the engine draws
+                // the BSP ranges in it); only model draws of the group, whose
+                // order the engine may vary, are reversed in their own slots.
+                std::vector<size_t> slots;
+                for (size_t i = first; i < last; ++i)
+                    if (items[i].model)
+                        slots.push_back(i);
+                for (size_t a = 0, b = slots.size(); a + 1 < b; ++a, --b)
+                    std::swap(items[slots[a]], items[slots[b - 1]]);
                 first = last;
             }
         int boundIndexBuffer = -1;
