@@ -2058,6 +2058,10 @@ PhysicsAsset BakePhysicsAsset(std::string name, const PhysicsMesh &source,
     Write(body + 0x14, std::uint16_t{0});
     Write(body + 0x16, std::uint8_t{0});
     Write(body + 0x88, std::uint16_t{0});
+    // bodyCinfo position (+0x30) is a point: every shipped body (400 of 400
+    // sampled, all motion types) stores w = 1. The constructor leaves 0, and
+    // converted clutter (Nuketown's tires) fell through the world once shot.
+    Write(body + 0x3C, 1.0f);
     if (serializedBodyPolicy)
     {
         // Shipped static-model, script-model and glass assets retain the body
