@@ -12,6 +12,7 @@
 #include "../iw8/replay_sunshadow.h"
 #include "iw3_vision.h"
 #include "../iw8/replay_vfx.h"
+#include "../iw8/replay_xanim.h"
 
 #include <array>
 #include <cstdint>
@@ -219,6 +220,8 @@ struct PreparedMap
     std::filesystem::path scratch;
     std::vector<PreparedXModel> xmodels;
     std::vector<PreparedRawFile> rawFiles;
+    // IW3 animations the converted scripts play (vehicle destroy anims).
+    std::vector<iw8::xanim::Anim> xanims;
     std::vector<PreparedFx> fxEffects;
     std::unordered_map<std::string, std::string> fxMaterialAliases;
     std::vector<iw8::vfx::Effect> vfxEffects;

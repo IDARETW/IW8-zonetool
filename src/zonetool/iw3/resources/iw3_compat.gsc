@@ -810,9 +810,29 @@ iw3compat_vehicle_explode()
     if ( isdefined( self.mw120r_destroyed_model ) )
         self setmodel( self.mw120r_destroyed_model );
 
+    // IW3 _destructible: the explode state plays the type's destroy anim
+    // (setanimknob %vehicle_80s_sedan1_destroy, converted XAnimParts) and
+    // explodeAnim()'s hop on the destroyed model.
+    if ( isdefined( level.mw120r_destroyanim ) && isdefined( self.destructible_type ) &&
+         isdefined( level.mw120r_destroyanim[self.destructible_type] ) )
+        self scriptmodelplayanim( level.mw120r_destroyanim[self.destructible_type] );
+    self thread iw3compat_vehicle_explode_hop();
+
     // IW3's own explosion carries its fire; the stock stand-in needs a burn.
     if ( iw3compat_slot_stock( "veh_explosion" ) )
         self thread iw3compat_vehicle_burn( 15 );
+}
+
+// IW3 _destructible explodeAnim(): the wreck jumps 16 units and pitches 10
+// degrees over 0.3 s, then settles back.
+iw3compat_vehicle_explode_hop()
+{
+    self endon( "death" );
+    self movez( 16, 0.3, 0, 0.2 );
+    self rotatepitch( 10, 0.3, 0, 0.2 );
+    wait 0.3;
+    self movez( -16, 0.3, 0.15, 0 );
+    self rotatepitch( -10, 0.3, 0.15, 0 );
 }
 
 // The stock wreck fire (vfx_veh_fire_linger_med) burns 15-130 s per play on a

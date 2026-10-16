@@ -384,7 +384,8 @@ std::filesystem::path MakeScratchDirectory(const std::filesystem::path &scratchR
 void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &options,
                  const std::filesystem::path &output,
                  const std::filesystem::path &sourceFastfile = {},
-                 const bool supplementalAssets = false, const bool skeletons = false)
+                 const bool supplementalAssets = false, const bool skeletons = false,
+                 const std::string &xanims = {})
 {
     std::vector<std::wstring> arguments{unlinker.wstring(),
                                         L"--no-color",
@@ -394,7 +395,14 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
                                         skeletons ? L"XMODEL_EXPORT" : L"OBJ",
                                         L"-o",
                                         output.wstring()};
-    if (skeletons)
+    if (!xanims.empty())
+    {
+        // Raw XAnimParts streams (ReplayMapDumpers XAnim), limited to the
+        // comma-separated names in IW3_REPLAY_XANIMS.
+        arguments.push_back(L"--include-assets");
+        arguments.push_back(L"xanim");
+    }
+    else if (skeletons)
     {
         // XMODEL_EXPORT keeps the bind skeleton and each vertex's bone, which
         // the OBJ extraction drops.
@@ -444,7 +452,7 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
     const auto loadFastfile =
         inputFastfile.parent_path() / (inputFastfile.stem().wstring() + L"_load.ff");
     std::error_code error;
-    if (!supplementalAssets && !skeletons &&
+    if (!supplementalAssets && !skeletons && xanims.empty() &&
         std::filesystem::is_regular_file(loadFastfile, error))
     {
         arguments.push_back(std::filesystem::absolute(loadFastfile).wstring());
@@ -460,7 +468,8 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
         commandLine += Quote(argument);
     }
 
-    const auto logPath = output / (skeletons            ? "unlinker-skeleton.log"
+    const auto logPath = output / (!xanims.empty()      ? "unlinker-xanim.log"
+                                   : skeletons          ? "unlinker-skeleton.log"
                                    : supplementalAssets ? "unlinker-supplemental.log"
                                                         : "unlinker.log");
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, TRUE};
@@ -478,16 +487,22 @@ void RunUnlinker(const std::filesystem::path &unlinker, const ImportOptions &opt
     startup.hStdError = log;
     startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
     PROCESS_INFORMATION process{};
+    // The child inherits this environment: name the anims to dump, and clear
+    // the filter for every other run.
+    SetEnvironmentVariableW(L"IW3_REPLAY_XANIMS",
+                            xanims.empty() ? nullptr
+                                           : std::wstring(xanims.begin(), xanims.end()).c_str());
     const BOOL started =
         CreateProcessW(unlinker.c_str(), commandLine.data(), nullptr, nullptr, TRUE,
                        CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    SetEnvironmentVariableW(L"IW3_REPLAY_XANIMS", nullptr);
     CloseHandle(log);
     if (!started)
     {
         throw std::runtime_error("cannot start OpenAssetTools Unlinker");
     }
 
-    const DWORD timeoutMinutes = supplementalAssets || skeletons ? 30u : 10u;
+    const DWORD timeoutMinutes = supplementalAssets || skeletons || !xanims.empty() ? 30u : 10u;
     const DWORD wait = WaitForSingleObject(process.hProcess, timeoutMinutes * 60u * 1000u);
     DWORD exitCode = 1;
     if (wait == WAIT_TIMEOUT)
@@ -1531,6 +1546,9 @@ std::string_view SourceAssetAuditReason(const std::string_view type)
     if (type == "fx")
         return "effects the map never uses (no script, createfx, impact-table, destructible or "
                "child reference) or that an \"FX ... not converted\" line names";
+    if (type == "xanim")
+        return "animations no converted script plays (player, weapon and AI anims; only "
+               "destructible vehicles' destroy anims are converted, from common_mp)";
     if (type == "sound" || type == "soundcurve" || type == "loadedsound")
         return "only aliases the map uses (scripts, createfx, ambient, destructibles), their "
                "audio and falloff curves go into the map bank";
@@ -7524,6 +7542,7 @@ PreparedMap::PreparedMap(PreparedMap &&other) noexcept
     , scratch(std::move(other.scratch))
     , xmodels(std::move(other.xmodels))
     , rawFiles(std::move(other.rawFiles))
+    , xanims(std::move(other.xanims))
     , fxEffects(std::move(other.fxEffects))
     , fxMaterialAliases(std::move(other.fxMaterialAliases))
     , vfxEffects(std::move(other.vfxEffects))
@@ -7558,6 +7577,7 @@ PreparedMap &PreparedMap::operator=(PreparedMap &&other) noexcept
         scratch = std::move(other.scratch);
         xmodels = std::move(other.xmodels);
         rawFiles = std::move(other.rawFiles);
+        xanims = std::move(other.xanims);
         fxEffects = std::move(other.fxEffects);
         fxMaterialAliases = std::move(other.fxMaterialAliases);
         vfxEffects = std::move(other.vfxEffects);
@@ -8487,10 +8507,62 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             if (name != entity.end() && name->second == "interactive_tv" && model != entity.end())
                 extraModels.insert(model->second + "_d");
         }
+        // IW3 maps\mp\_destructible_types: every vehicle type (sedan, wagon,
+        // hatchbacks, small cars) plays %vehicle_80s_sedan1_destroy with
+        // setanimknob when it explodes. The XAnimParts lives in common_mp.
+        std::map<std::string, std::string> destroyAnims; // destructible_type -> xanim
+        for (const EntityFields &entity : ParseEntityFields(entities))
+        {
+            const auto type = entity.find("destructible_type");
+            if (type == entity.end())
+                continue;
+            for (const char *family : {"vehicle_80s_sedan1", "vehicle_80s_wagon1",
+                                       "vehicle_80s_hatch1", "vehicle_80s_hatch2",
+                                       "vehicle_small_wagon", "vehicle_small_hatch"})
+                if (type->second.find(family) != std::string::npos)
+                    destroyAnims.emplace(type->second, "vehicle_80s_sedan1_destroy");
+        }
+        {
+            std::set<std::string> needed;
+            for (const auto &[type, anim] : destroyAnims)
+                needed.insert(anim);
+            const auto dumped = [&](const std::string &anim) {
+                std::error_code missing;
+                return std::filesystem::is_regular_file(
+                    exportRoot / "xanim" / (anim + ".iw3.json"), missing);
+            };
+            std::string missing;
+            for (const auto &anim : needed)
+                if (!dumped(anim))
+                    missing += (missing.empty() ? "" : ",") + anim;
+            if (!missing.empty())
+            {
+                const auto commonFastfile = FindIw3CommonFastfile(options);
+                if (commonFastfile.empty())
+                    throw std::runtime_error("IW3 vehicle animations need common_mp.ff (" + missing +
+                                             "); pass the IW3 installation with --search-path");
+                zt::info("iw3: extracting xanim(s) %s from %s", missing.c_str(),
+                         commonFastfile.string().c_str());
+                RunUnlinker(unlinker, options, exportRoot, commonFastfile, true, false, missing);
+            }
+            for (const auto &anim : needed)
+            {
+                if (!dumped(anim))
+                    throw std::runtime_error("IW3 xanim was not found in common_mp.ff: " + anim);
+                result.xanims.push_back(
+                    iw8::xanim::LoadIw3(exportRoot / "xanim" / (anim + ".iw3.json")));
+                zt::info("iw3: converted xanim %s (%u frames, %zu bone(s))", anim.c_str(),
+                         unsigned(result.xanims.back().numframes),
+                         result.xanims.back().names.size());
+            }
+        }
         std::string generated = "iw3compat_generated()\n{\n    level.mw120r_models = [];\n"
-                                "    level.mw120r_destroyed = [];\n";
+                                "    level.mw120r_destroyed = [];\n"
+                                "    level.mw120r_destroyanim = [];\n";
         for (const auto &[type, model] : destroyedModels)
             generated += "    level.mw120r_destroyed[\"" + type + "\"] = \"" + model + "\";\n";
+        for (const auto &[type, anim] : destroyAnims)
+            generated += "    level.mw120r_destroyanim[\"" + type + "\"] = \"" + anim + "\";\n";
         for (const auto &model : extraModels)
         {
             std::error_code missing;

@@ -19,6 +19,7 @@
 #include "iw8/replay_havok.h"
 #include "iw8/replay_heightfield.h"
 #include "iw8/replay_locallights.h"
+#include "iw8/replay_xanim.h"
 #include "iw8/replay_impact.h"
 #include "iw8/replay_navigation.h"
 #include "iw8/replay_rawfile.h"
@@ -1219,6 +1220,8 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
                                                   prepared->gradingClutPixels);
             for (const auto &rawFile : prepared->rawFiles)
                 iw8::rawfile::Register(writer, rawFile.name, rawFile.data);
+            for (const auto &anim : prepared->xanims)
+                iw8::xanim::Register(writer, anim);
             if (prepared->soundBank)
                 iw8::sound::RegisterBank(writer, *prepared->soundBank);
             for (const auto &model : prepared->xmodels)
@@ -1263,7 +1266,14 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         std::optional<iw8::heightfield::Data> heightfield;
         if (!renderMesh.solidTriangles.empty())
         {
-            heightfield = iw8::heightfield::Build(renderMesh.solidTriangles, renderMesh.sceneBounds);
+            // Opaque world triangles plus every sun-shadow caster, which adds the
+            // static models (shipped heightmaps include model-built structures).
+            std::vector<float> solid = renderMesh.solidTriangles;
+            if (prepared)
+                for (const auto &surface : prepared->shadowScene.surfaces)
+                    for (const auto &vertex : surface.vertices)
+                        solid.insert(solid.end(), vertex.position.begin(), vertex.position.end());
+            heightfield = iw8::heightfield::Build(solid, renderMesh.sceneBounds);
             iw8::heightfield::Register(writer, *heightfield);
             info("heightfield: %ux%u over %zu triangles", heightfield->size, heightfield->size,
                  renderMesh.solidTriangles.size() / 9);
@@ -1422,6 +1432,11 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
                     effects.insert(effect);
             levelStrings[0].assign(models.begin(), models.end());  // "mdl"
             levelStrings[6].assign(effects.begin(), effects.end()); // "vfx"
+            // Script-played animations (scriptmodelplayanim) resolve through
+            // the level "anm" table, like script models through "mdl".
+            if (prepared)
+                for (const auto &anim : prepared->xanims)
+                    levelStrings[16].push_back(anim.name); // "anm"
             info("assets: level NetConstStrings: %zu model(s), %zu effect(s)", models.size(),
                  effects.size());
         }
