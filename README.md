@@ -184,46 +184,40 @@ from `--acts`, `--game` and `--oodle`, or `IW8_SIM_ACTS`, `IW8_SIM_GAME` and `IW
 
 ## Asset Conversion Support
 
+One row per IW3 asset type a multiplayer map carries, in conversion order. Every row applies to both
+`--style iw3` and `--style iw8`; the **Style** column says whether the two styles differ. Gameplay data
+(collision, entities, models, animations, ladders) is identical in both; the look and sound follow the style.
+
 Legend:
 - ✔️ Supported
-- ⚠️ Partially supported
+- ⚠️ Partially supported (approximated, or part of the type is missing)
 - ❌ Not supported
+- ➖ Not needed (no IW3 data, or IW8 does not use it)
 
-| **Asset type** | **IW3 → IW8** | **Notes** |
-|----------------|:-------------:|-----------|
-| GfxWorld | ✔️ | Geometry, lightmaps, light grid, reflection probes, sun and shadows, sky, visibility, static model placements, fog |
-| clipMap_t | ✔️ | Havok collision with surface types, brush models, triggers, ladders, stair ramps |
-| ComWorld | ✔️ | Sun and primary lights |
-| GameWorldMp | ✔️ | Including breakable glass |
-| MapEnts | ✔️ | Spawns, game mode objectives, script entities, triggers |
-| XModel | ✔️ | All LODs, cull distances, skeletons, dynamic and destructible models, model collision |
-| Material | ✔️ | Rebuilt on IW8 shaders |
-| GfxImage | ✔️ | Recompressed for IW8 |
-| FxImpactTable | ✔️ | |
-| FxEffectDef | ⚠️ | Effects the map uses. Trail, spot light and sound elements are not supported |
-| snd_alias_list_t | ⚠️ | Aliases the map uses, built into the map's sound bank |
-| SndCurve | ⚠️ | Falloff curves of converted aliases |
-| LoadedSound | ⚠️ | Audio of converted aliases |
-| PhysPreset | ⚠️ | Presets used by dynamic models |
-| GfxLightDef | ⚠️ | `light_point_linear` only |
-| RawFile | ⚠️ | Map GSC (including createfx and createart) is translated to IW8 and compiled; other map raw files are embedded |
-| MaterialTechniqueSet | ❌ | Replaced by generated IW8 shaders |
-| XAnimParts | ❌ | Animated models stay in their resting pose |
-| XModelPieces | ❌ | |
-| WeaponDef | ❌ | |
-| MenuList | ❌ | |
-| menuDef_t | ❌ | |
-| Font_s | ❌ | |
-| LocalizeEntry | ❌ | |
-| StringTable | ❌ | |
-| SndDriverGlobals | ❌ | |
-| XModelAlias | ❌ | |
-| AiType | ❌ | |
-| Character | ❌ | |
-| MpType | ❌ | |
-| uiMap | ❌ | |
-| GameWorldSp | ❌ | Multiplayer maps only |
-| clipMap_t (single-player) | ❌ | Multiplayer maps only |
+| # | **Asset type** | **IW8 target** | **IW3 → IW8** | **Style** | **Notes** |
+|---|----------------|----------------|:-------------:|-----------|-----------|
+| 1 | clipMap_t | col_map, Havok, MapEnts shape lists | ⚠️ | Identical | Brush hulls, terrain mesh, brush models, surface types and contents, glass, stair ramps, ladders, dynamic entities. Ladder rungs are rebuilt every 12 units (IW8's climb step); hand height on the rungs is not calibrated yet |
+| 2 | PhysPreset | PhysicsAsset | ✔️ | Identical | Mass, friction and bounce for each clutter model |
+| 3 | ComWorld | com_map | ⚠️ | Identical | Sun and primary lights with stock shadow defaults. The brightness scale of spot and omni lights is not final |
+| 4 | GfxWorld | gfx_map | ⚠️ | Differs | Geometry, lightmap, reflection probes, cells, portals and Umbra visibility, sky, static models, brush models, sun and baked sun shadow, heightfield. Spot and omni lights do not light the scene or cast shadows at runtime yet. Light grid is approximated from IW3 grid colours |
+| 5 | MapEnts | map_ents | ✔️ | Identical | Spawns, game mode objectives, script entities, triggers, glass prefabs, createfx one-shot effects |
+| 6 | XModel | xmodel, xmodelsurfs | ✔️ | Identical | All LODs, skeletons, car parts, model physics, script models |
+| 7 | XAnimParts | xanim | ⚠️ | Identical | Prop animations the map scripts play (such as the vehicle destroy animation). Root-motion (delta) animations are not supported |
+| 8 | Material | material | ⚠️ | Differs | Blend, layers, polygon offset, falloff, additive, multiply and model detail maps follow IW3's shader math. The world detail map is not applied and flag cloth does not wave |
+| 9 | MaterialTechniqueSet | techset | ⚠️ | Differs | Regenerated IW8 shaders (IW3 shaders cannot be ported) |
+| 10 | GfxImage | image | ⚠️ | Identical | Recompressed for IW8. World textures share one 8192 × 8192 BC7 atlas, which lowers their resolution |
+| 11 | GfxLightDef | lightdef | ✔️ | Identical | `light_point_linear`, matching the stock definition |
+| 12 | FxEffectDef | ParticleSystem | ⚠️ | Differs | Effects the map uses. No soft particles; view-angle falloff, eye offset and spot-lit smoke sprites are simplified. With `--style iw8` a stock IW8 effect replaces each IW3 effect that has one with the same role |
+| 13 | FxImpactTable | impactfx | ✔️ | Differs | `--style iw3` maps IW3's impact rows onto IW8's impact types by calibre; `--style iw8` keeps IW8's own surface impacts |
+| 14 | snd_alias_list_t | sound bank aliases | ⚠️ | Differs | Only the aliases the map uses. With `--style iw8`, vehicle and glass sounds use IW8's always-loaded aliases |
+| 15 | LoadedSound | sound bank audio | ⚠️ | Differs | Audio of the converted aliases, in a resident bank |
+| 16 | SndCurve | sound bank curves | ⚠️ | Differs | Falloff curves of the converted aliases, not yet verified against IW8's curve model |
+| 17 | RawFile | GSC, vision, sun, arena | ⚠️ | Differs | Map GSC (including createfx and createart) is translated to IW8 and compiled; some builtins are dropped. Vision becomes fog and colour grading. Sun file becomes the sun flare. The load zone has a preview only |
+| 18 | GameWorldMp | none | ➖ | n/a | Multiplayer only carries the name; bot navigation is generated from collision |
+
+Out of scope (not part of what is seen or heard in a map): MenuList, menuDef_t, LocalizeEntry, Font_s,
+StringTable, WeaponDef, XModelPieces, XModelAlias, SndDriverGlobals, AiType, Character, MpType, uiMap.
+Single-player maps (GameWorldSp, single-player clipMap_t) are not supported.
 
 Generated for every map (no IW3 equivalent):
 
@@ -246,8 +240,9 @@ Generated for every map (no IW3 equivalent):
 ## Known Issues
 
 * Only multiplayer maps can be converted.
-* With `--style iw3`, bullet holes do not appear on surfaces.
-* Animated props (swinging lamps, flags) do not move.
+* Spot and omni lights only show their baked lighting: they add no runtime light and cast no shadows.
+* Flags do not wave.
+* Ladder hand placement on the rungs is slightly off.
 
 ## More
 
