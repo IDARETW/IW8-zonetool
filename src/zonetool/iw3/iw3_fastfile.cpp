@@ -2418,6 +2418,149 @@ void AddLadderMidpointRungs(Surface &surface, const std::size_t lodIndex)
         }
 }
 
+// Replay climbs ladders in 12-unit rungs (BG_GetLadderInfo, climb animation).
+// IW3 ladder models authored with another rung spacing (Discovery's
+// p_rus_ladder_metal: 16) get their rung bars rebuilt every 12 units, from the
+// lowest to the highest authored rung, so the stock climb meets the rungs
+// without changing the game. Rung bars are the thin horizontal triangles (under
+// 4 units tall, 12+ units across); one complete authored bar is the template.
+// com_ladder_wood keeps its exact midpoint-rung treatment (AddLadderMidpointRungs).
+void RespaceLadderRungs(SourceStaticModels &models)
+{
+    constexpr float kRungSpacing = 12.0f;
+    for (SourceStaticModel &model : models.models)
+    {
+        std::string name = model.name;
+        std::ranges::transform(name, name.begin(), [](const unsigned char letter) {
+            return static_cast<char>(std::tolower(letter));
+        });
+        if (name.find("ladder") == std::string::npos || name == "com_ladder_wood")
+            continue;
+        for (std::size_t lodIndex = 0; lodIndex < model.lods.size(); ++lodIndex)
+        {
+            auto &surfaces = model.lods[lodIndex].surfaces;
+            struct RungTriangle
+            {
+                std::size_t surface, first;
+                float center;
+            };
+            std::vector<RungTriangle> rungTriangles;
+            for (std::size_t s = 0; s < surfaces.size(); ++s)
+            {
+                const Surface &surface = surfaces[s];
+                for (std::size_t first = 0; first + 2 < surface.indices.size(); first += 3)
+                {
+                    const Vec3 &a = surface.vertices.at(surface.indices[first]).position;
+                    const Vec3 &b = surface.vertices.at(surface.indices[first + 1]).position;
+                    const Vec3 &c = surface.vertices.at(surface.indices[first + 2]).position;
+                    const float low = (std::min)({a[2], b[2], c[2]});
+                    const float high = (std::max)({a[2], b[2], c[2]});
+                    const auto broad = [](const Vec3 &p, const Vec3 &q) {
+                        const float dx = p[0] - q[0], dy = p[1] - q[1];
+                        return dx * dx + dy * dy;
+                    };
+                    if (high - low > 4.0f || (std::max)({broad(a, b), broad(b, c), broad(c, a)}) < 144.0f)
+                        continue;
+                    rungTriangles.push_back({s, first, (a[2] + b[2] + c[2]) / 3.0f});
+                }
+            }
+            if (rungTriangles.size() < 6)
+                continue;
+            std::ranges::sort(rungTriangles, {}, &RungTriangle::center);
+            // Rungs: groups of triangles whose centres lie within 2 units.
+            std::vector<std::vector<const RungTriangle *>> rungs;
+            for (const RungTriangle &triangle : rungTriangles)
+            {
+                if (rungs.empty() || triangle.center - rungs.back().back()->center > 2.0f)
+                    rungs.emplace_back();
+                rungs.back().push_back(&triangle);
+            }
+            if (rungs.size() < 3)
+                continue;
+            const auto rungCenter = [](const std::vector<const RungTriangle *> &rung) {
+                float sum = 0.0f;
+                for (const RungTriangle *triangle : rung)
+                    sum += triangle->center;
+                return sum / static_cast<float>(rung.size());
+            };
+            std::map<int, unsigned> gaps;
+            for (std::size_t r = 1; r < rungs.size(); ++r)
+                ++gaps[static_cast<int>(std::lround((rungCenter(rungs[r]) - rungCenter(rungs[r - 1])) * 2.0f))];
+            const auto common = std::ranges::max_element(gaps, {}, [](const auto &e) { return e.second; });
+            const float spacing = common->first * 0.5f;
+            if (common->second < 2 || std::abs(spacing - kRungSpacing) < 0.5f)
+                continue;
+            // Template: a complete bar (the most common triangle count), nearest
+            // the middle of the ladder.
+            std::map<std::size_t, unsigned> counts;
+            for (const auto &rung : rungs)
+                ++counts[rung.size()];
+            const std::size_t complete =
+                std::ranges::max_element(counts, {}, [](const auto &e) { return e.second; })->first;
+            const std::vector<const RungTriangle *> *templateRung = nullptr;
+            const std::size_t middle = rungs.size() / 2;
+            for (std::size_t distance = 0; distance <= middle && !templateRung; ++distance)
+                for (const std::size_t index : {middle + distance, middle - distance})
+                    if (index < rungs.size() && rungs[index].size() == complete)
+                    {
+                        templateRung = &rungs[index];
+                        break;
+                    }
+            if (!templateRung)
+                continue;
+            const float templateCenter = rungCenter(*templateRung);
+            const float lowest = rungCenter(rungs.front()), highest = rungCenter(rungs.back());
+            struct Copy
+            {
+                std::size_t surface;
+                std::array<Vertex, 3> vertices;
+            };
+            std::vector<Copy> bar;
+            for (const RungTriangle *triangle : *templateRung)
+            {
+                const Surface &surface = surfaces[triangle->surface];
+                bar.push_back({triangle->surface,
+                               {surface.vertices.at(surface.indices[triangle->first]),
+                                surface.vertices.at(surface.indices[triangle->first + 1]),
+                                surface.vertices.at(surface.indices[triangle->first + 2])}});
+            }
+            // Drop every authored bar, then lay the template every 12 units.
+            std::vector<std::set<std::size_t>> removed(surfaces.size());
+            for (const RungTriangle &triangle : rungTriangles)
+                removed[triangle.surface].insert(triangle.first);
+            for (std::size_t s = 0; s < surfaces.size(); ++s)
+            {
+                if (removed[s].empty())
+                    continue;
+                std::vector<std::uint32_t> kept;
+                for (std::size_t first = 0; first + 2 < surfaces[s].indices.size(); first += 3)
+                    if (!removed[s].contains(first))
+                        kept.insert(kept.end(), surfaces[s].indices.begin() + first,
+                                    surfaces[s].indices.begin() + first + 3);
+                surfaces[s].indices = std::move(kept);
+            }
+            unsigned placed = 0;
+            for (float height = lowest; height <= highest + 0.5f; height += kRungSpacing, ++placed)
+                for (const Copy &copy : bar)
+                {
+                    Surface &surface = surfaces[copy.surface];
+                    const auto first = static_cast<std::uint32_t>(surface.vertices.size());
+                    for (Vertex vertex : copy.vertices)
+                    {
+                        vertex.position[2] += height - templateCenter;
+                        surface.vertices.push_back(std::move(vertex));
+                        if (!surface.vertexBones.empty())
+                            surface.vertexBones.push_back(surface.vertexBones.front());
+                    }
+                    surface.indices.insert(surface.indices.end(), {first, first + 1, first + 2});
+                }
+            zt::info("iw3: ladder %s LOD %zu: %zu rung(s) every %.1f units rebuilt as %u every 12 "
+                     "(%.1f .. %.1f)",
+                     model.name.c_str(), lodIndex, rungs.size(), spacing, placed, lowest, highest);
+        }
+    }
+}
+
 std::array<Vec3, 3> BasisFromQuaternion(const Vec4 &source)
 {
     float lengthSquared = 0.0f;
@@ -8443,6 +8586,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     SourceStaticModels sourceStaticModels;
     std::vector<BrushModel> brushModels =
         ReadBrushModels(world, exportRoot, visibility, sourceStaticModels);
+    RespaceLadderRungs(sourceStaticModels);
     SourceDynamicEntities sourceDynamicEntities = ReadDynamicEntities(collision, exportRoot);
     // IW3 map scripts: translate them first so the entities they drive stay
     // entities, and so destroyed-state models can be converted and precached.

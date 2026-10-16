@@ -319,7 +319,10 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
     const auto &lights = localLights ? *localLights : noLocalLights;
     if (!lights.Empty() && lights.lightCount != primaryLightCount)
         throw std::runtime_error("GfxWorld local-light data does not match the primary lights");
-    const auto umbraTome = replayrender::BuildUmbraTome(mesh, staticModels, lights.umbraLights);
+    // Draw-table probe instances: the authored probes plus one fallback.
+    const auto umbraTome = replayrender::BuildUmbraTome(
+        mesh, staticModels, lights.umbraLights,
+        static_cast<uint32_t>(mesh.reflectionProbes.size() + 1));
     const auto cellCount = static_cast<uint32_t>(mesh.cells.size());
     const auto cellWordCount = (cellCount + 31u) >> 5;
     std::vector<uint8_t> gw(kSizeGfxWorld, 0);

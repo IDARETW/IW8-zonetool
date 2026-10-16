@@ -2599,17 +2599,20 @@ void EmitVertices(ZoneWriter &w, const Mesh &m)
 }
 
 std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticModels,
-                                    const std::vector<uint32_t> &primaryLights)
+                                    const std::vector<uint32_t> &primaryLights,
+                                    const uint32_t reflectionProbeInstances)
 {
     BuildStaticModelLayout(staticModels);
     const uint32_t worldSurfaceCount = m.worldSurfaceCount();
     const uint32_t staticModelCount = static_cast<uint32_t>(staticModels.instances.size());
-    const uint32_t objectCount =
-        worldSurfaceCount + staticModelCount + static_cast<uint32_t>(primaryLights.size());
+    const uint32_t objectCount = worldSurfaceCount + staticModelCount +
+                                 static_cast<uint32_t>(primaryLights.size()) +
+                                 reflectionProbeInstances;
     // Umbra user IDs carry the object class in bits 28-30 (query consumer
     // 0x18CCA80): 0 world surface, 1 static model, 4 primary light (sets the
-    // light's primaryLightVisData bit). Static local lights reach the light
-    // binning (0x186C4F0) only through these query results.
+    // light's primaryLightVisData bit), 5 reflection-probe instance. Static
+    // local lights reach the light binning (0x186C4F0) only through these
+    // query results.
     std::vector<uint32_t> userIDList;
     userIDList.reserve(objectCount);
     for (uint32_t surface = 0; surface < worldSurfaceCount; ++surface)
@@ -2622,6 +2625,10 @@ std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticMod
             throw std::runtime_error("Replay primary light exceeds the Umbra user-ID range");
         userIDList.push_back(0x40000000u + light);
     }
+    // Class 5: reflection-probe instances (reflectionProbeVisData bits);
+    // shipped tomes list them too (mp_hideout: 41).
+    for (uint32_t probe = 0; probe < reflectionProbeInstances; ++probe)
+        userIDList.push_back(0x50000000u + probe);
     if (!objectCount || objectCount > 0x01000000 ||
         uint64_t(worldSurfaceCount) * 56 > m.bounds.size())
         throw std::runtime_error("Replay world surfaces cannot be represented by Umbra object IDs");

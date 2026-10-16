@@ -256,5 +256,6 @@ void EmitReflectionProbes(iw8::ZoneWriter &writer, const Mesh &mesh);
 replaybounds::Bounds StaticModelWorldBounds(const StaticModels &models, size_t instance);
 // primaryLights: static local-light indices registered as Umbra light objects.
 std::vector<uint8_t> BuildUmbraTome(const Mesh &mesh, const StaticModels &staticModels,
-                                    const std::vector<uint32_t> &primaryLights = {});
+                                    const std::vector<uint32_t> &primaryLights = {},
+                                    uint32_t reflectionProbeInstances = 0);
 } // namespace replayrender
