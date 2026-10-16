@@ -1841,6 +1841,12 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
     // and emissive passes of unlit techniques). Unlit additive, screen and
     // multiply techniques (wc_unlit_add, wc_unlit_falloff_add god rays and
     // window hotspots, wc_unlit_multiply stains) carry no _b<n> name tag.
+    // Nor do unlit alpha-blended layers (srcalpha/invsrcalpha, no depth write:
+    // Greenband's koi mural waves, plants and fish). Their depth states carry a
+    // gt0 alpha test, which made them depth-writing cut-outs: a layer sitting
+    // slightly in front then hid the later layers behind it (the koi head under
+    // waves_depthfix, map simulator 2026-10-16). IW3 draws them blended.
+    bool stateBlended = false;
     if (const auto entries = source.find("stateBitsEntry");
         entries != source.end() && entries->is_array())
     {
@@ -1857,6 +1863,8 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
                 continue;
             const std::string src = state.value("srcBlendRgb", std::string("one"));
             const std::string dst = state.value("dstBlendRgb", std::string("zero"));
+            if (src == "srcalpha" && dst == "invsrcalpha" && !state.value("depthWrite", true))
+                stateBlended = true;
             if (dst == "one" && (src == "one" || src == "invdestcolor"))
                 material.blend = 1; // additive; IW3 "screen" adds in Replay's HDR target
             else if (dst == "one" && src == "srcalpha")
@@ -1894,7 +1902,7 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
         material.environment = {parms[2], parms[3], endLevel / beginLevel, 0};
         material.flags |= 1024u;
     }
-    material.kind = blended || material.blend
+    material.kind = blended || stateBlended || material.blend
                         ? SurfaceKind::glass
                         : (authoredAlpha ? SurfaceKind::cutout : SurfaceKind::opaque);
     // A blended layer that is not glass (snow, ice, dirt and grime decals)
@@ -1937,6 +1945,35 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
     if (techset.find("unlit") != std::string::npos)
         material.flags |= 128u;
     return material;
+}
+
+// Replay draws translucent surfaces by material sort key first (GfxDrawSurf
+// primarySortKey is the key's top field); stock GfxWorld's translucent range is
+// sortKeyTransBegin 18 .. sortKeyTransEnd 34, with 24 its distortion key. IW3
+// orders its blended layers by sort (Greenband's koi mural: background 9,
+// waves 10, plants 14, fish 29, scales 30). Giving every converted blended
+// layer one key (26) left their order to the engine's draw order, so layers
+// swapped (map simulator, 2026-10-16). Spread the map's distinct IW3 sorts over
+// the translucent range in IW3 order; a single sort keeps 26.
+std::map<unsigned, std::uint8_t> TranslucentSortKeys(const std::set<unsigned> &iw3Sorts)
+{
+    std::vector<std::uint8_t> slots;
+    for (std::uint8_t key = 18; key <= 34; ++key)
+        if (key != 24)
+            slots.push_back(key);
+    std::map<unsigned, std::uint8_t> keys;
+    if (iw3Sorts.size() == 1)
+    {
+        keys[*iw3Sorts.begin()] = 26;
+        return keys;
+    }
+    std::size_t index = 0;
+    for (const unsigned sort : iw3Sorts)
+    {
+        keys[sort] = slots[index * (slots.size() - 1) / (iw3Sorts.size() - 1)];
+        ++index;
+    }
+    return keys;
 }
 
 bool FoliageName(const std::string &value)
@@ -4382,6 +4419,11 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         }
 
         const std::set<std::string> neededMaterials(needed.begin(), needed.end());
+        std::set<unsigned> glassSorts;
+        for (const SourceMaterial &source : materials)
+            if (neededMaterials.contains(source.name) && source.kind == SurfaceKind::glass)
+                glassSorts.insert(source.sortKey);
+        const auto translucentKeys = TranslucentSortKeys(glassSorts);
         std::map<std::pair<unsigned, unsigned>, std::pair<std::string, std::string>> techsetFiles;
         for (const SourceMaterial &source : materials)
         {
@@ -4430,10 +4472,11 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             direct["source"] = source.name;
             if (source.kind == SurfaceKind::glass)
             {
-                // Shipped Replay model glass is submitted after opaque surfaces.
+                // Shipped Replay model glass is submitted after opaque surfaces,
+                // in the translucent sort range (IW3 layer order kept).
                 auto info = Unhex(direct.at("info").get<std::string>());
                 info[0x10] = 3;
-                info[0x11] = 26;
+                info[0x11] = translucentKeys.at(source.sortKey);
                 direct["info"] = Hex(info);
             }
             direct["techset"] = techsetEntry->second.first;
