@@ -98,6 +98,14 @@ Texture2D<float4> sourceResponseAtlas : register(t3);
 float3 SourceData(float3 value) {
     return lerp(value * 12.92, 1.055 * pow(max(value, 0), 1.0 / 2.4) - .055, step(.0031308, value));
 }
+// Inverse of SourceData (IEC 61966-2-1 decode).
+float3 DecodeSrgb(float3 value) {
+    return lerp(value / 12.92, pow((value + .055) / 1.055, 2.4), step(.04045, value));
+}
+#ifdef MAP_DETAIL
+// IW3 detailMap, material texture slot 0x3E (models only; worlds use it for lightmaps).
+Texture2D<float4> detailMap : register(t10);
+#endif
 float3
 SourceWorldNormal(Input input, uint flags, float2 atlasUV, float lod, out float3 tangentNormal) {
     tangentNormal = float3(0, 0, 1);
@@ -650,6 +658,15 @@ float4 main(Input input) : SV_TARGET0 {
     float lod = 0;
     float2 sampleUV = input.uv.xy;
     float4 texel = sourceAtlas.SampleBias(colorSampler, sampleUV, MAP_MIP_BIAS);
+#ifdef MAP_DETAIL
+    // IW3 detail materials (lp_*r0c0d0*): colour + detail - 0.5 in IW3's gamma
+    // space before the vertex colour, the detail map tiled by detailScale.xy
+    // (disassembled ps_lp_r0c0d0n0_sm3). The detail image is stored UNORM, so
+    // it reads IW3's raw bytes; the colour map is sRGB and is re-encoded here.
+    float3 detail = detailMap.SampleBias(colorSampler, sampleUV * MAP_DETAIL_SCALE, MAP_MIP_BIAS).rgb;
+    float3 gammaColor = SourceData(texel.rgb) + detail - .5;
+    texel.rgb = DecodeSrgb(max(gammaColor, 0));
+#endif
 #else
     float2 cellSize = ATLAS_SIZE.0 / ATLAS_COLUMNS;
     float2 tileOrigin = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize;

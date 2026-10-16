@@ -65,6 +65,9 @@ struct SourceMaterial
     std::string color;
     std::string normal;
     std::string response;
+    // IW3 detailMap and detailScale.xy (lp_*d0* techsets: colour + detail - 0.5).
+    std::string detail;
+    std::array<float, 2> detailScale{1, 1};
     std::array<float, 4> tint{1, 1, 1, 1};
     std::array<float, 4> environment{0.8f, 4.0f, 2.5f, 0.625f};
     SurfaceKind kind{SurfaceKind::opaque};
@@ -1787,12 +1790,28 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
             material.normal = texture.at("image").get<std::string>();
         else if (semantic == "specularMap")
             material.response = texture.at("image").get<std::string>();
+        else if (semantic == "detailMap" ||
+                 texture.value("name", std::string{}) == "detailMap")
+            material.detail = texture.at("image").get<std::string>();
     }
     for (const auto &constant : source.value("constants", Json::array()))
     {
         const std::string key = constant.value("name", std::string{});
         if (key == "colorTint")
             material.tint = Literal<4>(constant.at("literal"), material.tint);
+        else if (key == "detailScale")
+        {
+            // Detail tiling is often far above the colour constants' range.
+            const auto &literal = constant.at("literal");
+            if (literal.is_array() && literal.size() >= 2)
+                for (std::size_t axis = 0; axis < 2; ++axis)
+                {
+                    const float value = literal.at(axis).get<float>();
+                    if (!std::isfinite(value) || value == 0 || std::abs(value) > 4096)
+                        throw std::runtime_error("invalid IW3 detailScale: " + name);
+                    material.detailScale[axis] = value;
+                }
+        }
         else if (key == "envMapParms")
             material.environment = Literal<4>(constant.at("literal"), material.environment);
     }
@@ -2382,7 +2401,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
                   const std::string &glassEnvironment, const bool instanceLighting = false,
                   const std::string &lightVolumeDefines = {},
                   const std::string &lightmapDefines = {}, const bool bakedSun = false,
-                  const std::string &modelVertexDefines = {})
+                  const std::string &modelVertexDefines = {},
+                  const std::string &detailDefines = {})
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
     const bool entity = geometry == TechniqueGeometry::entity;
@@ -2406,6 +2426,9 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         pixelSource += lightmapDefines;
     if (bakedSun)
         pixelSource += "#define MAP_BAKED_SUN 1\n";
+    const bool detailTexture = model && !detailDefines.empty();
+    if (detailTexture)
+        pixelSource += detailDefines;
     pixelSource += ResourceText(IDR_IW3_PIXEL_SHADER);
     ReplaceAtlasTokens(pixelSource, columns, atlasSize);
     // Model coverage passes bind no view mip bias; sample with the gradients alone.
@@ -2450,6 +2473,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
     }
     if (bakedSun)
         AppendTextureArgument(lit, "051009003c00"); // t9, slot 0x3C: baked sun depth
+    if (detailTexture)
+        AppendTextureArgument(lit, "05100a003e00"); // t10, slot 0x3E: IW3 detail map
     PatchStateIdentity(lit, pixel);
 
     const auto depthProgram =
@@ -4490,7 +4515,30 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             if (neededMaterials.contains(source.name) && source.kind == SurfaceKind::glass)
                 glassSorts.insert(source.sortKey);
         const auto translucentKeys = TranslucentSortKeys(glassSorts);
-        std::map<std::pair<unsigned, unsigned>, std::pair<std::string, std::string>> techsetFiles;
+        // IW3 detail materials (opaque lp_*d0*): one lit variant per distinct
+        // detailScale, sampling the detail map from material slot 0x3E.
+        std::map<std::pair<float, float>, std::pair<unsigned, Json>> detailTechsets;
+        const auto detailVariant = [&](const SourceMaterial &source)
+            -> const std::pair<unsigned, Json> & {
+            const std::pair key{source.detailScale[0], source.detailScale[1]};
+            auto found = detailTechsets.find(key);
+            if (found == detailTechsets.end())
+            {
+                char defines[160];
+                std::snprintf(defines, sizeof(defines),
+                              "#define MAP_DETAIL 1\n#define MAP_DETAIL_SCALE float2(%.9g, %.9g)\n",
+                              key.first, key.second);
+                Json techset = BuildTechset(
+                    map, columns, plan.atlasSize, geometry, plan.glassEnvironment,
+                    instanceLighting, volumeLighting ? entityLightVolume->defines : std::string{},
+                    {}, true, plan.modelFalloffDefines, defines);
+                const unsigned index = static_cast<unsigned>(detailTechsets.size());
+                found = detailTechsets.emplace(key, std::pair{index, std::move(techset)}).first;
+            }
+            return found->second;
+        };
+        std::map<std::tuple<unsigned, unsigned, int>, std::pair<std::string, std::string>>
+            techsetFiles;
         for (const SourceMaterial &source : materials)
         {
             if (!neededMaterials.contains(source.name) || source.kind == SurfaceKind::skipped)
@@ -4499,14 +4547,17 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             if (kind >= modelTechsets.size() || modelTechsets[kind].empty())
                 throw std::runtime_error("IW3 render plan omitted a model technique variant");
             const unsigned blend = source.kind == SurfaceKind::glass ? source.blend : 0u;
+            const bool detailed = !source.detail.empty() && source.kind == SurfaceKind::opaque;
+            const int detailIndex = detailed ? static_cast<int>(detailVariant(source).first) : -1;
             auto [techsetEntry, inserted] = techsetFiles.try_emplace(
-                {kind, source.cullMode | (source.depthBias ? 4u : 0u) | (blend << 3)});
+                {kind, source.cullMode | (source.depthBias ? 4u : 0u) | (blend << 3), detailIndex});
             if (inserted)
             {
-                Json variant = modelTechsets[kind];
+                Json variant = detailed ? detailVariant(source).second : modelTechsets[kind];
                 const std::string suffix =
                     "_cull" + std::to_string(source.cullMode) + (source.depthBias ? "_bias" : "") +
-                    (blend ? "_b" + std::to_string(blend) : "");
+                    (blend ? "_b" + std::to_string(blend) : "") +
+                    (detailed ? "_d" + std::to_string(detailIndex) : "");
                 variant["name"] = variant.at("name").get<std::string>() + suffix;
                 for (auto &technique : variant.at("techniques"))
                 {
@@ -4580,6 +4631,18 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                                                       {"rgba8", entityLightVolume->file},
                                                       {"format", 6},
                                                       {"mipCount", 1}});
+            if (detailed)
+            {
+                // Slot 0x3E follows 0x3D: the table stays slot-sorted, as the
+                // technique's ascending texture arguments require.
+                direct["textures"].push_back({{"header", "3e00000000000000"}, {"image", "$gray"}});
+                const unsigned channel = static_cast<unsigned>(direct["textures"].size() - 1);
+                residentImage(direct, channel, image(source.detail).front(), {1, 1, 1, 1},
+                              "model_detail");
+                auto info = Unhex(direct.at("info").get<std::string>());
+                info[0x14] = static_cast<std::uint8_t>(direct["textures"].size());
+                direct["info"] = Hex(info);
+            }
             WriteJson(mapDirectory / materialFile, direct);
             plan.assetMaterials.push_back(
                 {{"schema", 1}, {"material", materialName}, {"materialDefinition", materialFile}});
