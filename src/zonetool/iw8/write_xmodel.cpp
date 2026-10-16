@@ -47,6 +47,12 @@ iw8_focus::XModel buildStruct(const cx::Iw8XModelRecord &rec)
     xm.bounds.midPoint = {rec.boundsMid[0], rec.boundsMid[1], rec.boundsMid[2]};
     xm.bounds.halfSize = {rec.boundsHalf[0], rec.boundsHalf[1], rec.boundsHalf[2]};
     xm.physicsUseCategory = rec.physicsAssetName.empty() ? 0 : 1;
+    // CharCollBoundsType_Human (game-test PDB enum): the model compiler's default,
+    // carried by 98% of shipped Replay XModels (mp_hideout); read only when the
+    // model is used as a character. flags stay as the source sets them: shipped
+    // 0x40 (SELF_VISIBILITY) and 0x2000000 (HAS_ANY_STREAMED_IMAGES) describe data
+    // converted models do not carry.
+    xm.characterCollBoundsType = 1;
     // numAimAssistBones / numClothAssets / mdaoVolumeCount / physicsUseCategory / impactType /
     // mdaoType / characterCollBoundsType / edgeLength / lgvData / physicsUsageCounter /
     // noScalePartBits: 0 (no IW5 source) -> all their //PTR/CNT pairs are null/zero (load-safe).
