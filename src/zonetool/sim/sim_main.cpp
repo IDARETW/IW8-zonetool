@@ -121,6 +121,8 @@ bool Parse(const int argc, char **argv, Options &options)
             options.render.reverseOrder = true;
         else if (value == "--opaque-only")
             options.render.opaqueOnly = true;
+        else if (value == "--gtao")
+            options.render.gtao = true;
         else if (value == "--no-world")
             options.render.drawWorld = false;
         else if (value == "--no-models")
@@ -505,6 +507,7 @@ void ApplyViewQuery(const std::map<std::string, std::string> &query, const Optio
     render.drawDynamic = Get(query, "dynamic", 1) != 0;
     render.drawGlass = Get(query, "glass", 1) != 0;
     render.flipWinding = Get(query, "flip", options.render.flipWinding ? 1.0f : 0.0f) != 0;
+    render.gtao = Get(query, "gtao", options.render.gtao ? 1.0f : 0.0f) != 0;
 }
 
 // One rendered JPEG of the current view (the simulator lock must be held).

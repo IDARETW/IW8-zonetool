@@ -50,6 +50,10 @@ struct RenderOptions
     // exact view: tonemap on the GPU and read back 8-bit sRGB (Frame::rgba8)
     // instead of the HDR target (the viewer's fast path).
     bool gpuTonemap = false;
+    // Approximate the engine's GTAO (screen-space AO from the depth prepass)
+    // instead of a constant white input: shows view-dependent AO as in game.
+    bool gtao = false;
+    float gtaoStrength = 1.0f; // cb7[47].x (vision r_ssaoStrength, stock 1)
 };
 
 struct Frame

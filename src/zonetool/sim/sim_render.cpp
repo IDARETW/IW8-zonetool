@@ -400,6 +400,53 @@ float4 main(float4 position : SV_Position) : SV_Target
     return float4(saturate(v <= 0.0031308 ? low : high), 1);
 }
 )";
+// Horizon-style AO from the depth prepass (an approximation of Replay's GTAO:
+// same input, the depth buffer, and the same view dependence).
+constexpr char kGtaoShader[] = R"(
+Texture2D<float> depthImage : register(t0);
+cbuffer Gtao : register(b0) { float4 projection; float4 size; };
+// projection: sx, sy, near plane, world radius; size: width, height, 1/width, 1/height
+float3 ViewPosition(int2 pixel)
+{
+    float d = depthImage.Load(int3(pixel, 0));
+    float z = d > 0 ? projection.z / d : 1e6;
+    float2 ndc = float2((pixel.x + .5) * size.z * 2 - 1, 1 - (pixel.y + .5) * size.w * 2);
+    return float3(ndc.x / projection.x, ndc.y / projection.y, 1) * z;
+}
+float main(float4 position : SV_Position) : SV_Target
+{
+    int2 pixel = int2(position.xy);
+    float3 p = ViewPosition(pixel);
+    if (p.z >= 1e5)
+        return 1;
+    float3 px = ViewPosition(pixel + int2(1, 0)) - p, py = ViewPosition(pixel + int2(0, 1)) - p;
+    float3 nx = ViewPosition(pixel - int2(1, 0)) - p, ny = ViewPosition(pixel - int2(0, 1)) - p;
+    float3 dx = abs(px.z) < abs(nx.z) ? px : -nx;
+    float3 dy = abs(py.z) < abs(ny.z) ? py : -ny;
+    float3 n = normalize(cross(dy, dx));
+    if (dot(n, p) > 0) n = -n;
+    float radiusPixels = projection.w * projection.x * size.x * .5 / p.z;
+    radiusPixels = clamp(radiusPixels, 2, 96);
+    float occlusion = 0, count = 0;
+    [unroll] for (int d = 0; d < 8; ++d)
+    {
+        float angle = d * 0.7853982 + 0.3;
+        float2 dir = float2(cos(angle), sin(angle));
+        [unroll] for (int s = 1; s <= 4; ++s)
+        {
+            int2 sample = pixel + int2(dir * radiusPixels * s / 4);
+            if (any(sample < 0) || sample.x >= (int)size.x || sample.y >= (int)size.y)
+                continue;
+            float3 v = ViewPosition(sample) - p;
+            float len = length(v);
+            float falloff = saturate(1 - len / projection.w);
+            occlusion += saturate(dot(n, v) / max(len, 1e-3) - .1) * falloff;
+            count += 1;
+        }
+    }
+    return saturate(1 - 2 * occlusion / max(count, 1));
+}
+)";
 constexpr char kFullscreenShader[] = R"(
 float4 main(uint id : SV_VertexID) : SV_Position
 {
@@ -468,7 +515,12 @@ struct Simulator::Impl
     std::vector<std::string> missingModels; // placed but without exported geometry
     unsigned droppedPlacements{};
     ComPtr<ID3D11VertexShader> fullscreenVS;
-    ComPtr<ID3D11PixelShader> tonemapPS;
+    ComPtr<ID3D11PixelShader> tonemapPS, gtaoPS;
+    ComPtr<ID3D11Buffer> cbGtao;
+    ComPtr<ID3D11Texture2D> gtaoTarget;
+    ComPtr<ID3D11RenderTargetView> gtaoView;
+    ComPtr<ID3D11ShaderResourceView> gtaoResource, depthResource;
+    bool gtaoActive{};
     ComPtr<ID3D11Buffer> cbTonemap;
     ComPtr<ID3D11Texture2D> ldrTarget, ldrStaging;
     ComPtr<ID3D11RenderTargetView> ldrView;
@@ -1277,19 +1329,32 @@ struct Simulator::Impl
         make(DXGI_FORMAT_R32G32B32A32_UINT, D3D11_BIND_RENDER_TARGET, idTarget, false);
         make(DXGI_FORMAT_R32G32B32A32_UINT, 0, idStaging, true);
         make(DXGI_FORMAT_R32_FLOAT, D3D11_BIND_RENDER_TARGET, normalTarget, false);
-        make(DXGI_FORMAT_D32_FLOAT, D3D11_BIND_DEPTH_STENCIL, depthTarget, false);
-        make(DXGI_FORMAT_D32_FLOAT, 0, depthStaging, true);
+        make(DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, depthTarget, false);
+        make(DXGI_FORMAT_R32_TYPELESS, 0, depthStaging, true);
+        make(DXGI_FORMAT_R8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, gtaoTarget, false);
         Check(device->CreateRenderTargetView(colorTarget.Get(), nullptr, &colorView), "RTV");
         Check(device->CreateRenderTargetView(ldrTarget.Get(), nullptr, &ldrView), "LDR RTV");
         Check(device->CreateShaderResourceView(colorTarget.Get(), nullptr, &colorResource), "HDR SRV");
         Check(device->CreateRenderTargetView(idTarget.Get(), nullptr, &idView), "id RTV");
         Check(device->CreateRenderTargetView(normalTarget.Get(), nullptr, &normalView), "normal RTV");
-        Check(device->CreateDepthStencilView(depthTarget.Get(), nullptr, &depthView), "DSV");
+        D3D11_DEPTH_STENCIL_VIEW_DESC dsv{};
+        dsv.Format = DXGI_FORMAT_D32_FLOAT;
+        dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        Check(device->CreateDepthStencilView(depthTarget.Get(), &dsv, &depthView), "DSV");
+        D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_R32_FLOAT;
+        srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+        Check(device->CreateShaderResourceView(depthTarget.Get(), &srv, &depthResource), "depth SRV");
+        Check(device->CreateRenderTargetView(gtaoTarget.Get(), nullptr, &gtaoView), "GTAO RTV");
+        Check(device->CreateShaderResourceView(gtaoTarget.Get(), nullptr, &gtaoResource), "GTAO SRV");
     }
 
     // ---- per-frame binding ------------------------------------------------
     ID3D11ShaderResourceView *EngineResource(const std::string &name)
     {
+        if (name == "gtaoImage" && gtaoActive)
+            return gtaoResource.Get();
         static const std::map<std::string, ComPtr<ID3D11ShaderResourceView> Impl::*> table = {
             {"sunVisibility", &Impl::white},        {"gtaoImage", &Impl::white},
             {"localLights", &Impl::localLightRecords}, {"localLightBins", &Impl::localLightBins},
@@ -1516,6 +1581,10 @@ void Simulator::Load(const std::string &simJsonPath)
         };
         const auto vs = compile(kFullscreenShader, "vs_5_0");
         const auto ps = compile(kTonemapShader, "ps_5_0");
+        const auto ao = compile(kGtaoShader, "ps_5_0");
+        Check(impl.device->CreatePixelShader(ao->GetBufferPointer(), ao->GetBufferSize(), nullptr, &impl.gtaoPS),
+              "GTAO PS");
+        impl.cbGtao = impl.ConstantBuffer(32);
         Check(impl.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &impl.fullscreenVS),
               "fullscreen VS");
         Check(impl.device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &impl.tonemapPS),
@@ -1641,6 +1710,9 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     lighting[43][2] = 1;
     lighting[43][3] = 1;
     lighting[47][1] = 1;
+    impl.gtaoActive = options.gtao && options.view == View::exact;
+    if (impl.gtaoActive)
+        lighting[47][0] = options.gtaoStrength;
     lighting[54][0] = float(options.width);
     if (!impl.localLights.empty())
     {
@@ -1874,6 +1946,31 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     for (int pass = 0; pass < 2; ++pass)
     {
         const bool prepass = pass == 0;
+        if (!prepass && impl.gtaoActive)
+        {
+            ID3D11RenderTargetView *aoTargets[1] = {impl.gtaoView.Get()};
+            ctx.OMSetRenderTargets(1, aoTargets, nullptr);
+            ctx.RSSetState(nullptr);
+            ctx.OMSetDepthStencilState(nullptr, 0);
+            ctx.OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            ctx.VSSetShader(impl.fullscreenVS.Get(), nullptr, 0);
+            ctx.PSSetShader(impl.gtaoPS.Get(), nullptr, 0);
+            const float tanHalf = std::tan(camera.fov * kPi / 360);
+            const float aoConstants[8] = {1 / tanHalf, (float(options.width) / options.height) / tanHalf, 4.0f, 48.0f,
+                                          float(options.width), float(options.height), 1.0f / options.width,
+                                          1.0f / options.height};
+            impl.Update(impl.cbGtao.Get(), aoConstants, sizeof(aoConstants));
+            ID3D11Buffer *aoBuffers[1] = {impl.cbGtao.Get()};
+            ctx.PSSetConstantBuffers(0, 1, aoBuffers);
+            ID3D11ShaderResourceView *depth[1] = {impl.depthResource.Get()};
+            ctx.PSSetShaderResources(0, 1, depth);
+            ctx.Draw(3, 0);
+            ID3D11ShaderResourceView *none[1] = {};
+            ctx.PSSetShaderResources(0, 1, none);
+            // Restore the scene constant buffers for the lit pass.
+            ctx.VSSetConstantBuffers(0, 11, cbs);
+            ctx.PSSetConstantBuffers(0, 11, cbs);
+        }
         ID3D11RenderTargetView *targets[2] = {idPass ? impl.idView.Get() : impl.colorView.Get(),
                                               impl.normalView.Get()};
         ctx.OMSetRenderTargets(2, targets, impl.depthView.Get());

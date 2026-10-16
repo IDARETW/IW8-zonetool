@@ -36,7 +36,9 @@ details{margin-top:6px}
  Exposure <input id="exposure" type="range" min="0.1" max="4" step="0.05" value="1" style="width:90px"><span id="expv">1.00</span></div>
 <div class="row"><label><input type="checkbox" id="world" checked> world</label><label><input type="checkbox" id="models" checked> models</label>
 <label><input type="checkbox" id="dynamic" checked> dynents</label><label><input type="checkbox" id="glass" checked> glass</label>
-<label><input type="checkbox" id="flip"> flip winding</label> LOD <select id="lod"><option value="-1">auto</option><option>0</option><option>1</option><option>2</option><option>3</option></select></div>
+<label><input type="checkbox" id="flip"> flip winding</label>
+<label title="Approximate the engine's screen-space AO (GTAO), which changes with the view"><input type="checkbox" id="gtao"> engine AO</label>
+ Size <select id="res"><option>960x540</option><option selected>1280x720</option><option>1600x900</option></select> LOD <select id="lod"><option value="-1">auto</option><option>0</option><option>1</option><option>2</option><option>3</option></select></div>
 <div class="row"><button id="pickbtn">Pick at crosshair (P)</button><button id="checkbtn">Run load checks</button><button id="shot">Save PNG</button></div>
 <details><summary>Controls</summary>Click the image to capture the mouse. Mouse look; W/A/S/D move, Q/E down/up, Shift fast, Ctrl slow. Esc releases. Type a camera below and press Enter.
 <div class="row">Camera <input id="cam" style="width:260px" placeholder="x,y,z,yaw,pitch"></div></details>
@@ -47,10 +49,10 @@ details{margin-top:6px}
 const S={x:0,y:0,z:0,yaw:0,pitch:0,fov:65,keys:{},dirty:true,lastT:0,info:null,frames:[],renderMs:0,mode:'stream'};
 const $=id=>document.getElementById(id);
 const view=$('view');
-function params(w,h){return `x=${S.x.toFixed(1)}&y=${S.y.toFixed(1)}&z=${S.z.toFixed(1)}&yaw=${S.yaw.toFixed(2)}&pitch=${S.pitch.toFixed(2)}&fov=${S.fov}&w=${w}&h=${h}&view=${$('mode').value}&exposure=${$('exposure').value}&lod=${$('lod').value}&world=${+$('world').checked}&models=${+$('models').checked}&dynamic=${+$('dynamic').checked}&glass=${+$('glass').checked}&flip=${+$('flip').checked}`}
+function params(w,h){return `x=${S.x.toFixed(1)}&y=${S.y.toFixed(1)}&z=${S.z.toFixed(1)}&yaw=${S.yaw.toFixed(2)}&pitch=${S.pitch.toFixed(2)}&fov=${S.fov}&w=${w}&h=${h}&view=${$('mode').value}&exposure=${$('exposure').value}&lod=${$('lod').value}&world=${+$('world').checked}&models=${+$('models').checked}&dynamic=${+$('dynamic').checked}&glass=${+$('glass').checked}&flip=${+$('flip').checked}&gtao=${+$('gtao').checked}`}
 let moving=false, idleTimer=null, lastUrl=null, camInFlight=0, camSeq=0, lastCam=0, lastFrameAt=0;
 // Moving: a smaller, lower-quality frame; once still, one full-quality frame.
-function viewSize(){return moving?[960,540,60]:[1600,900,88];}
+function viewSize(){const r=$('res').value.split('x').map(Number); return [r[0],r[1],moving?70:90];}
 function show(blob){
   if(lastUrl) URL.revokeObjectURL(lastUrl);
   lastUrl=URL.createObjectURL(blob); view.src=lastUrl;
@@ -132,7 +134,7 @@ document.addEventListener('keydown',e=>{
   if(key==='p') pick();
 });
 document.addEventListener('keyup',e=>{const key=e.key.toLowerCase(); S.keys[key]=false; S.keys.shift=e.shiftKey; S.keys.ctrl=e.ctrlKey;});
-for(const id of ['mode','exposure','world','models','dynamic','glass','flip','lod']) $(id).addEventListener('change',()=>{S.dirty=true;$('expv').textContent=(+$('exposure').value).toFixed(2)});
+for(const id of ['mode','exposure','world','models','dynamic','glass','flip','lod','gtao','res']) $(id).addEventListener('change',()=>{S.dirty=true;$('expv').textContent=(+$('exposure').value).toFixed(2)});
 $('exposure').addEventListener('input',()=>{$('expv').textContent=(+$('exposure').value).toFixed(2)});
 $('cam').addEventListener('keydown',e=>{ if(e.key!=='Enter') return; const v=$('cam').value.split(/[ ,]+/).map(Number); if(v.length>=5){[S.x,S.y,S.z,S.yaw,S.pitch]=v;S.dirty=true;} });
 $('go').addEventListener('click',()=>{const s=S.info.spawns[+$('spawn').value]; if(!s) return; [S.x,S.y,S.z]=[s.origin[0],s.origin[1],s.origin[2]+60]; S.yaw=s.yaw; S.pitch=0; S.dirty=true;});
