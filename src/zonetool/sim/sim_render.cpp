@@ -454,6 +454,19 @@ struct Simulator::Impl
     unsigned modelVertexPages{};
     unsigned sharedLods{}; // padded LOD copies that reuse an earlier LOD's pages
     DrawCache drawCache;
+    struct LocalLight
+    {
+        Float3 origin, color, direction;
+        float radius{};
+        bool spot{};
+        float cosOuter{}, cosInner{};
+    };
+    std::vector<LocalLight> localLights;
+    ComPtr<ID3D11ShaderResourceView> localLightRecords, localLightBins, localLightMasks;
+    ComPtr<ID3D11Buffer> localLightRecordsBuffer;
+    unsigned localLightMaskTiles{};
+    std::vector<std::string> missingModels; // placed but without exported geometry
+    unsigned droppedPlacements{};
     ComPtr<ID3D11VertexShader> fullscreenVS;
     ComPtr<ID3D11PixelShader> tonemapPS;
     ComPtr<ID3D11Buffer> cbTonemap;
@@ -934,6 +947,7 @@ struct Simulator::Impl
             if (source == xmodels.end())
             {
                 zt::warn("sim: model without geometry: %s", name.c_str());
+                missingModels.push_back(name);
                 continue;
             }
             const Json &record = *source->second;
@@ -1091,7 +1105,10 @@ struct Simulator::Impl
             const std::string name = simJson.at("staticModels").at(placement.model).at("name");
             const auto found = modelByName.find(name);
             if (found == modelByName.end())
+            {
+                ++droppedPlacements;
                 continue;
+            }
             placement.model = found->second;
             placements.push_back(placement);
         }
@@ -1275,6 +1292,8 @@ struct Simulator::Impl
     {
         static const std::map<std::string, ComPtr<ID3D11ShaderResourceView> Impl::*> table = {
             {"sunVisibility", &Impl::white},        {"gtaoImage", &Impl::white},
+            {"localLights", &Impl::localLightRecords}, {"localLightBins", &Impl::localLightBins},
+            {"localLightMasks", &Impl::localLightMasks},
             {"lightingTiles", &Impl::zeroTiles},    {"probeParameters", &Impl::probeParameters},
             {"probeBoxes", &Impl::probeBoxes},      {"probeClusterMasks", &Impl::probeMasks},
             {"probeDepthBins", &Impl::probeBins},   {"specularOcclusionLut", &Impl::ones3d},
@@ -1317,7 +1336,10 @@ struct Simulator::Impl
             }
             else
                 view = EngineResource(resource.name);
-            if (!view && resource.type == D3D_SIT_TEXTURE)
+            // Local-light falloff curve and shadow maps stay unbound: the zone
+            // shader then uses a flat falloff and no shadow (its documented
+            // fallback for generated techniques).
+            if (!view && resource.type == D3D_SIT_TEXTURE && resource.name.rfind("localLight", 0) != 0)
                 view = white.Get();
             if (pixel)
                 context->PSSetShaderResources(resource.bindPoint, 1, &view);
@@ -1504,6 +1526,52 @@ void Simulator::Load(const std::string &simJsonPath)
         Check(impl.device->CreatePixelShader(world.data(), world.size(), nullptr, &impl.idShaderWorld), "id PS");
         Check(impl.device->CreatePixelShader(model.data(), model.size(), nullptr, &impl.idShaderModel), "id PS");
     }
+    {
+        std::string lightingPath = simJsonPath;
+        if (const auto at = lightingPath.rfind(".sim.json"); at != std::string::npos)
+            lightingPath.replace(at, 9, ".lighting.json");
+        std::string text;
+        if (read_file_str(lightingPath, text))
+        {
+            const Json lighting = Json::parse(text);
+            const int sunIndex = lighting.value("sun_primary_light_index", -1);
+            const auto &primary = lighting.value("primary_lights", Json::array());
+            for (size_t i = 0; i < primary.size(); ++i)
+            {
+                const Json &light = primary[i];
+                const int type = light.value("type", 0);
+                // IW3 primary light types: 2 omni, 3 spot (1 is the sun).
+                if (int(i) == sunIndex || (type != 2 && type != 3) || light.value("radius", 0.0f) <= 0)
+                    continue;
+                Impl::LocalLight local;
+                const auto vec = [&](const char *key) {
+                    const auto &v = light.at(key);
+                    return Float3{v.at(0).get<float>(), v.at(1).get<float>(), v.at(2).get<float>()};
+                };
+                local.origin = vec("origin");
+                local.color = vec("color");
+                local.direction = vec("direction");
+                local.radius = light.at("radius").get<float>();
+                local.spot = type == 3;
+                local.cosOuter = light.value("cos_half_fov_outer", 0.0f);
+                local.cosInner = light.value("cos_half_fov_inner", 1.0f);
+                impl.localLights.push_back(local);
+            }
+            if (impl.localLights.size() > 32)
+                impl.localLights.resize(32); // one mask word; converted maps hold a handful
+        }
+        // Every light in every view-depth bin: [first:16][last:16].
+        std::vector<uint32_t> bins(8192, impl.localLights.empty() ? 0u : uint32_t(impl.localLights.size() - 1));
+        impl.localLightBins = impl.StructuredBuffer(bins.data(), bins.size() * 4, 4);
+        impl.localLightMaskTiles = (3840 / 8) * (2160 / 8);
+        const uint32_t all = impl.localLights.empty() ? 0u
+                             : impl.localLights.size() == 32 ? 0xFFFFFFFFu
+                                                              : (1u << impl.localLights.size()) - 1;
+        std::vector<uint32_t> masks(impl.localLightMaskTiles, all);
+        impl.localLightMasks = impl.StructuredBuffer(masks.data(), masks.size() * 4, 4);
+        if (!impl.localLights.empty())
+            zt::info("sim: %zu local light(s)", impl.localLights.size());
+    }
     impl.BuildWorld();
     impl.BuildProbes();
     impl.BuildModels(simJson, blob);
@@ -1574,6 +1642,38 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     lighting[43][3] = 1;
     lighting[47][1] = 1;
     lighting[54][0] = float(options.width);
+    if (!impl.localLights.empty())
+    {
+        const uint32_t words = 1;
+        std::memcpy(&lighting[52][0], &words, 4);
+        std::vector<uint8_t> records(impl.localLights.size() * 96, 0);
+        for (size_t i = 0; i < impl.localLights.size(); ++i)
+        {
+            const auto &light = impl.localLights[i];
+            uint8_t *r = records.data() + i * 96;
+            const auto put = [&](size_t offset, float value) { std::memcpy(r + offset, &value, 4); };
+            put(0, light.color.x);
+            put(4, light.color.y);
+            put(8, light.color.z);
+            // Spot axis points back toward the light.
+            put(16, -light.direction.x);
+            put(20, -light.direction.y);
+            put(24, -light.direction.z);
+            const uint32_t flags = (light.spot ? 2u << 8 : 1u << 8) | 255u; // no shadow slot
+            std::memcpy(r + 28, &flags, 4);
+            put(48, light.origin.x - camera.origin[0]);
+            put(52, light.origin.y - camera.origin[1]);
+            put(56, light.origin.z - camera.origin[2]);
+            put(60, 1.0f / light.radius);
+            // Cone: saturate(c * scale + bias) from the outer to the inner angle.
+            const float span = std::max(light.cosInner - light.cosOuter, 1e-3f);
+            put(64, light.spot ? 1.0f / span : 0.0f);
+            put(68, light.spot ? -light.cosOuter / span : 1.0f);
+            put(72, 0.0f);
+            put(76, 1.0f); // window: linear falloff to the radius (light_point_linear)
+        }
+        impl.localLightRecords = impl.RawBuffer(records.data(), records.size(), &impl.localLightRecordsBuffer);
+    }
     lighting[56][0] = impl.sunDirection.x;
     lighting[56][1] = impl.sunDirection.y;
     lighting[56][2] = impl.sunDirection.z;
@@ -2136,6 +2236,81 @@ std::string Simulator::InstanceModel(const uint32_t instance) const
     if ((instance & 0x80000000u) && p < impl.placements.size())
         return impl.models[impl.placements[p].model].name;
     return {};
+}
+
+std::string Simulator::Audit() const
+{
+    const auto &impl = *impl_;
+    Json report;
+    // Geometry whose material never registered (no lit technique) is not drawn.
+    std::map<std::string, unsigned> undrawnWorld, undrawnModel;
+    for (unsigned i = 0; i < impl.mesh.count; ++i)
+    {
+        const unsigned index = impl.mesh.surfaceMaterials[i];
+        const auto &source = index ? impl.mesh.additionalMaterials[index - 1]
+                                   : static_cast<const replayrender::Material &>(impl.mesh);
+        if (!impl.materials.contains(source.material))
+            ++undrawnWorld[source.material];
+    }
+    std::set<std::string> usedMaterials;
+    for (const auto &model : impl.models)
+        for (const auto &lod : model.lods)
+            for (const auto &surface : lod.surfaces)
+            {
+                usedMaterials.insert(surface.material);
+                if (!impl.materials.contains(surface.material))
+                    ++undrawnModel[model.name + " | " + surface.material];
+            }
+    report["undrawnWorldSurfaces"] = undrawnWorld;
+    report["undrawnModelSurfaces"] = undrawnModel;
+    // Material images the map data does not define (white in the simulator;
+    // stock images resolve in the game, anything else is a missing asset).
+    std::map<std::string, std::vector<std::string>> missingImages;
+    std::map<std::string, unsigned> engineInputs;
+    for (const auto &[name, gpu] : impl.materials)
+    {
+        for (const auto *textures : {&gpu.litTextures, &gpu.prepassTextures})
+            for (const auto &[reg, image] : *textures)
+                if (!impl.images.contains(image))
+                    missingImages[image].push_back(name);
+        if (gpu.lit)
+            for (const auto *binding : {&gpu.lit->psBinding, &gpu.lit->vsBinding})
+                for (const auto &resource : binding->resources)
+                {
+                    if (resource.type == D3D_SIT_SAMPLER || resource.type == D3D_SIT_CBUFFER)
+                        continue;
+                    if (gpu.litTextures.contains(resource.bindPoint) && resource.type == D3D_SIT_TEXTURE)
+                        continue;
+                    const bool known = const_cast<Impl &>(impl).EngineResource(resource.name) != nullptr;
+                    ++engineInputs[(known ? "emulated: " : "MISSING (white/null): ") + resource.name];
+                }
+    }
+    Json images = Json::object();
+    for (auto &[image, users] : missingImages)
+    {
+        std::sort(users.begin(), users.end());
+        users.erase(std::unique(users.begin(), users.end()), users.end());
+        images[image] = {{"materials", users.size()}, {"example", users.front()}};
+    }
+    report["imagesNotInMapData"] = images;
+    report["shaderInputs"] = engineInputs;
+    report["modelsWithoutGeometry"] = impl.missingModels;
+    report["droppedStaticPlacements"] = impl.droppedPlacements;
+    // Bounds sanity for every model surface.
+    unsigned badBounds = 0;
+    for (const auto &model : impl.models)
+        for (const auto &lod : model.lods)
+            for (const auto &surface : lod.surfaces)
+                if (!std::isfinite(surface.scale) || surface.scale <= 0 || surface.scale > 65536 ||
+                    !std::isfinite(surface.mid[0]) || !std::isfinite(surface.mid[1]) || !std::isfinite(surface.mid[2]))
+                    ++badBounds;
+    report["modelSurfacesWithBadBounds"] = badBounds;
+    report["counts"] = {{"materials", impl.materials.size()},
+                        {"images", impl.images.size()},
+                        {"models", impl.models.size()},
+                        {"placements", impl.placements.size()},
+                        {"worldSurfaces", impl.mesh.count}};
+    return report.dump(2);
 }
 
 std::string Simulator::Describe(const Camera &camera, const RenderOptions &options, const unsigned x,

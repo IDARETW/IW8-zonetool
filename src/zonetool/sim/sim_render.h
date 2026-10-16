@@ -104,6 +104,10 @@ public:
     std::string Describe(const Camera &camera, const RenderOptions &options, unsigned x,
                          unsigned y);
     MaterialInfo Material(uint32_t id) const;
+    // Everything the renderer would silently skip or substitute: surfaces whose
+    // material has no drawable technique, material images and engine inputs
+    // that are not in the map data, models without geometry, bad bounds.
+    std::string Audit() const;
     // Model name for an instance id from the id pass (empty for world surfaces).
     std::string InstanceModel(uint32_t instance) const;
 

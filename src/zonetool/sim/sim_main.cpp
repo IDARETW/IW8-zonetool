@@ -1103,6 +1103,7 @@ int Main(const int argc, char **argv)
                          "  check    --package <built map dir>\n"
                          "  flicker  [-o report.json] [--points spawns|x,y,z;...] [--camera ...]  (draw-order depth ties)\n"
                          "  rotation [-o report.json] [--points ...] [--camera ...]  (shading that changes with view rotation)\n"
+                         "  audit    [-o report.json]  (undrawn surfaces, images and inputs the map data lacks)\n"
                          "  info\n"
                          "  common: --no-world --no-models --no-dynamic --no-glass --flip-winding\n");
             return 2;
@@ -1138,6 +1139,14 @@ int Main(const int argc, char **argv)
             return Flicker(simulator, options);
         if (options.command == "rotation")
             return Rotation(simulator, options);
+        if (options.command == "audit")
+        {
+            const std::string report = simulator.Audit();
+            if (!options.output.empty())
+                write_file_str(options.output, report);
+            std::puts(report.c_str());
+            return 0;
+        }
         if (options.command == "serve")
             return Serve(simulator, options);
         throw std::runtime_error("sim: unknown command " + options.command);
