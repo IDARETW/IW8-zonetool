@@ -4579,6 +4579,11 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
             const bool bg = mb.kind == SurfaceKind::glass;
             if (ag != bg)
                 return !ag;
+            // Blended world layers share a few materials and one sort key, and
+            // Replay draws its translucent range in surface order: keep IW3's
+            // layer order (rank = IW3 sort - 8, flags bits 12-17).
+            if (ag && ((ma.flags >> 12) & 0x3Fu) != ((mb.flags >> 12) & 0x3Fu))
+                return ((ma.flags >> 12) & 0x3Fu) < ((mb.flags >> 12) & 0x3Fu);
             if (ma.kind != mb.kind)
                 return static_cast<unsigned>(ma.kind) < static_cast<unsigned>(mb.kind);
             if (ma.environment != mb.environment)

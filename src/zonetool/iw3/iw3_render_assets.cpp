@@ -1378,8 +1378,11 @@ void Paste(Image &target, const Image &source, const unsigned x, const unsigned 
                     static_cast<std::size_t>(source.width) * 4);
 }
 
+// Colours and environment parameters are non-negative; falloffParms holds
+// scale/bias pairs whose biases are negative (IW3 god rays: -0.0526, -0.111).
 template <std::size_t Size>
-std::array<float, Size> Literal(const Json &value, const std::array<float, Size> &fallback)
+std::array<float, Size> Literal(const Json &value, const std::array<float, Size> &fallback,
+                                const bool signedValues = false)
 {
     if (!value.is_array() || value.size() != Size)
         return fallback;
@@ -1387,7 +1390,8 @@ std::array<float, Size> Literal(const Json &value, const std::array<float, Size>
     for (std::size_t index = 0; index < Size; ++index)
     {
         result[index] = value.at(index).get<float>();
-        if (!std::isfinite(result[index]) || result[index] < 0 || result[index] > 64)
+        if (!std::isfinite(result[index]) || (!signedValues && result[index] < 0) ||
+            std::abs(result[index]) > 64)
             throw std::runtime_error("invalid IW3 material constant");
     }
     return result;
@@ -1889,7 +1893,7 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
         {
             const std::string key = constant.value("name", std::string{});
             if (key == "falloffParms")
-                parms = Literal<4>(constant.at("literal"), parms);
+                parms = Literal<4>(constant.at("literal"), parms, true);
             else if (key == "falloffBeginColor")
                 begin = Literal<4>(constant.at("literal"), begin);
             else if (key == "falloffEndColor")
