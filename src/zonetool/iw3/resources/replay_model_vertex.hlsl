@@ -121,6 +121,24 @@ float4 EntityPosition(uint row, float3 local, int3 viewOrigin) {
 }
 #endif
 
+// IW3 polygon offset as a pull toward the camera (fraction of the distance).
+// IW3 (R_ForceSetPolygonOffset) sets D3D9 DEPTHBIAS level * r_polygonOffsetBias
+// (-1) / 65536 and SLOPESCALEDEPTHBIAS level * r_polygonOffsetScale (-1) on a
+// [0, 1] depth range with r_znear 4: the constant term brings a decal
+// level * d^2 / 262144 units nearer (0.34 units at 300, 3.8 at 1000), the slope
+// term about one pixel footprint (0.0015 d at 1080p, 90 degrees; two are
+// allowed) times the
+// tangent of the view angle. Mapper decals sit on or slightly behind their
+// wall and relied on it (see the world vertex shader).
+float Iw3PolygonOffset(uint level, float3 relative, float3 normal) {
+    if (level == 0)
+        return 0;
+    float viewDistance = max(dot(relative, replayView[3].xyz), 0);
+    float facing = abs(dot(normalize(normal), normalize(relative)));
+    float slope = sqrt(saturate(1 - facing * facing)) / max(facing, .1);
+    return level * min(viewDistance * (1.0 / 262144.0) + .003 * slope, .03);
+}
+
 Output main(uint id : SV_VertexID) {
     uint drawSurface = id >> 16;
     // Replay's model shadow pass uses the second draw-surface table in t63.
@@ -196,6 +214,9 @@ Output main(uint id : SV_VertexID) {
     precise float4 projected = relative;
 #ifndef MAP_MODEL_SHADOW_PASS
     projected.xyz *= 1 - ((extended >> 4) & 63) * 1.2e-5;
+    // IW3 polygon offset (bits 10-11 of a surface without falloff: offset1,
+    // offset2), as the world vertex shader.
+    projected.xyz *= 1 - Iw3PolygonOffset(falloff ? 0 : (attributes.x >> 10) & 3, projected.xyz, normal);
 #endif
     // IW3 eye offset (zfeather_foa_nf_eo): the vertex moves along its view ray
     // until it is eyeOffsetParms.x units nearer in view depth.

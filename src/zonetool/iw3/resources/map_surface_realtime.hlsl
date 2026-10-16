@@ -1037,8 +1037,13 @@ float4 main(Input input) : SV_TARGET0 {
     // fogged additive techniques toward black).
     if ((flags & 512) != 0)
         return float4(lerp(1, texel.rgb, fogFactor), 1);
+    // IW3's additive pixel shaders (vertcol_simple_add, zfeather_add_nf) output
+    // colour * texture alpha * vertex alpha (texel carries both): god-ray cards
+    // fade along their length through vertex alpha, and drew as uniform
+    // hard-ended sheets without it (Gulag, owner test 2026-10-16). Additive
+    // layers blend ONE/ONE, srcalpha-additive ones included.
     if ((flags & 256) != 0)
-        return float4(min(color * fogFactor * replayLighting[42].x, 32255.0), alpha);
+        return float4(min(color * alpha * fogFactor * replayLighting[42].x, 32255.0), alpha);
 #if defined(MAP_FOG) && MAP_DEBUG_MODE == 0
     // Blended toward the fog colour in CoD4's gamma-encoded framebuffer.
     if (!sky)

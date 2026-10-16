@@ -3568,15 +3568,18 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                 // Models bind their own textures, so the low 16 bits carry no atlas
                 // tile: bits 0-3 hold the blend and falloff flags (256-2048), bits
                 // 4-9 the layer rank (flags bits 12-17), bits 10-15 the falloff
-                // table row, bits 16-23 the low flags.
+                // table row of a falloff layer, else the IW3 polygon offset level
+                // (flags bits 18-19), bits 16-23 the low flags.
                 const unsigned lowFlags = (kind + material.flags) & 0xFFu;
                 const unsigned blendFlags = (material.flags >> 8) & 0xFu;
                 const unsigned layer = (material.flags >> 12) & 0x3Fu;
-                if (material.flags > 0x3FFFFu || material.falloffIndex > 0x3Fu)
+                const unsigned offsetLevel = (material.flags >> 18) & 3u;
+                if (material.flags > 0xFFFFFu || material.falloffIndex > 0x3Fu)
                     throw std::runtime_error("IW3 model material metadata exceeds Replay fields");
-                const std::uint32_t metadata = blendFlags | (layer << 4) |
-                                               (material.falloffIndex << 10) | (lowFlags << 16) |
-                                               0xFF000000u;
+                const unsigned row =
+                    (material.flags & 1024u) != 0 ? material.falloffIndex : offsetLevel;
+                const std::uint32_t metadata = blendFlags | (layer << 4) | (row << 10) |
+                                               (lowFlags << 16) | 0xFF000000u;
                 auto &destinationSurface = converted.surfaces[surfaceIndex];
                 constexpr std::size_t packedVertexSize = 20;
                 constexpr std::size_t selfVisibilityOffset = 8;
@@ -5390,13 +5393,36 @@ CollisionData ReadCollision(const Json &collision)
         if (const auto ladderPlanes = brush.find("ladder_planes");
             ladderPlanes != brush.end() && ladderPlanes->is_array() && !ladderPlanes->empty())
         {
-            const std::size_t thinAxis = maximum[0] - minimum[0] < maximum[1] - minimum[1] ? 0 : 1;
+            // IW3 ladder brushes carry the ladder flag on every side, and a
+            // rotated brush also lists its axial bounding planes, which touch
+            // it only along an edge. The climbable faces are the broad
+            // vertical faces: keep the vertical planes whose face on the hull
+            // is (nearly) the widest. Taking the axial planes of the thin
+            // bounding-box axis yawed the climber 30 degrees on Discovery's
+            // rotated ladder, hands off the rungs (owner test 2026-10-16).
+            std::vector<std::pair<Vec4, float>> faces;
+            float widest = 0.0f;
             for (const auto &plane : *ladderPlanes)
             {
                 const Vec4 value = ReadVector<4>(plane);
-                if (std::abs(value[thinAxis]) >= 0.999f && std::abs(value[2]) <= 0.001f)
-                    hull.ladderPlanes.push_back(value);
+                if (std::abs(value[2]) > 0.001f)
+                    continue;
+                float low = INFINITY, high = -INFINITY;
+                for (const Vec3 &point : hull.points)
+                {
+                    if (std::abs(Dot(Vec3{value[0], value[1], value[2]}, point) - value[3]) > 0.1f)
+                        continue;
+                    const float tangent = -value[1] * point[0] + value[0] * point[1];
+                    low = (std::min)(low, tangent);
+                    high = (std::max)(high, tangent);
+                }
+                const float width = high > low ? high - low : 0.0f;
+                faces.push_back({value, width});
+                widest = (std::max)(widest, width);
             }
+            for (const auto &[value, width] : faces)
+                if (widest >= 8.0f && width >= widest * 0.75f)
+                    hull.ladderPlanes.push_back(value);
             if (!hull.ladderPlanes.empty())
                 hull.surfaceFlags |= 0x8u;
         }

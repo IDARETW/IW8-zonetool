@@ -45,6 +45,25 @@ struct Output {
     nointerpolation float4 materialParameters : MATERIALPARMS0;
     float3 relativePosition : WORLDPOS0;
 };
+// IW3 polygon offset as a pull toward the camera (fraction of the distance).
+// IW3 (R_ForceSetPolygonOffset) sets D3D9 DEPTHBIAS level * r_polygonOffsetBias
+// (-1) / 65536 and SLOPESCALEDEPTHBIAS level * r_polygonOffsetScale (-1) on a
+// [0, 1] depth range with r_znear 4: the constant term brings a decal
+// level * d^2 / 262144 units nearer (0.34 units at 300, 3.8 at 1000), the slope
+// term about one pixel footprint (0.0015 d at 1080p, 90 degrees; two are
+// allowed) times the
+// tangent of the view angle. Mapper decals sit on or slightly behind their
+// wall and relied on it: Greenband's stains (gnbr_com_stain_01, offset1)
+// flickered against Replay's far smaller hardware bias (owner test 2026-10-16).
+float Iw3PolygonOffset(uint level, float3 relative, float3 normal) {
+    if (level == 0)
+        return 0;
+    float viewDistance = max(dot(relative, replayView[3].xyz), 0);
+    float facing = abs(dot(normalize(normal), normalize(relative)));
+    float slope = sqrt(saturate(1 - facing * facing)) / max(facing, .1);
+    return level * min(viewDistance * (1.0 / 262144.0) + .003 * slope, .03);
+}
+
 Output main(uint id : SV_VertexID) {
 #ifdef GLASS_PANE
     GlassVertex vertex = glassVertices[id];
@@ -84,10 +103,6 @@ Output main(uint id : SV_VertexID) {
     // coplanar layers keep IW3's order at any distance and view angle.
     precise float4 projected = relative;
     projected.xyz *= 1 - (((uint)o.metadata.y >> 12) & 63) * 1.2e-5;
-    o.position.x = dot(projected, replayView[0]);
-    o.position.y = dot(projected, replayView[1]);
-    o.position.z = dot(projected, replayView[2]);
-    o.position.w = dot(projected, replayView[3]);
     float3 xyz = (float3(packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 511) *
                       float3(2.0 / 1023, 2.0 / 1023, 2.0 / 511) -
                   1) *
@@ -102,6 +117,12 @@ Output main(uint id : SV_VertexID) {
                       1 - 2 * (q.x * q.x + q.y * q.y));
     o.tangent = float4(1 - 2 * (q.y * q.y + q.z * q.z), 2 * (q.x * q.y + q.w * q.z),
                        2 * (q.x * q.z - q.w * q.y), (packed & (1u << 29)) ? -1 : 1);
+    // IW3 polygon offset (flags bits 18-19: offset1, offset2).
+    projected.xyz *= 1 - Iw3PolygonOffset(((uint)o.metadata.y >> 18) & 3, projected.xyz, o.normal);
+    o.position.x = dot(projected, replayView[0]);
+    o.position.y = dot(projected, replayView[1]);
+    o.position.z = dot(projected, replayView[2]);
+    o.position.w = dot(projected, replayView[3]);
 #ifdef GLASS_PANE
     uint color = vertex.color;
 #else

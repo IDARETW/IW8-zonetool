@@ -79,6 +79,7 @@ struct SourceMaterial
     // alpha *= saturate(view depth * x)) and the eye offset (eyeOffsetParms.x
     // units toward the camera).
     std::array<float, 2> effect{0, 0};
+    unsigned polygonOffset{}; // IW3 colour-pass polygonOffset: 0, offset1 1, offset2 2.
 };
 
 enum class FxMaterialFamily
@@ -1877,6 +1878,8 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
             const auto &state = states.at(index);
             if (!state.value("colorWriteRgb", false) || state.value("polymodeLine", false))
                 continue;
+            const std::string polygonOffset = state.value("polygonOffset", std::string("offset0"));
+            material.polygonOffset = polygonOffset == "offset1" ? 1u : polygonOffset == "offset2" ? 2u : 0u;
             const std::string src = state.value("srcBlendRgb", std::string("one"));
             const std::string dst = state.value("dstBlendRgb", std::string("zero"));
             if (src == "srcalpha" && dst == "invsrcalpha" && !state.value("depthWrite", true))
@@ -1968,6 +1971,9 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
     // materials) show their colour map as emitted light.
     if (techset.find("unlit") != std::string::npos)
         material.flags |= 128u;
+    // IW3 polygon offset level (flags bits 18-19), which the vertex shaders
+    // turn into IW3's distance-scaled pull toward the camera.
+    material.flags |= material.polygonOffset << 18;
     return material;
 }
 

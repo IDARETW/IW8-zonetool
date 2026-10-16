@@ -72,7 +72,7 @@ inline std::uint64_t GlassBlendBits(const unsigned blend)
     {
     case 1: return 0x8010;  // one / one
     case 2: return 0x8821;  // zero / srccolor (alpha zero / one)
-    case 3: return 0x8014;  // srcalpha / one
+    case 3: return 0x8010;  // srcalpha / one: one / one, the shader applies alpha
     default: return 0x28050; // srcalpha / invsrcalpha (alpha one / invsrcalpha)
     }
 }
