@@ -9202,6 +9202,28 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             const std::string name =
                 gsc.substr(at + kScriptEffectMarker.size(), end - at - kScriptEffectMarker.size());
             const auto alias = effectAliases.find(name);
+            // An effect absent from every IW3 source (no graph in the map zone,
+            // IWD or common_mp; Discovery's fx_mp_discovery_aurore2) resolved to
+            // a missing asset in IW3 and drew nothing. Keep it that way: the
+            // whole loadfx call becomes undefined, which the compat createfx
+            // paths skip, instead of an unrelated stock stand-in.
+            const bool absent = alias == effectAliases.end() && !scriptEffect(name) &&
+                                std::ranges::none_of(result.fxEffects, [&](const PreparedFx &effect) {
+                                    return effect.name == name;
+                                });
+            if (absent)
+            {
+                const std::size_t call = gsc.rfind("loadfx", at);
+                const std::size_t close = gsc.find(')', end);
+                if (call != std::string::npos && at - call <= 24 && close != std::string::npos)
+                {
+                    zt::info("iw3: script effect %s is absent from the IW3 sources -> undefined",
+                             name.c_str());
+                    gsc.replace(call, close + 1 - call, "undefined");
+                    at = call + 9;
+                    continue;
+                }
+            }
             const std::string replacement = scriptEffect(name).value_or(
                 alias != effectAliases.end() ? alias->second : scripts::StockEffectFor(name));
             zt::info("iw3: script effect %s -> %s", name.c_str(), replacement.c_str());
