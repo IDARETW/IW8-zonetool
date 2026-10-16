@@ -44,29 +44,68 @@ details{margin-top:6px}
 <div id="status"></div>
 <div id="pick"></div>
 <script>
-const S={x:0,y:0,z:0,yaw:0,pitch:0,fov:65,keys:{},busy:false,dirty:true,lastT:0,info:null,fps:0};
+const S={x:0,y:0,z:0,yaw:0,pitch:0,fov:65,keys:{},dirty:true,lastT:0,info:null,frames:[],renderMs:0,mode:'stream'};
 const $=id=>document.getElementById(id);
 const view=$('view');
 function params(w,h){return `x=${S.x.toFixed(1)}&y=${S.y.toFixed(1)}&z=${S.z.toFixed(1)}&yaw=${S.yaw.toFixed(2)}&pitch=${S.pitch.toFixed(2)}&fov=${S.fov}&w=${w}&h=${h}&view=${$('mode').value}&exposure=${$('exposure').value}&lod=${$('lod').value}&world=${+$('world').checked}&models=${+$('models').checked}&dynamic=${+$('dynamic').checked}&glass=${+$('glass').checked}&flip=${+$('flip').checked}`}
-let moving=false, idleTimer=null, lastUrl=null;
-async function frame(){
-  if(S.busy) return; S.busy=true;
-  const w=moving?960:1600, h=moving?540:900;
-  const t0=performance.now();
-  try{
-    const r=await fetch('/frame?'+params(w,h)+'&q='+(moving?70:88));
-    const b=await r.blob();
-    if(lastUrl) URL.revokeObjectURL(lastUrl);
-    lastUrl=URL.createObjectURL(b); view.src=lastUrl;
-    S.fps=Math.round(1000/(performance.now()-t0));
-  }catch(e){ $('status').textContent='frame failed: '+e; }
-  S.busy=false; S.dirty=false;
-  status();
+let moving=false, idleTimer=null, lastUrl=null, camInFlight=0, camSeq=0, lastCam=0, lastFrameAt=0;
+// Moving: a smaller, lower-quality frame; once still, one full-quality frame.
+function viewSize(){return moving?[960,540,60]:[1600,900,88];}
+function show(blob){
+  if(lastUrl) URL.revokeObjectURL(lastUrl);
+  lastUrl=URL.createObjectURL(blob); view.src=lastUrl;
+  const now=performance.now(); lastFrameAt=now; S.frames.push(now);
+  while(S.frames.length&&now-S.frames[0]>1000) S.frames.shift();
+}
+// Camera updates: ~30 per second, up to six in flight (a tunnel round trip
+// is far longer than a frame); the server drops any that arrive out of order.
+async function sendCam(){
+  if(camInFlight>=6){S.dirty=true;return;}
+  camInFlight++; lastCam=performance.now();
+  const [w,h,q]=viewSize();
+  try{const r=await fetch('/cam?'+params(w,h)+'&q='+q+'&seq='+(++camSeq)); const j=await r.json(); S.renderMs=j.renderMs;}catch(e){}
+  camInFlight--;
+}
+// Frame stream: multipart JPEG parts with Content-Length, read with fetch so
+// every frame is counted; reconnects when the response ends.
+async function stream(){
+  for(;;){
+    try{
+      const r=await fetch('/stream'); const reader=r.body.getReader();
+      let buf=new Uint8Array(0);
+      const append=c=>{const n=new Uint8Array(buf.length+c.length);n.set(buf);n.set(c,buf.length);buf=n;};
+      const find=(pat,from)=>{outer:for(let i=from;i<=buf.length-pat.length;i++){for(let j=0;j<pat.length;j++) if(buf[i+j]!==pat[j]) continue outer; return i;} return -1;};
+      const sep=new TextEncoder().encode('\r\n\r\n');
+      for(;;){
+        const {value,done}=await reader.read(); if(done) break; append(value);
+        for(;;){
+          const end=find(sep,0); if(end<0) break;
+          const head=new TextDecoder().decode(buf.slice(0,end));
+          const m=/Content-Length:\s*(\d+)/i.exec(head); const len=m?+m[1]:0;
+          if(buf.length<end+4+len) break;
+          if(len>0&&/image\/jpeg/i.test(head)) show(new Blob([buf.slice(end+4,end+4+len)],{type:'image/jpeg'}));
+          buf=buf.slice(end+4+len);
+        }
+      }
+    }catch(e){}
+    if(S.mode!=='stream') return;
+    await new Promise(r=>setTimeout(r,500));
+  }
+}
+// Fallback when a proxy buffers the stream: pipelined single frames.
+let pollBusy=0;
+async function poll(){
+  if(pollBusy>=2) return; pollBusy++;
+  const [w,h,q]=viewSize();
+  try{const r=await fetch('/frame?'+params(w,h)+'&q='+q); show(await r.blob());}catch(e){}
+  pollBusy--;
 }
 function status(){
-  $('status').textContent=`pos ${S.x.toFixed(0)} ${S.y.toFixed(0)} ${S.z.toFixed(0)}   yaw ${S.yaw.toFixed(1)}  pitch ${S.pitch.toFixed(1)}   ${S.fps} fps${moving?' (preview)':''}`;
-  $('cam').value=`${S.x.toFixed(0)},${S.y.toFixed(0)},${S.z.toFixed(0)},${S.yaw.toFixed(1)},${S.pitch.toFixed(1)}`;
+  const fps=S.frames.length;
+  $('status').textContent=`pos ${S.x.toFixed(0)} ${S.y.toFixed(0)} ${S.z.toFixed(0)}   yaw ${S.yaw.toFixed(1)}  pitch ${S.pitch.toFixed(1)}   ${fps} fps   render ${S.renderMs.toFixed(0)} ms${moving?'  (preview)':''}${S.mode==='poll'?'  [polling]':''}`;
+  if(document.activeElement!==$('cam')) $('cam').value=`${S.x.toFixed(0)},${S.y.toFixed(0)},${S.z.toFixed(0)},${S.yaw.toFixed(1)},${S.pitch.toFixed(1)}`;
 }
+function touch(){S.dirty=true; moving=true; clearTimeout(idleTimer); idleTimer=setTimeout(()=>{moving=false;S.dirty=true},250);}
 function tick(t){
   const dt=Math.min((t-S.lastT)/1000,0.1); S.lastT=t;
   const k=S.keys; let speed=500*(k.shift?4:1)*(k.ctrl?0.25:1);
@@ -77,15 +116,15 @@ function tick(t){
   const add=(v,s)=>{S.x+=v[0]*s;S.y+=v[1]*s;S.z+=v[2]*s;mv=true};
   if(k.w) add(f,speed*dt); if(k.s) add(f,-speed*dt); if(k.d) add(r,speed*dt); if(k.a) add(r,-speed*dt);
   if(k.e) S.z+=speed*dt,mv=true; if(k.q) S.z-=speed*dt,mv=true;
-  if(mv){S.dirty=true; moving=true; clearTimeout(idleTimer); idleTimer=setTimeout(()=>{moving=false;S.dirty=true},250);}
-  if(S.dirty) frame();
-  requestAnimationFrame(tick);
+  if(mv) touch();
+  if(S.dirty&&t-lastCam>=33){S.dirty=false; if(S.mode==='stream') sendCam(); else poll();}
+  status();
 }
 view.addEventListener('click',()=>view.requestPointerLock());
 document.addEventListener('mousemove',e=>{
   if(document.pointerLockElement!==view) return;
   S.yaw-=e.movementX*0.15; S.pitch=Math.max(-89,Math.min(89,S.pitch+e.movementY*0.15));
-  S.dirty=true; moving=true; clearTimeout(idleTimer); idleTimer=setTimeout(()=>{moving=false;S.dirty=true},250);
+  touch();
 });
 document.addEventListener('keydown',e=>{
   if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
@@ -98,9 +137,9 @@ $('exposure').addEventListener('input',()=>{$('expv').textContent=(+$('exposure'
 $('cam').addEventListener('keydown',e=>{ if(e.key!=='Enter') return; const v=$('cam').value.split(/[ ,]+/).map(Number); if(v.length>=5){[S.x,S.y,S.z,S.yaw,S.pitch]=v;S.dirty=true;} });
 $('go').addEventListener('click',()=>{const s=S.info.spawns[+$('spawn').value]; if(!s) return; [S.x,S.y,S.z]=[s.origin[0],s.origin[1],s.origin[2]+60]; S.yaw=s.yaw; S.pitch=0; S.dirty=true;});
 async function pick(){
-  const rect=view.getBoundingClientRect(); const w=1600,h=900;
+  const w=1600,h=900;
   const r=await fetch('/pick?'+params(w,h)+`&px=${w/2}&py=${h/2}`); const j=await r.json();
-  $('pick').style.display='block'; $('pick').textContent=JSON.stringify(j,null,1); S.dirty=true;
+  $('pick').style.display='block'; $('pick').textContent=JSON.stringify(j,null,1);
 }
 $('pickbtn').addEventListener('click',pick);
 $('checkbtn').addEventListener('click',async()=>{$('pick').style.display='block';$('pick').textContent='running load checks (ACTS, preload plans, script links)...';
@@ -111,7 +150,10 @@ fetch('/info').then(r=>r.json()).then(info=>{
   const sel=$('spawn'); info.spawns.forEach((s,i)=>{const o=document.createElement('option');o.value=i;o.textContent=`${i} ${s.classname} (${s.origin.map(v=>v.toFixed(0)).join(' ')})`;sel.appendChild(o);});
   if(info.spawns.length){const s=info.spawns[0];[S.x,S.y,S.z]=[s.origin[0],s.origin[1],s.origin[2]+60];S.yaw=s.yaw;}
   else {S.x=(info.boundsMin[0]+info.boundsMax[0])/2;S.y=(info.boundsMin[1]+info.boundsMax[1])/2;S.z=(info.boundsMin[2]+info.boundsMax[2])/2;}
-  S.dirty=true; requestAnimationFrame(tick);
+  // A timer, not requestAnimationFrame: rAF stalls in unfocused windows.
+  S.lastT=performance.now(); S.dirty=true; stream(); setInterval(()=>tick(performance.now()),16);
+  // No frame within 4 s of opening the stream: a proxy is buffering it.
+  setTimeout(()=>{ if(!lastFrameAt){S.mode='poll'; S.dirty=true;} },4000);
 });
 </script></body></html>
 )HTML";

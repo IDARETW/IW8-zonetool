@@ -47,6 +47,9 @@ struct RenderOptions
     // depth-equal), i.e. surfaces that flicker as the engine's order changes.
     bool reverseOrder = false;
     bool opaqueOnly = false; // skip blended surfaces (picking under decal layers)
+    // exact view: tonemap on the GPU and read back 8-bit sRGB (Frame::rgba8)
+    // instead of the HDR target (the viewer's fast path).
+    bool gpuTonemap = false;
 };
 
 struct Frame
@@ -55,6 +58,7 @@ struct Frame
     std::vector<float> rgba; // linear HDR
     std::vector<float> depth;
     std::vector<uint32_t> ids; // id views: material id, instance id per pixel
+    std::vector<uint8_t> rgba8; // gpuTonemap: tonemapped sRGB, alpha 255
 };
 
 struct MaterialInfo

@@ -373,6 +373,40 @@ struct Batch
     const ModelSurfaceGpu *surface{}; // entity draws: quantisation bounds
     std::vector<uint32_t> indices;
 };
+struct BatchRange
+{
+    Batch *batch;
+    unsigned first, count;
+};
+// Model draw list for one LOD selection; rebuilt only when a placement's LOD
+// (or the model/dynamic toggles) changes, not every frame.
+struct DrawCache
+{
+    bool valid{};
+    std::vector<const void *> selection;
+    std::map<std::pair<std::string, uint8_t>, Batch> staticBatches;
+    std::vector<Batch> entityBatches;
+    std::vector<BatchRange> ranges;
+};
+
+constexpr char kTonemapShader[] = R"(
+Texture2D<float4> hdr : register(t0);
+cbuffer Tonemap : register(b0) { float4 exposure; };
+float4 main(float4 position : SV_Position) : SV_Target
+{
+    float3 v = max(hdr.Load(int3(position.xy, 0)).rgb * exposure.x, 0);
+    v = v / (1 + v * 0.15); // the CPU Tonemap's filmic roll-off
+    float3 low = v * 12.92, high = 1.055 * pow(v, 1 / 2.4) - 0.055;
+    return float4(saturate(v <= 0.0031308 ? low : high), 1);
+}
+)";
+constexpr char kFullscreenShader[] = R"(
+float4 main(uint id : SV_VertexID) : SV_Position
+{
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+)";
 } // namespace
 
 struct Simulator::Impl
@@ -419,6 +453,13 @@ struct Simulator::Impl
     std::vector<uint16_t> modelIndices; // local indices of every model surface
     unsigned modelVertexPages{};
     unsigned sharedLods{}; // padded LOD copies that reuse an earlier LOD's pages
+    DrawCache drawCache;
+    ComPtr<ID3D11VertexShader> fullscreenVS;
+    ComPtr<ID3D11PixelShader> tonemapPS;
+    ComPtr<ID3D11Buffer> cbTonemap;
+    ComPtr<ID3D11Texture2D> ldrTarget, ldrStaging;
+    ComPtr<ID3D11RenderTargetView> ldrView;
+    ComPtr<ID3D11ShaderResourceView> colorResource;
     std::vector<unsigned> worldSurfaceMaterial; // material id per world surface
     struct GlassDraw
     {
@@ -1211,7 +1252,10 @@ struct Simulator::Impl
             desc.CPUAccessFlags = staging ? D3D11_CPU_ACCESS_READ : 0;
             Check(device->CreateTexture2D(&desc, nullptr, &texture), "render target");
         };
-        make(DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET, colorTarget, false);
+        make(DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, colorTarget,
+             false);
+        make(DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET, ldrTarget, false);
+        make(DXGI_FORMAT_R8G8B8A8_UNORM, 0, ldrStaging, true);
         make(DXGI_FORMAT_R16G16B16A16_FLOAT, 0, colorStaging, true);
         make(DXGI_FORMAT_R32G32B32A32_UINT, D3D11_BIND_RENDER_TARGET, idTarget, false);
         make(DXGI_FORMAT_R32G32B32A32_UINT, 0, idStaging, true);
@@ -1219,6 +1263,8 @@ struct Simulator::Impl
         make(DXGI_FORMAT_D32_FLOAT, D3D11_BIND_DEPTH_STENCIL, depthTarget, false);
         make(DXGI_FORMAT_D32_FLOAT, 0, depthStaging, true);
         Check(device->CreateRenderTargetView(colorTarget.Get(), nullptr, &colorView), "RTV");
+        Check(device->CreateRenderTargetView(ldrTarget.Get(), nullptr, &ldrView), "LDR RTV");
+        Check(device->CreateShaderResourceView(colorTarget.Get(), nullptr, &colorResource), "HDR SRV");
         Check(device->CreateRenderTargetView(idTarget.Get(), nullptr, &idView), "id RTV");
         Check(device->CreateRenderTargetView(normalTarget.Get(), nullptr, &normalView), "normal RTV");
         Check(device->CreateDepthStencilView(depthTarget.Get(), nullptr, &depthView), "DSV");
@@ -1438,6 +1484,21 @@ void Simulator::Load(const std::string &simJsonPath)
     impl.cbEntity = impl.ConstantBuffer(kEntityRows * 16);
     impl.cbIds = impl.ConstantBuffer(16);
     {
+        const auto compile = [](const char *source, const char *profile) {
+            ComPtr<ID3DBlob> program, errors;
+            if (FAILED(D3DCompile(source, std::strlen(source), "sim_tonemap.hlsl", nullptr, nullptr, "main", profile,
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &program, &errors)))
+                throw std::runtime_error(std::string("sim: tonemap shader: ") +
+                                         (errors ? static_cast<const char *>(errors->GetBufferPointer()) : "?"));
+            return program;
+        };
+        const auto vs = compile(kFullscreenShader, "vs_5_0");
+        const auto ps = compile(kTonemapShader, "ps_5_0");
+        Check(impl.device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &impl.fullscreenVS),
+              "fullscreen VS");
+        Check(impl.device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &impl.tonemapPS),
+              "tonemap PS");
+        impl.cbTonemap = impl.ConstantBuffer(16);
         const auto world = CompileDebug(kIdShader, "");
         const auto model = CompileDebug(kIdShader, "#define HAS_INSTANCE 1\n");
         Check(impl.device->CreatePixelShader(world.data(), world.size(), nullptr, &impl.idShaderWorld), "id PS");
@@ -1539,11 +1600,6 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     const float blendFactor[4] = {1, 1, 1, 1};
 
     // ---- static and dynamic model batches for this camera ----------------
-    std::vector<uint32_t> drawSurfaceTable; // 4 uints per draw surface
-    std::vector<uint32_t> colorStarts;
-    std::map<std::pair<std::string, uint8_t>, Batch> staticBatches;
-    std::vector<Batch> entityBatches;
-    std::vector<uint32_t> allIndices;
     const auto lodFor = [&](const ModelGpu &model, const Placement &placement) -> const ModelLodGpu * {
         if (model.lods.empty())
             return nullptr;
@@ -1557,92 +1613,113 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
                 return &lod;
         return nullptr; // beyond the last LOD distance: culled, as in the game
     };
+    // The draw list depends only on each placement's LOD and the toggles.
+    std::vector<const void *> selection;
+    selection.reserve(impl.placements.size() + 1);
+    selection.push_back(reinterpret_cast<const void *>(
+        uintptr_t((options.drawModels ? 1 : 0) | (options.drawDynamic ? 2 : 0) | ((options.forceLod + 1) << 2))));
     if (options.drawModels || options.drawDynamic)
+        for (const Placement &placement : impl.placements)
+            selection.push_back(placement.dynamic ? (options.drawDynamic ? lodFor(impl.models[placement.model], placement)
+                                                                          : nullptr)
+                                                  : (options.drawModels ? lodFor(impl.models[placement.model], placement)
+                                                                        : nullptr));
+    DrawCache &cache = impl.drawCache;
+    if (!cache.valid || cache.selection != selection)
     {
-        for (unsigned p = 0; p < impl.placements.size(); ++p)
+    std::vector<uint32_t> drawSurfaceTable; // 4 uints per draw surface
+    std::vector<uint32_t> colorStarts;
+    auto &staticBatches = cache.staticBatches;
+    auto &entityBatches = cache.entityBatches;
+    staticBatches.clear();
+    entityBatches.clear();
+    std::vector<uint32_t> allIndices;
+        if (options.drawModels || options.drawDynamic)
         {
-            const Placement &placement = impl.placements[p];
-            if (placement.dynamic ? !options.drawDynamic : !options.drawModels)
-                continue;
-            const ModelGpu &model = impl.models[placement.model];
-            const ModelLodGpu *lod = lodFor(model, placement);
-            if (!lod)
-                continue;
-            for (const auto &surface : lod->surfaces)
+            for (unsigned p = 0; p < impl.placements.size(); ++p)
             {
-                const auto material = impl.materials.find(surface.material);
-                if (material == impl.materials.end())
+                const Placement &placement = impl.placements[p];
+                if (placement.dynamic ? !options.drawDynamic : !options.drawModels)
                     continue;
-                if (drawSurfaceTable.size() / 4 >= 65535)
-                    break;
-                const uint16_t *local = impl.modelIndices.data() + surface.indexFirst;
-                if (model.entity)
+                const ModelGpu &model = impl.models[placement.model];
+                const ModelLodGpu *lod = lodFor(model, placement);
+                if (!lod)
+                    continue;
+                for (const auto &surface : lod->surfaces)
                 {
-                    // DObj path: one draw surface per rigid run, its bone in x.
-                    std::vector<RigidRun> runs = surface.runs;
-                    if (runs.empty())
-                        runs.push_back({0, 0, 0, surface.triCount});
-                    entityBatches.push_back({});
-                    Batch &batch = entityBatches.back();
-                    batch.entity = true;
-                    batch.placement = p;
-                    batch.modelIndex = placement.model;
-                    batch.surface = &surface;
-                    batch.material = &material->second;
-                    batch.cullType = surface.cullType;
-                    for (const auto &run : runs)
+                    const auto material = impl.materials.find(surface.material);
+                    if (material == impl.materials.end())
+                        continue;
+                    if (drawSurfaceTable.size() / 4 >= 65535)
+                        break;
+                    const uint16_t *local = impl.modelIndices.data() + surface.indexFirst;
+                    if (model.entity)
                     {
-                        if (drawSurfaceTable.size() / 4 >= 65535)
-                            break;
-                        if (run.bone < model.bones.size() && model.bones[run.bone].hidden)
-                            continue;
-                        const uint32_t ds = static_cast<uint32_t>(drawSurfaceTable.size() / 4);
-                        drawSurfaceTable.insert(drawSurfaceTable.end(),
-                                                {run.bone, surface.boundsIndex, surface.pageStart, 0});
-                        colorStarts.push_back(surface.colorPageStart);
-                        const unsigned end = std::min(surface.triCount, run.triOffset + run.triCount);
-                        for (unsigned t = run.triOffset * 3; t < end * 3; ++t)
-                            batch.indices.push_back((ds << 16) | local[t]);
+                        // DObj path: one draw surface per rigid run, its bone in x.
+                        std::vector<RigidRun> runs = surface.runs;
+                        if (runs.empty())
+                            runs.push_back({0, 0, 0, surface.triCount});
+                        entityBatches.push_back({});
+                        Batch &batch = entityBatches.back();
+                        batch.entity = true;
+                        batch.placement = p;
+                        batch.modelIndex = placement.model;
+                        batch.surface = &surface;
+                        batch.material = &material->second;
+                        batch.cullType = surface.cullType;
+                        for (const auto &run : runs)
+                        {
+                            if (drawSurfaceTable.size() / 4 >= 65535)
+                                break;
+                            if (run.bone < model.bones.size() && model.bones[run.bone].hidden)
+                                continue;
+                            const uint32_t ds = static_cast<uint32_t>(drawSurfaceTable.size() / 4);
+                            drawSurfaceTable.insert(drawSurfaceTable.end(),
+                                                    {run.bone, surface.boundsIndex, surface.pageStart, 0});
+                            colorStarts.push_back(surface.colorPageStart);
+                            const unsigned end = std::min(surface.triCount, run.triOffset + run.triCount);
+                            for (unsigned t = run.triOffset * 3; t < end * 3; ++t)
+                                batch.indices.push_back((ds << 16) | local[t]);
+                        }
+                        continue;
                     }
-                    continue;
+                    const uint32_t ds = static_cast<uint32_t>(drawSurfaceTable.size() / 4);
+                    drawSurfaceTable.insert(drawSurfaceTable.end(), {p, surface.boundsIndex, surface.pageStart, 0});
+                    colorStarts.push_back(surface.colorPageStart);
+                    Batch *batch = &staticBatches[{surface.material, surface.cullType}];
+                    batch->material = &material->second;
+                    batch->cullType = surface.cullType;
+                    for (unsigned i = 0; i < surface.triCount * 3; ++i)
+                        batch->indices.push_back((ds << 16) | local[i]);
                 }
-                const uint32_t ds = static_cast<uint32_t>(drawSurfaceTable.size() / 4);
-                drawSurfaceTable.insert(drawSurfaceTable.end(), {p, surface.boundsIndex, surface.pageStart, 0});
-                colorStarts.push_back(surface.colorPageStart);
-                Batch *batch = &staticBatches[{surface.material, surface.cullType}];
-                batch->material = &material->second;
-                batch->cullType = surface.cullType;
-                for (unsigned i = 0; i < surface.triCount * 3; ++i)
-                    batch->indices.push_back((ds << 16) | local[i]);
             }
         }
+        // Draw-surface table (t63): records at 0, colour page starts at the
+        // fixed table base the vertex shader reads.
+        {
+            std::vector<uint8_t> table(kColorPageTableBase + colorStarts.size() * 4 + 16, 0);
+            std::memcpy(table.data(), drawSurfaceTable.data(), drawSurfaceTable.size() * 4);
+            std::memcpy(table.data() + kColorPageTableBase, colorStarts.data(), colorStarts.size() * 4);
+            impl.drawSurfaces = impl.RawBuffer(table.data(), table.size(), &impl.drawSurfacesBuffer);
+        }
+        auto &ranges = cache.ranges;
+        ranges.clear();
+        for (auto &[key, batch] : staticBatches)
+        {
+            ranges.push_back({&batch, static_cast<unsigned>(allIndices.size()), static_cast<unsigned>(batch.indices.size())});
+            allIndices.insert(allIndices.end(), batch.indices.begin(), batch.indices.end());
+        }
+        for (auto &batch : entityBatches)
+        {
+            ranges.push_back({&batch, static_cast<unsigned>(allIndices.size()), static_cast<unsigned>(batch.indices.size())});
+            allIndices.insert(allIndices.end(), batch.indices.begin(), batch.indices.end());
+        }
+        if (!allIndices.empty())
+            impl.modelIndexBuffer = impl.IndexBuffer(allIndices.data(), allIndices.size() * 4, false);
+        cache.selection = std::move(selection);
+        cache.valid = true;
     }
-    // Draw-surface table (t63): records at 0, colour page starts at the
-    // fixed table base the vertex shader reads.
-    {
-        std::vector<uint8_t> table(kColorPageTableBase + colorStarts.size() * 4 + 16, 0);
-        std::memcpy(table.data(), drawSurfaceTable.data(), drawSurfaceTable.size() * 4);
-        std::memcpy(table.data() + kColorPageTableBase, colorStarts.data(), colorStarts.size() * 4);
-        impl.drawSurfaces = impl.RawBuffer(table.data(), table.size(), &impl.drawSurfacesBuffer);
-    }
-    struct Range
-    {
-        Batch *batch;
-        unsigned first, count;
-    };
-    std::vector<Range> ranges;
-    for (auto &[key, batch] : staticBatches)
-    {
-        ranges.push_back({&batch, static_cast<unsigned>(allIndices.size()), static_cast<unsigned>(batch.indices.size())});
-        allIndices.insert(allIndices.end(), batch.indices.begin(), batch.indices.end());
-    }
-    for (auto &batch : entityBatches)
-    {
-        ranges.push_back({&batch, static_cast<unsigned>(allIndices.size()), static_cast<unsigned>(batch.indices.size())});
-        allIndices.insert(allIndices.end(), batch.indices.begin(), batch.indices.end());
-    }
-    if (!allIndices.empty())
-        impl.modelIndexBuffer = impl.IndexBuffer(allIndices.data(), allIndices.size() * 4, false);
+    auto &ranges = cache.ranges;
 
     const auto applyPipeline = [&](const Pipeline &pipeline, const TextureMap &textures, const bool ids,
                                    const bool model) {
@@ -1809,7 +1886,8 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
     Frame frame;
     frame.width = options.width;
     frame.height = options.height;
-    frame.rgba.resize(size_t(options.width) * options.height * 4);
+    if (!(options.gpuTonemap && options.view == View::exact))
+        frame.rgba.resize(size_t(options.width) * options.height * 4);
     if (idPass)
     {
         ctx.CopyResource(impl.idStaging.Get(), impl.idTarget.Get());
@@ -1853,6 +1931,36 @@ Frame Simulator::Render(const Camera &camera, const RenderOptions &options)
             }
         }
         ctx.Unmap(impl.idStaging.Get(), 0);
+    }
+    else if (options.gpuTonemap && options.view == View::exact)
+    {
+        ID3D11RenderTargetView *ldr[1] = {impl.ldrView.Get()};
+        ctx.OMSetRenderTargets(1, ldr, nullptr);
+        ctx.RSSetState(nullptr);
+        ctx.OMSetDepthStencilState(nullptr, 0);
+        ctx.OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        ctx.IASetInputLayout(nullptr);
+        ctx.IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        ctx.VSSetShader(impl.fullscreenVS.Get(), nullptr, 0);
+        ctx.PSSetShader(impl.tonemapPS.Get(), nullptr, 0);
+        const float exposure[4] = {options.exposure, 0, 0, 0};
+        impl.Update(impl.cbTonemap.Get(), exposure, sizeof(exposure));
+        ID3D11Buffer *tonemapConstants[1] = {impl.cbTonemap.Get()};
+        ctx.PSSetConstantBuffers(0, 1, tonemapConstants);
+        ID3D11ShaderResourceView *hdr[1] = {impl.colorResource.Get()};
+        ctx.PSSetShaderResources(0, 1, hdr);
+        ctx.Draw(3, 0);
+        ID3D11ShaderResourceView *none[1] = {};
+        ctx.PSSetShaderResources(0, 1, none);
+        ctx.OMSetRenderTargets(0, nullptr, nullptr);
+        ctx.CopyResource(impl.ldrStaging.Get(), impl.ldrTarget.Get());
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        Check(ctx.Map(impl.ldrStaging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "LDR readback");
+        frame.rgba8.resize(size_t(options.width) * options.height * 4);
+        for (unsigned y = 0; y < options.height; ++y)
+            std::memcpy(frame.rgba8.data() + size_t(y) * options.width * 4,
+                        static_cast<const uint8_t *>(mapped.pData) + size_t(y) * mapped.RowPitch, size_t(options.width) * 4);
+        ctx.Unmap(impl.ldrStaging.Get(), 0);
     }
     else
     {

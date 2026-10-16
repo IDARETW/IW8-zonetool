@@ -9,6 +9,7 @@
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <objbase.h>
 
 #include <algorithm>
 #include <cctype>
@@ -19,6 +20,10 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <condition_variable>
 #include <numbers>
 #include <sstream>
 #include <string>
@@ -467,7 +472,7 @@ void Respond(const SOCKET client, const char *status, const char *type, const vo
 {
     std::string header = std::string("HTTP/1.1 ") + status + "\r\nContent-Type: " + type +
                          "\r\nContent-Length: " + std::to_string(size) +
-                         "\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n";
+                         "\r\nCache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n";
     send(client, header.data(), static_cast<int>(header.size()), 0);
     size_t sent = 0;
     while (sent < size)
@@ -479,6 +484,45 @@ void Respond(const SOCKET client, const char *status, const char *type, const vo
     }
 }
 
+// Viewer request parameters shared by /frame, /pick and /cam.
+void ApplyViewQuery(const std::map<std::string, std::string> &query, const Options &options, Camera &camera,
+                    RenderOptions &render)
+{
+    camera.origin[0] = Get(query, "x", camera.origin[0]);
+    camera.origin[1] = Get(query, "y", camera.origin[1]);
+    camera.origin[2] = Get(query, "z", camera.origin[2]);
+    camera.yaw = Get(query, "yaw", camera.yaw);
+    camera.pitch = Get(query, "pitch", camera.pitch);
+    camera.fov = Get(query, "fov", camera.fov);
+    render.width = static_cast<unsigned>(std::clamp(Get(query, "w", 1280.0f), 64.0f, 3840.0f));
+    render.height = static_cast<unsigned>(std::clamp(Get(query, "h", 720.0f), 64.0f, 2160.0f));
+    render.exposure = Get(query, "exposure", render.exposure);
+    render.forceLod = static_cast<int>(Get(query, "lod", -1));
+    if (const auto view = query.find("view"); view != query.end())
+        render.view = ParseView(view->second);
+    render.drawWorld = Get(query, "world", 1) != 0;
+    render.drawModels = Get(query, "models", 1) != 0;
+    render.drawDynamic = Get(query, "dynamic", 1) != 0;
+    render.drawGlass = Get(query, "glass", 1) != 0;
+    render.flipWinding = Get(query, "flip", options.render.flipWinding ? 1.0f : 0.0f) != 0;
+}
+
+// One rendered JPEG of the current view (the simulator lock must be held).
+std::vector<uint8_t> RenderJpeg(Simulator &simulator, const Camera &camera, RenderOptions render, const int quality)
+{
+    render.gpuTonemap = true;
+    const Frame frame = simulator.Render(camera, render);
+    if (!frame.rgba8.empty())
+        return Simulator::EncodeJpeg(frame.rgba8.data(), frame.width, frame.height, quality);
+    const auto rgba = Simulator::Tonemap(frame, render.exposure);
+    return Simulator::EncodeJpeg(rgba.data(), frame.width, frame.height, quality);
+}
+
+// Live viewer. Every connection gets its own thread. The page keeps one
+// /stream response open (multipart JPEG frames) and posts camera changes to
+// /cam; a single render thread owns the GPU and renders the latest requested
+// view whenever it changes, so frame throughput no longer waits for a network
+// round trip per frame (the remote tunnel adds most of a second to each).
 int Serve(Simulator &simulator, const Options &options)
 {
     WSADATA wsa{};
@@ -491,7 +535,7 @@ int Serve(Simulator &simulator, const Options &options)
     address.sin_addr.s_addr = htonl(INADDR_ANY);
     const BOOL reuse = TRUE;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char *>(&reuse), sizeof(reuse));
-    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) || listen(listener, 8))
+    if (bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) || listen(listener, 64))
         throw std::runtime_error("sim: cannot listen on port " + std::to_string(options.port));
     std::string secret;
     if (!options.authFile.empty())
@@ -503,6 +547,70 @@ int Serve(Simulator &simulator, const Options &options)
         if (secret.find(':') == std::string::npos)
             throw std::runtime_error("sim: the auth file must hold user:password");
     }
+
+    struct Shared
+    {
+        std::mutex mutex;
+        std::condition_variable changed;
+        Camera camera;
+        RenderOptions render;
+        int quality = 80;
+        uint64_t requested = 1, rendered = 0; // view versions
+        std::shared_ptr<const std::vector<uint8_t>> jpeg;
+        uint64_t frameId = 0;
+        double renderMs = 0;
+        int streams = 0;
+        double lastSeq = -1; // /cam updates may overtake each other in flight
+    };
+    auto shared = std::make_shared<Shared>();
+    shared->camera = options.cameraSet ? options.camera : SpawnCamera(simulator, 0);
+    shared->render = options.render;
+    shared->render.width = 960;
+    shared->render.height = 540;
+    std::mutex simulatorLock; // one D3D11 immediate context
+
+    std::thread([&simulator, &simulatorLock, shared]() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        for (;;)
+        {
+            Camera camera;
+            RenderOptions render;
+            int quality;
+            uint64_t version;
+            {
+                std::unique_lock lock(shared->mutex);
+                shared->changed.wait(lock, [&] { return shared->streams > 0 && shared->requested != shared->rendered; });
+                camera = shared->camera;
+                render = shared->render;
+                quality = shared->quality;
+                version = shared->requested;
+            }
+            std::shared_ptr<const std::vector<uint8_t>> jpeg;
+            const auto t0 = std::chrono::steady_clock::now();
+            try
+            {
+                std::lock_guard simulatorGuard(simulatorLock);
+                jpeg = std::make_shared<const std::vector<uint8_t>>(RenderJpeg(simulator, camera, render, quality));
+            }
+            catch (const std::exception &error)
+            {
+                zt::warn("sim: viewer frame failed: %s", error.what());
+            }
+            {
+                std::lock_guard lock(shared->mutex);
+                if (jpeg)
+                {
+                    shared->jpeg = std::move(jpeg);
+                    ++shared->frameId;
+                    shared->renderMs =
+                        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                }
+                shared->rendered = version;
+            }
+            shared->changed.notify_all();
+        }
+    }).detach();
+
     zt::info("sim: viewer at http://localhost:%d/  (free camera: WASD + mouse, Q/E up/down, Shift fast)%s",
              options.port, secret.empty() ? "" : ", HTTP basic auth required");
     for (;;)
@@ -510,104 +618,173 @@ int Serve(Simulator &simulator, const Options &options)
         const SOCKET client = accept(listener, nullptr, nullptr);
         if (client == INVALID_SOCKET)
             continue;
-        Request request;
-        if (!ReadRequest(client, request))
-        {
-            closesocket(client);
-            continue;
-        }
-        if (!secret.empty())
-        {
-            const bool basic = request.authorization.rfind("Basic ", 0) == 0;
-            if (!basic || !SameSecret(Base64Decode(request.authorization.substr(6)), secret))
+        std::thread([&simulator, &simulatorLock, &options, shared, secret, client]() {
+            const BOOL noDelay = TRUE;
+            setsockopt(client, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&noDelay), sizeof(noDelay));
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            // Keep-alive: one connection carries many /cam requests (a tunnel
+            // round trip per new connection otherwise).
+            for (bool keep = true; keep;)
             {
-                Sleep(400); // slow down guessing
-                const char *body = "authentication required";
-                const std::string header =
-                    std::string("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"map simulator\", "
-                                "charset=\"UTF-8\"\r\nContent-Type: text/plain\r\nContent-Length: ") +
-                    std::to_string(std::strlen(body)) + "\r\nConnection: close\r\n\r\n" + body;
-                send(client, header.data(), static_cast<int>(header.size()), 0);
-                closesocket(client);
-                continue;
-            }
-        }
-        try
-        {
-            const std::string path = request.target.substr(0, request.target.find('?'));
-            const auto query = Query(request.target);
-            if (path == "/")
-                Respond(client, "200 OK", "text/html; charset=utf-8", kViewerHtml, std::strlen(kViewerHtml));
-            else if (path == "/info")
+            Request request;
+            if (!ReadRequest(client, request))
+                break;
+            if (!secret.empty())
             {
-                const std::string body = InfoJson(simulator).dump();
-                Respond(client, "200 OK", "application/json", body.data(), body.size());
-            }
-            else if (path == "/frame" || path == "/pick")
-            {
-                Camera camera = options.cameraSet ? options.camera : SpawnCamera(simulator, 0);
-                camera.origin[0] = Get(query, "x", camera.origin[0]);
-                camera.origin[1] = Get(query, "y", camera.origin[1]);
-                camera.origin[2] = Get(query, "z", camera.origin[2]);
-                camera.yaw = Get(query, "yaw", camera.yaw);
-                camera.pitch = Get(query, "pitch", camera.pitch);
-                camera.fov = Get(query, "fov", camera.fov);
-                RenderOptions render = options.render;
-                render.width = static_cast<unsigned>(std::clamp(Get(query, "w", 1280.0f), 64.0f, 3840.0f));
-                render.height = static_cast<unsigned>(std::clamp(Get(query, "h", 720.0f), 64.0f, 2160.0f));
-                render.exposure = Get(query, "exposure", render.exposure);
-                render.forceLod = static_cast<int>(Get(query, "lod", -1));
-                if (const auto view = query.find("view"); view != query.end())
-                    render.view = ParseView(view->second);
-                render.drawWorld = Get(query, "world", 1) != 0;
-                render.drawModels = Get(query, "models", 1) != 0;
-                render.drawDynamic = Get(query, "dynamic", 1) != 0;
-                render.drawGlass = Get(query, "glass", 1) != 0;
-                render.flipWinding = Get(query, "flip", options.render.flipWinding ? 1.0f : 0.0f) != 0;
-                if (path == "/pick")
+                const bool basic = request.authorization.rfind("Basic ", 0) == 0;
+                if (!basic || !SameSecret(Base64Decode(request.authorization.substr(6)), secret))
                 {
-                    const std::string body = simulator.Describe(camera, render, static_cast<unsigned>(Get(query, "px", 0)),
-                                                                static_cast<unsigned>(Get(query, "py", 0)));
+                    Sleep(400); // slow down guessing
+                    const char *body = "authentication required";
+                    const std::string header =
+                        std::string("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"map simulator\", "
+                                    "charset=\"UTF-8\"\r\nContent-Type: text/plain\r\nContent-Length: ") +
+                        std::to_string(std::strlen(body)) + "\r\nConnection: close\r\n\r\n" + body;
+                    send(client, header.data(), static_cast<int>(header.size()), 0);
+                    break;
+                }
+            }
+            try
+            {
+                const std::string path = request.target.substr(0, request.target.find('?'));
+                const auto query = Query(request.target);
+                if (path == "/")
+                    Respond(client, "200 OK", "text/html; charset=utf-8", kViewerHtml, std::strlen(kViewerHtml));
+                else if (path == "/info")
+                {
+                    std::string body;
+                    {
+                        std::lock_guard guard(simulatorLock);
+                        body = InfoJson(simulator).dump();
+                    }
                     Respond(client, "200 OK", "application/json", body.data(), body.size());
                 }
-                else
+                else if (path == "/cam")
                 {
-                    const Frame frame = simulator.Render(camera, render);
-                    const auto rgba = Simulator::Tonemap(frame, render.exposure);
-                    const auto jpeg = Simulator::EncodeJpeg(rgba.data(), frame.width, frame.height,
-                                                            static_cast<int>(Get(query, "q", float(options.quality))));
-                    Respond(client, "200 OK", "image/jpeg", jpeg.data(), jpeg.size());
+                    {
+                        std::lock_guard lock(shared->mutex);
+                        const double seq = Get(query, "seq", -1);
+                        if (seq < 0 || seq > shared->lastSeq)
+                        {
+                            shared->lastSeq = seq < 0 ? shared->lastSeq : seq;
+                            ApplyViewQuery(query, options, shared->camera, shared->render);
+                            shared->quality = static_cast<int>(std::clamp(Get(query, "q", 80), 20.0f, 100.0f));
+                            ++shared->requested;
+                        }
+                    }
+                    shared->changed.notify_all();
+                    std::string body;
+                    {
+                        std::lock_guard lock(shared->mutex);
+                        body = "{\"frame\":" + std::to_string(shared->frameId) +
+                               ",\"renderMs\":" + std::to_string(shared->renderMs) + "}";
+                    }
+                    Respond(client, "200 OK", "application/json", body.data(), body.size());
                 }
+                else if (path == "/stream")
+                {
+                    const std::string header = "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+                                               "Cache-Control: no-store\r\nX-Accel-Buffering: no\r\nConnection: close\r\n\r\n";
+                    bool open = send(client, header.data(), static_cast<int>(header.size()), 0) > 0;
+                    uint64_t sent = 0;
+                    {
+                        std::lock_guard lock(shared->mutex);
+                        ++shared->streams;
+                        ++shared->requested; // a fresh frame for the new viewer
+                    }
+                    shared->changed.notify_all();
+                    while (open)
+                    {
+                        std::shared_ptr<const std::vector<uint8_t>> jpeg;
+                        {
+                            std::unique_lock lock(shared->mutex);
+                            // Wake at least every 10 s: an empty part keeps idle
+                            // tunnels from closing the response.
+                            shared->changed.wait_for(lock, std::chrono::seconds(10),
+                                                     [&] { return shared->frameId != sent; });
+                            if (shared->frameId != sent)
+                            {
+                                jpeg = shared->jpeg;
+                                sent = shared->frameId;
+                            }
+                        }
+                        const std::string part =
+                            jpeg ? "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + std::to_string(jpeg->size()) +
+                                       "\r\nX-Frame: " + std::to_string(sent) + "\r\n\r\n"
+                                 : std::string("--frame\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n\r\n");
+                        open = send(client, part.data(), static_cast<int>(part.size()), 0) > 0;
+                        size_t offset = 0;
+                        while (open && jpeg && offset < jpeg->size())
+                        {
+                            const int n = send(client, reinterpret_cast<const char *>(jpeg->data()) + offset,
+                                               static_cast<int>(std::min<size_t>(jpeg->size() - offset, 1 << 16)), 0);
+                            open = n > 0;
+                            offset += n > 0 ? static_cast<size_t>(n) : 0;
+                        }
+                        if (open && jpeg)
+                            open = send(client, "\r\n", 2, 0) > 0;
+                    }
+                    std::lock_guard lock(shared->mutex);
+                    --shared->streams;
+                    keep = false;
+                }
+                else if (path == "/frame" || path == "/pick")
+                {
+                    Camera camera = options.cameraSet ? options.camera : SpawnCamera(simulator, 0);
+                    RenderOptions render = options.render;
+                    ApplyViewQuery(query, options, camera, render);
+                    if (path == "/pick")
+                    {
+                        std::string body;
+                        {
+                            std::lock_guard guard(simulatorLock);
+                            body = simulator.Describe(camera, render, static_cast<unsigned>(Get(query, "px", 0)),
+                                                      static_cast<unsigned>(Get(query, "py", 0)));
+                        }
+                        Respond(client, "200 OK", "application/json", body.data(), body.size());
+                    }
+                    else
+                    {
+                        std::vector<uint8_t> jpeg;
+                        {
+                            std::lock_guard guard(simulatorLock);
+                            jpeg = RenderJpeg(simulator, camera, render,
+                                              static_cast<int>(Get(query, "q", float(options.quality))));
+                        }
+                        Respond(client, "200 OK", "image/jpeg", jpeg.data(), jpeg.size());
+                    }
+                }
+                else if (path == "/check")
+                {
+                    std::string report;
+                    if (options.package.empty())
+                        report = "{\"error\":\"start the viewer with --package <built map directory> to run checks\"}";
+                    else
+                    {
+                        const std::string command = "python -I \"" + path_join(ToolsDirectory(), "mapcheck.py") +
+                                                    "\" \"" + options.package + "\" --json";
+                        FILE *pipe = _popen(command.c_str(), "r");
+                        char chunk[4096];
+                        while (pipe && std::fgets(chunk, sizeof(chunk), pipe))
+                            report += chunk;
+                        if (pipe)
+                            _pclose(pipe);
+                        if (report.empty())
+                            report = "{\"error\":\"mapcheck produced no output\"}";
+                    }
+                    Respond(client, "200 OK", "application/json", report.data(), report.size());
+                }
+                else
+                    Respond(client, "404 Not Found", "text/plain", "not found", 9);
             }
-            else if (path == "/check")
+            catch (const std::exception &error)
             {
-                std::string report;
-                if (options.package.empty())
-                    report = "{\"error\":\"start the viewer with --package <built map directory> to run checks\"}";
-                else
-                {
-                    const std::string command = "python -I \"" + path_join(ToolsDirectory(), "mapcheck.py") + "\" \"" +
-                                                options.package + "\" --json";
-                    FILE *pipe = _popen(command.c_str(), "r");
-                    char chunk[4096];
-                    while (pipe && std::fgets(chunk, sizeof(chunk), pipe))
-                        report += chunk;
-                    if (pipe)
-                        _pclose(pipe);
-                    if (report.empty())
-                        report = "{\"error\":\"mapcheck produced no output\"}";
-                }
-                Respond(client, "200 OK", "application/json", report.data(), report.size());
+                const std::string body = std::string("{\"error\":\"") + error.what() + "\"}";
+                Respond(client, "500 Internal Server Error", "application/json", body.data(), body.size());
             }
-            else
-                Respond(client, "404 Not Found", "text/plain", "not found", 9);
-        }
-        catch (const std::exception &error)
-        {
-            const std::string body = std::string("{\"error\":\"") + error.what() + "\"}";
-            Respond(client, "500 Internal Server Error", "application/json", body.data(), body.size());
-        }
-        closesocket(client);
+            }
+            closesocket(client);
+        }).detach();
     }
 }
 } // namespace
