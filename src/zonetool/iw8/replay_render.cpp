@@ -1538,7 +1538,9 @@ Mesh Load(const std::string &path)
                 for (unsigned k = 0; k < 2; ++k)
                 {
                     const double value = v.at("lightmapUV").at(k).get<double>();
-                    if (!std::isfinite(value) || value < 0 || value >= 65536)
+                    // Tile and flag words (layer rank in bits 12-17) stay exact
+                    // as float integers below 2^24.
+                    if (!std::isfinite(value) || value < 0 || value >= 16777216.0)
                         throw std::runtime_error("Atlas metadata is outside supported range");
                     append(m.aux, float(std::floor(value)));
                 }

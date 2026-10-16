@@ -211,6 +211,9 @@ struct PreparedRawFile
 struct PreparedMap
 {
     std::filesystem::path root;
+    // Rung spacing of the map's ladder models; 0 keeps Replay's 12 (map.json
+    // ladderRungDistance, applied by the DW client).
+    float ladderRungDistance{};
     std::filesystem::path collision;
     std::filesystem::path footsteps;
     std::filesystem::path scratch;

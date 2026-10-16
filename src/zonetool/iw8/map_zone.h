@@ -97,6 +97,15 @@ inline void emitPhysicsAssetReference(ZoneBuffer &zb,
     zb.writeStr(name);
     zb.popStream();
     zb.popStream();
+    // Map zones load through Preload_PhysicsAssetPtr (0xDFB170), which places this
+    // stub in stream 2 where Load_PhysicsAssetPtr (0xDF3A60) uses stream 1. Reserve
+    // it in both. Unreserved, Greenband's static-model collision stubs overran
+    // stream 2 into stream 6, which the preload allocator places right after it,
+    // and corrupted the map script's bytecode ("unknown function", owner 2026-10-15).
+    zb.pushStream(XFILE_BLOCK_TEMP_POSTLOAD);
+    zb.align(7);
+    zb.reserveCalc(sizeof(asset));
+    zb.popStream();
 }
 
 inline void emitStaticModelCollisionModelLists(

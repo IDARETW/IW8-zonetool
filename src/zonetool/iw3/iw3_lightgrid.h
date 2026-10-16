@@ -18,9 +18,13 @@ bool PrepareNativeLightGrid(const std::filesystem::path &sourceRoot,
 // the nearest cell within 8 steps), as an ambient cube of shading values in IW3
 // light-grid units (the units the world lightmaps use) for +X,-X,+Y,-Y,+Z,-Z.
 // Empty when the map has no exported light grid.
+// With sunVisibility, also each point's IW3 sun visibility: the interpolated
+// share of grid cells whose primary light is the sun (IW3 lit a static model
+// by the sun only where its grid point's primary light was the sun).
 std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
     const std::filesystem::path &sourceRoot, const std::string &sourceAsset,
-    const std::vector<std::array<float, 3>> &points);
+    const std::vector<std::array<float, 3>> &points, unsigned sunPrimaryLight = 0,
+    std::vector<float> *sunVisibility = nullptr);
 
 // The IW3 light grid as a world-space L1 SH volume for moving or scripted
 // models (IW3 lit those from the grid at their lighting origin). Cells hold

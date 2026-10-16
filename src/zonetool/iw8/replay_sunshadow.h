@@ -75,6 +75,33 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
           const replaybounds::Bounds &receiverBounds, float sampleSize = 1.0f,
           const replaybounds::Bounds *focus = nullptr);
 
+// World-space sun depth image for the converted surface shaders: 16-bit
+// occluder depths (the midpoint of each texel's stored-depth interval, 0 = no
+// caster) over the region's sun-space footprint, rasterized two-sided, in
+// whole 512x512 tiles (at most DepthImageTiles). RGBA8, DepthImageWidth x
+// DepthImageHeight (the largest uncompressed resident image our packager
+// accepts): row 0
+// holds 18 little-endian floats (right xyz, up xyz, sun xyz, startX, startY,
+// texel size, origin, inverse span, baked width, baked height, 1 when baked,
+// row stride); from row 1 the depths in row-major order, two per texel, high
+// byte first. A receiver p is lit where (sun.p + origin) * inverseSpan is at
+// least the stored depth.
+constexpr std::uint32_t DepthImageWidth = 4096;
+constexpr std::uint32_t DepthImageHeight = 4096;
+constexpr std::uint32_t DepthImageTiles =
+    (DepthImageWidth * (DepthImageHeight - 1) * 2) / (512 * 512);
+
+struct DepthImage
+{
+    std::uint32_t width{}, height{};
+    float texelSize{};
+    bool baked{};
+    std::vector<std::uint8_t> rgba;
+};
+
+DepthImage BakeDepthImage(const Scene &scene, const std::array<float, 3> &sunDirection,
+                          const replaybounds::Bounds &region);
+
 // A mini tile stores normalized occluder depth. Positive zero means no caster.
 // Replay compares (projectedReceiver + origin) * inverseSpan with this depth.
 std::vector<std::uint8_t> EncodeTile(std::span<const float> depths,

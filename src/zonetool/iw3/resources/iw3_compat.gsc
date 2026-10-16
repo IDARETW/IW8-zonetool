@@ -45,6 +45,36 @@ iw3compat_load_main()
     level thread iw3compat_destructible_vehicles();
     level thread iw3compat_destructables();
     level thread iw3compat_interactive_tvs();
+    level thread iw3compat_out_of_bounds();
+}
+
+// IW8 maps kill players who leave the play space; converted IW3 maps had no
+// such volume, and far outside the map Replay's visibility pass crashed.
+iw3compat_out_of_bounds()
+{
+    if ( !isdefined( level.mw120r_playspace_min ) || !isdefined( level.mw120r_playspace_max ) )
+        return;
+
+    low = level.mw120r_playspace_min;
+    high = level.mw120r_playspace_max;
+    for ( ;; )
+    {
+        wait 0.25;
+        if ( !isdefined( level.players ) )
+            continue;
+
+        foreach ( player in level.players )
+        {
+            // Only builtins Replay registers (isalive/suicide compile with
+            // gsc-tool but are unknown to Replay's linker: "unknown function").
+            if ( !isdefined( player ) || !isdefined( player.health ) || player.health <= 0 )
+                continue;
+
+            origin = player.origin;
+            if ( origin[0] < low[0] || origin[1] < low[1] || origin[2] < low[2] || origin[0] > high[0] || origin[1] > high[1] || origin[2] > high[2] )
+                radiusdamage( origin, 32, 100000, 100000 );
+        }
+    }
 }
 
 iw3compat_precache()

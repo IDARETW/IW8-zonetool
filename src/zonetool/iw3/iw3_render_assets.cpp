@@ -72,7 +72,9 @@ struct SourceMaterial
     bool shadowOnly{};
     unsigned flags{};
     unsigned cullMode{1}; // Replay: none=0, back=1, front=2.
-    bool depthBias{};     // IW3 polygonOffset on the color pass.
+    bool depthBias{};     // IW3 polygonOffset on the color pass, or a decal sort.
+    unsigned sortKey{4};
+    unsigned blend{};     // 0 alpha or opaque, 1 additive, 2 multiply, 3 srcalpha additive
 };
 
 enum class FxMaterialFamily
@@ -896,6 +898,9 @@ std::vector<Image> LoadImage(const std::filesystem::path &root,
         return {SolidImage({255, 255, 255, 255})};
     if (name == "$black")
         return {SolidImage({0, 0, 0, 255})};
+    // Water specular: sRGB 80 is linear .08, Replay F0 .25 * .08 = .02 (water).
+    if (name == "$water_specular")
+        return {SolidImage({80, 80, 80, 255})};
     if (name == "$identitynormalmap")
         return {SolidImage({128, 128, 255, 255})};
     const auto path = root / "images" / (name + ".dds");
@@ -1258,13 +1263,13 @@ std::vector<std::uint8_t> BuildReflectionProbeArray(const std::vector<Cubemap> &
 // edge texels: dark, speckled outlines on IW3 cut-out decals (owner test
 // 2026-10-14, zz_trailer_decal "INDEPENDENT MOVING & DELIVERY"). Grow the visible
 // colour outward through the cut-away texels; alpha is unchanged.
-void BleedCutoutColor(Image &level)
+void BleedCutoutColor(Image &level, const unsigned visibleAlpha = 128)
 {
     const std::size_t width = level.width, height = level.height;
     std::vector<std::uint8_t> known(width * height);
     std::size_t knownCount = 0;
     for (std::size_t index = 0; index < known.size(); ++index)
-        knownCount += known[index] = level.rgba[index * 4 + 3] >= 128;
+        knownCount += known[index] = level.rgba[index * 4 + 3] >= visibleAlpha;
     if (knownCount == 0 || knownCount == known.size())
         return;
     for (unsigned pass = 0; pass < 32; ++pass)
@@ -1732,7 +1737,12 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
                 material.castsShadow = true;
     }
     const std::string techset = source.at("techniqueSet").get<std::string>();
-    if (techset == "shadowcaster")
+    // caulk_shadow (Greenband's gnbr_caulk_shadow, an mc_unlit material) is
+    // invisible geometry that only casts sun shadow, as shadowcaster is.
+    const bool caulkShadow = name.find("caulk_shadow") != std::string::npos;
+    if (caulkShadow)
+        material.castsShadow = true;
+    if (techset == "shadowcaster" || caulkShadow)
     {
         material.kind = SurfaceKind::skipped;
         material.shadowOnly = true;
@@ -1812,8 +1822,106 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
             material.depthBias = offset != "offset0" && offset != "offsetShadowmap";
         }
     }
-    material.kind =
-        blended ? SurfaceKind::glass : (authoredAlpha ? SurfaceKind::cutout : SurfaceKind::opaque);
+    // IW3 layers world decals (sorts "decal - bottom 1" 9 to "decal - top"
+    // 23: stains, cracks, signage, painted numbers) on the coplanar surface
+    // by sort order alone, without polygon offset. Replay's depth prepass and
+    // reversed depth make such layers z-fight unless they are biased.
+    material.sortKey = source.value("sortKey", 4u);
+    if (material.sortKey >= 9 && material.sortKey <= 23)
+        material.depthBias = true;
+    // Layer rank (flags bits 12-17) = IW3 sort - 8. The vertex shaders pull a
+    // ranked surface toward the camera by rank * 1.2e-5 of its distance, which
+    // keeps IW3's draw order between coplanar layers at
+    // any distance and view angle. Replay's opaque lit pass tests depth EQUAL
+    // against the prepass, so equal-depth layers otherwise swap with the
+    // camera (owner test 2026-10-15: Greenband sand, gravel, mats, windows).
+    if (material.sortKey > 8)
+        material.flags |= std::min(63u, material.sortKey - 8) << 12;
+    // The colour pass's blend (lit, lit sun, lit sun shadow, then the unlit
+    // and emissive passes of unlit techniques). Unlit additive, screen and
+    // multiply techniques (wc_unlit_add, wc_unlit_falloff_add god rays and
+    // window hotspots, wc_unlit_multiply stains) carry no _b<n> name tag.
+    if (const auto entries = source.find("stateBitsEntry");
+        entries != source.end() && entries->is_array())
+    {
+        const auto &states = source.value("stateBits", Json::array());
+        for (const int technique : {7, 8, 9, 4, 5})
+        {
+            if (static_cast<std::size_t>(technique) >= entries->size())
+                continue;
+            const int index = entries->at(technique).get<int>();
+            if (index < 0 || static_cast<std::size_t>(index) >= states.size())
+                continue;
+            const auto &state = states.at(index);
+            if (!state.value("colorWriteRgb", false) || state.value("polymodeLine", false))
+                continue;
+            const std::string src = state.value("srcBlendRgb", std::string("one"));
+            const std::string dst = state.value("dstBlendRgb", std::string("zero"));
+            if (dst == "one" && (src == "one" || src == "invdestcolor"))
+                material.blend = 1; // additive; IW3 "screen" adds in Replay's HDR target
+            else if (dst == "one" && src == "srcalpha")
+                material.blend = 3; // alpha-weighted additive
+            else if ((src == "zero" && dst == "srccolor") || (src == "destcolor" && dst == "zero"))
+                material.blend = 2; // multiply
+            break;
+        }
+    }
+    if (material.blend)
+    {
+        // Additive and multiply layers never occlude and take no light.
+        material.castsShadow = false;
+        material.flags |= material.blend == 2 ? 512u : 256u;
+    }
+    // IW3 falloff: lerp(falloffEndColor, falloffBeginColor,
+    // saturate(|N.V| * falloffParms.z + falloffParms.w)); god rays fade edge on.
+    if (techset.find("falloff") != std::string::npos)
+    {
+        std::array<float, 4> parms{0, 0, 2.128f, -0.064f}, begin{1, 1, 1, 1}, end{.5f, .5f, .5f, .5f};
+        for (const auto &constant : source.value("constants", Json::array()))
+        {
+            const std::string key = constant.value("name", std::string{});
+            if (key == "falloffParms")
+                parms = Literal<4>(constant.at("literal"), parms);
+            else if (key == "falloffBeginColor")
+                begin = Literal<4>(constant.at("literal"), begin);
+            else if (key == "falloffEndColor")
+                end = Literal<4>(constant.at("literal"), end);
+        }
+        const float beginLevel = std::max({begin[0], begin[1], begin[2], 1.0e-3f});
+        const float endLevel = std::max({end[0], end[1], end[2], 0.0f});
+        for (std::size_t channel = 0; channel < 3; ++channel)
+            material.tint[channel] *= begin[channel];
+        material.environment = {parms[2], parms[3], endLevel / beginLevel, 0};
+        material.flags |= 1024u;
+    }
+    material.kind = blended || material.blend
+                        ? SurfaceKind::glass
+                        : (authoredAlpha ? SurfaceKind::cutout : SurfaceKind::opaque);
+    // A blended layer that is not glass (snow, ice, dirt and grime decals)
+    // takes the lighting of the surface under it (2048): drawn like glass, its
+    // averaged-environment film and missing shadow made it change against that
+    // surface with the view (Discovery's ice cave, owner test 2026-10-15).
+    if (material.kind == SurfaceKind::glass && !material.blend &&
+        !std::regex_search(name, std::regex("glass", std::regex::icase)))
+        material.flags |= 2048u;
+    // IW3 wc_water draws a procedural wave map (waterMap) in waterColor with the
+    // envMapParms reflection; its colorMap slot holds a placeholder (case64blue
+    // on Discovery) that IW3 never shows. Draw the water colour, reflective.
+    if (techset.find("water") != std::string::npos)
+    {
+        std::array<float, 4> water{0.1f, 0.1f, 0.1f, 1.0f};
+        for (const auto &constant : source.value("constants", Json::array()))
+            if (constant.value("name", std::string{}) == "waterColor")
+                water = Literal<4>(constant.at("literal"), water);
+        material.color = "$white";
+        material.normal = "$identitynormalmap";
+        material.response = "$water_specular";
+        material.tint = {water[0], water[1], water[2], 1.0f};
+        material.kind = SurfaceKind::opaque;
+        material.blend = 0;
+        material.flags &= ~(256u | 512u | 1024u);
+        material.castsShadow = false;
+    }
     if (material.kind == SurfaceKind::cutout)
         material.flags = alphaMode == "gt0" ? 8u : (alphaMode == "lt128" ? 16u : 0u);
     // `$identitynormalmap` is a stock flat-normal placeholder.  Its texture
@@ -2098,7 +2206,18 @@ void AppendTextureArgument(Json &technique, const std::string_view hex)
     const std::size_t end = at + std::size_t{header[0x7A]} * 6;
     if (end > args.size())
         throw std::runtime_error("technique argument counts exceed the argument array");
-    while (at < end && args[at] <= argument[0])
+    // Within the material-texture arguments (type 5) Replay resolves each slot
+    // by searching the material's slot-sorted texture table onward from the
+    // previous argument's match, with no end check (sub_1419824A0). The
+    // arguments must therefore ascend by slot: t9/slot 0x3C appended after
+    // t8/slot 0x3F walked off the table and bound garbage (map-load crash at
+    // 0x1413BEAD0, x64dbg owner session 2026-10-15).
+    const auto slotOf = [](const std::vector<std::uint8_t> &bytes, const std::size_t offset) {
+        return bytes[offset + 4] | (bytes[offset + 5] << 8);
+    };
+    while (at < end && (args[at] < argument[0] ||
+                        (args[at] == argument[0] &&
+                         (argument[0] != 5 || slotOf(args, at) <= slotOf(argument, 0)))))
         at += 6;
     args.insert(args.begin() + static_cast<std::ptrdiff_t>(at), argument.begin(), argument.end());
     ++header[0x7A];
@@ -2195,7 +2314,7 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
                   const TechniqueGeometry geometry,
                   const std::string &glassEnvironment, const bool instanceLighting = false,
                   const std::string &lightVolumeDefines = {},
-                  const std::string &lightmapDefines = {})
+                  const std::string &lightmapDefines = {}, const bool bakedSun = false)
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
     const bool entity = geometry == TechniqueGeometry::entity;
@@ -2215,6 +2334,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
     const bool lightmapTextures = !model && !lightmapDefines.empty();
     if (lightmapTextures)
         pixelSource += lightmapDefines;
+    if (bakedSun)
+        pixelSource += "#define MAP_BAKED_SUN 1\n";
     pixelSource += ResourceText(IDR_IW3_PIXEL_SHADER);
     ReplaceAtlasTokens(pixelSource, columns, atlasSize);
     // Model coverage passes bind no view mip bias; sample with the gradients alone.
@@ -2256,6 +2377,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
         AppendTextureArgument(lit, "051007003e00"); // t7, slot 0x3E: lightmap A + direction X
         AppendTextureArgument(lit, "051008003f00"); // t8, slot 0x3F: lightmap B + direction Y
     }
+    if (bakedSun)
+        AppendTextureArgument(lit, "051009003c00"); // t9, slot 0x3C: baked sun depth
     PatchStateIdentity(lit, pixel);
 
     const auto depthProgram =
@@ -2389,10 +2512,17 @@ Json CreateVariant(const Json &base, Json &material, const std::string &stem,
     Json lit = techset.at("techniques").back();
     auto header = Unhex(lit.at("header").get<std::string>());
     std::uint64_t other = At<std::uint64_t>(header, 0xA0);
-    const bool foliage = kind.ends_with("foliage"), glass = kind.ends_with("glass");
+    const bool foliage = kind.ends_with("foliage");
+    const bool glass = kind.ends_with("glass") || kind.starts_with("glass");
+    // glass_b<n>: an IW3 additive or multiply layer (GlassBlendBits).
+    unsigned blend = 0;
+    if (const auto at = kind.find("glass_b"); glass && at != std::string::npos &&
+                                               at + 7 < kind.size() && kind[at + 7] >= '0' &&
+                                               kind[at + 7] <= '9')
+        blend = static_cast<unsigned>(kind[at + 7] - '0'); // not glass_bias
     other = (other & ~(0xE00ull | 3ull)) | (foliage ? 0x800ull : 0xC00ull);
     Put<std::uint64_t>(header, 0xA0, other);
-    Put<std::uint64_t>(header, 0xA8, glass ? 0x28054ull : 0ull);
+    Put<std::uint64_t>(header, 0xA8, glass ? GlassBlendBits(blend) : 0ull);
     lit["header"] = Hex(header);
     const auto identity = Sha256(header);
     techset["name"] = "tw/mw120r_" + map + "_" + kind + "_" + Hex(std::span(identity).first(6));
@@ -3035,6 +3165,15 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             if (color.size() != 1)
                 throw std::runtime_error("IW3 material color map is a cubemap: " + name);
             ClassifyFoliage(material, color.front());
+            // Grass blades, leaves and hedges: their IW3 specular maps read as a
+            // wet sheen under Replay's view-angle reflections (owner test
+            // 2026-10-15, Greenband grass). Foliage shades without a specular
+            // map (the shader's matte default).
+            if (FoliageName(material.name + " " + material.color) && !material.response.empty())
+            {
+                material.response.clear();
+                material.flags &= ~64u;
+            }
         }
         materials.push_back(std::move(material));
     }
@@ -3340,6 +3479,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         item.flags = material.flags;
         item.cullMode = material.cullMode;
         item.depthBias = material.depthBias;
+        item.blend = material.blend;
         item.sourceSurfaceTypeBits = material.surfaceTypeBits;
         item.environment = material.environment;
         if (material.kind != SurfaceKind::skipped)
@@ -3355,13 +3495,18 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                         atlasTileMips[channel].push_back(
                             {item.tile, name, material.tint});
                 };
-                if (material.kind == SurfaceKind::cutout && bledColors.insert(material.color).second)
+                // Cut-out and blended colour maps: IW3 DXT5 transparent texels
+                // hold arbitrary colours that filtering pulls into visible edges.
+                const bool blendedAlpha = material.kind == SurfaceKind::glass && material.blend == 0;
+                if ((material.kind == SurfaceKind::cutout || blendedAlpha) &&
+                    bledColors.insert(material.color).second)
                 {
                     image(material.color);
                     Image &source = images.at(material.color).front();
-                    BleedCutoutColor(source);
+                    const unsigned visibleAlpha = blendedAlpha ? 1u : 128u;
+                    BleedCutoutColor(source, visibleAlpha);
                     for (Image &mip : source.mips)
-                        BleedCutoutColor(mip);
+                        BleedCutoutColor(mip, visibleAlpha);
                 }
                 const Image color =
                     Resize(image(material.color).front(), cell, cell, true, material.tint);
@@ -3629,6 +3774,16 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     plan.material = "w/mw120r_" + map;
     plan.instanceLightingImage = "mw120r/" + map + "_smodel_lighting";
     plan.instanceLightingFile = map + "_smodel_lighting.rgba";
+    plan.sunDepthImage = "mw120r/" + map + "_sun_depth";
+    plan.sunDepthFile = map + "_sun_depth.rgba";
+    // Material texture tables stay in slot order (0, 9, 0x3B, then these).
+    const Json sunDepthTexture = {{"header", "3c00000000000000"}, {"image", plan.sunDepthImage}};
+    const Json sunDepthDefinition = {{"name", plan.sunDepthImage},
+                                     {"width", replaysunshadow::DepthImageWidth},
+                                     {"height", replaysunshadow::DepthImageHeight},
+                                     {"rgba8", plan.sunDepthFile},
+                                     {"format", 6},
+                                     {"mipCount", 1}};
     plan.instanceLightingCount = staticModelInstances;
     plan.materialDefinition = stem + ".material.json";
     std::set<std::string> writtenResidentImages;
@@ -3830,6 +3985,15 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     // technique) add the two uncompressed lightmap layers; model materials keep
     // the three atlas textures.
     Json worldMaterial = material;
+    {
+        auto info = Unhex(worldMaterial.at("info").get<std::string>());
+        if (info[0x14] != worldMaterial.at("textures").size())
+            throw std::runtime_error("world material texture count does not match its textures");
+        worldMaterial["textures"].push_back(sunDepthTexture);
+        worldMaterial["imageDefinitions"].push_back(sunDepthDefinition);
+        info[0x14] = static_cast<std::uint8_t>(worldMaterial.at("textures").size());
+        worldMaterial["info"] = Hex(info);
+    }
     std::string lightmapDefines;
     if (!plan.lightmaps.empty())
     {
@@ -3864,7 +4028,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                  lightmapPrimary.width, lightmapPrimary.height, lightmapLeft, lightmapTop);
     }
     Json techset = BuildTechset(map, columns, plan.atlasSize, TechniqueGeometry::world,
-                                plan.glassEnvironment, false, {}, lightmapDefines);
+                                plan.glassEnvironment, false, {}, lightmapDefines, true);
     timing.lap("world techset");
     material["techset"] = techset.at("name");
     worldMaterial["techset"] = techset.at("name");
@@ -3876,8 +4040,11 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         if (entry.kind == SurfaceKind::cutout)
             cutoutKinds.insert(CutoutVariantKind(entry));
     worldVariants.insert(worldVariants.end(), cutoutKinds.begin(), cutoutKinds.end());
-    if (plan.hasGlass)
-        worldVariants.push_back("glass");
+    std::set<std::string> glassKinds;
+    for (const auto &[name, entry] : plan.materials)
+        if (entry.kind == SurfaceKind::glass)
+            glassKinds.insert(GlassVariantKind(entry));
+    worldVariants.insert(worldVariants.end(), glassKinds.begin(), glassKinds.end());
     worldVariants.push_back("sky");
     if (plan.hasOpaqueBias)
         worldVariants.push_back("opaque_bias");
@@ -3924,7 +4091,14 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             variant["material"]["techsetDefinition"] = variant.at("techsetFile");
         }
         else
+        {
             variant = CreateVariant(techset, worldMaterial, stem, map, kind);
+            if (name.starts_with("glass") && name.ends_with("_bias"))
+            {
+                ApplyDepthBias(variant["techset"]);
+                variant["material"]["techset"] = variant.at("techset").at("name");
+            }
+        }
         WriteJson(mapDirectory / variant.at("definition").get<std::string>(),
                   variant.at("material"));
         WriteJson(mapDirectory / variant.at("techsetFile").get<std::string>(),
@@ -4046,6 +4220,27 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                       source.response.empty() ? Image{1, 1, std::vector<std::uint8_t>{0, 0, 0, 0}}
                                               : image(source.response).front(),
                       {1, 1, 1, 1}, "world");
+        // Replay resolves a technique's material textures by a linear search
+        // of the slot byte with no end check (sub_1419824A0). These materials
+        // are drawn with techniques binding the world material's extra slots
+        // (baked sun depth, lightmaps); without them the search ran past the
+        // table and bound garbage (round 42/43 map-load crash at 0x1413BEAD0).
+        // Carry the same entries; the stock technique ignores them.
+        {
+            const auto &extra = worldMaterial.at("textures");
+            for (std::size_t texture = direct.at("textures").size(); texture < extra.size();
+                 ++texture)
+            {
+                direct["textures"].push_back(extra[texture]);
+                const auto name = extra[texture].at("image");
+                for (const auto &definition : worldMaterial.at("imageDefinitions"))
+                    if (definition.at("name") == name)
+                        direct["imageDefinitions"].push_back(definition);
+            }
+            auto info = Unhex(direct.at("info").get<std::string>());
+            info[0x14] = static_cast<std::uint8_t>(direct.at("textures").size());
+            direct["info"] = Hex(info);
+        }
         WriteJson(mapDirectory / materialFile, direct);
         const unsigned index = static_cast<unsigned>(plan.additionalMaterials.size() + 1);
         plan.additionalMaterials.push_back(
@@ -4159,17 +4354,19 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         const bool instanceLighting = !entity && staticModelInstances > 0;
         // Entities (DObjs) sample the world-space light-grid volume instead.
         const bool volumeLighting = entity && entityLightVolume;
+        if (modelInfo[0x14] != modelMaterialTemplate.at("textures").size())
+            throw std::runtime_error("model material texture count does not match its textures");
+        modelMaterialTemplate["textures"].push_back(sunDepthTexture);
         if (instanceLighting || volumeLighting)
-        {
-            modelInfo[0x14] = 4; // texture count
             modelMaterialTemplate["textures"].push_back(
                 {{"header", "3d00000000000000"},
                  {"image", instanceLighting ? plan.instanceLightingImage : entityLightVolume->image}});
-        }
+        modelInfo[0x14] = static_cast<std::uint8_t>(modelMaterialTemplate.at("textures").size());
         modelMaterialTemplate["info"] = Hex(modelInfo);
         Json modelTechset =
             BuildTechset(map, columns, plan.atlasSize, geometry, plan.glassEnvironment,
-                         instanceLighting, volumeLighting ? entityLightVolume->defines : std::string{});
+                         instanceLighting, volumeLighting ? entityLightVolume->defines : std::string{},
+                         {}, true);
         std::array<Json, 5> modelTechsets{};
         modelTechsets[static_cast<unsigned>(SurfaceKind::opaque)] = modelTechset;
 
@@ -4193,13 +4390,15 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             const unsigned kind = static_cast<unsigned>(source.kind);
             if (kind >= modelTechsets.size() || modelTechsets[kind].empty())
                 throw std::runtime_error("IW3 render plan omitted a model technique variant");
+            const unsigned blend = source.kind == SurfaceKind::glass ? source.blend : 0u;
             auto [techsetEntry, inserted] = techsetFiles.try_emplace(
-                {kind, source.cullMode | (source.depthBias ? 4u : 0u)});
+                {kind, source.cullMode | (source.depthBias ? 4u : 0u) | (blend << 3)});
             if (inserted)
             {
                 Json variant = modelTechsets[kind];
                 const std::string suffix =
-                    "_cull" + std::to_string(source.cullMode) + (source.depthBias ? "_bias" : "");
+                    "_cull" + std::to_string(source.cullMode) + (source.depthBias ? "_bias" : "") +
+                    (blend ? "_b" + std::to_string(blend) : "");
                 variant["name"] = variant.at("name").get<std::string>() + suffix;
                 for (auto &technique : variant.at("techniques"))
                 {
@@ -4210,6 +4409,8 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                     Put<std::uint64_t>(header, 0xA0,
                                        (At<std::uint64_t>(header, 0xA0) & ~3ull) | cull |
                                            (source.depthBias ? 0x10ull : 0ull));
+                    if (source.kind == SurfaceKind::glass)
+                        Put<std::uint64_t>(header, 0xA8, GlassBlendBits(blend));
                     technique["header"] = Hex(header);
                     technique["name"] = technique.at("name").get<std::string>() + suffix;
                     PatchStateIdentity(technique, header);
@@ -4253,6 +4454,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                               ? Image{1, 1, std::vector<std::uint8_t>{0, 0, 0, 0}}
                               : image(source.response).front(),
                           {1, 1, 1, 1}, "model");
+            direct["imageDefinitions"].push_back(sunDepthDefinition);
             if (instanceLighting)
                 direct["imageDefinitions"].push_back(
                     {{"name", plan.instanceLightingImage},

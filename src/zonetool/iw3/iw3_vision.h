@@ -31,7 +31,19 @@ struct Film
     std::array<float, 3> darkTint{1.0f, 1.0f, 1.0f};
 };
 
+// sun/<map>.sun: the sun sprite IW3 draws in the sky (r_sun_fx_position pitch
+// and yaw, r_sunsprite_size in 480-line pixels) and its flare strength
+// (r_sunflare_max_alpha). Maps without one draw no sun sprite.
+struct SunSprite
+{
+    std::array<float, 3> direction{};
+    float radiusDegrees{};
+    float flareAlpha{};
+};
+
 std::optional<ExpFog> ReadMapExpFog(const std::filesystem::path &exportRoot,
+                                    const std::string &sourceMap);
+std::optional<SunSprite> ReadMapSun(const std::filesystem::path &exportRoot,
                                     const std::string &sourceMap);
 std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
                                 const std::string &sourceMap);
@@ -50,7 +62,8 @@ enum class MapStyle
 };
 
 // HLSL preamble for the converted world/static-model pixel shader; empty without fog.
-std::string FogShaderDefines(const std::optional<ExpFog> &fog, MapStyle style);
+std::string FogShaderDefines(const std::optional<ExpFog> &fog, MapStyle style,
+                             const std::optional<SunSprite> &sun = std::nullopt);
 
 // Replay GfxGradingClut payload: 32^3 R16G16B16A16_UNORM texels (red fastest), each
 // the ST2084-encoded BT.2020 output for the ST2084-encoded BT.2020 input at its grid

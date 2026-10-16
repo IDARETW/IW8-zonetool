@@ -120,12 +120,17 @@ bool writeMaterial(iw8::ZoneWriter &zw, const Iw8Material &im)
 
 bool writeCompassMaterial(iw8::ZoneWriter &zw, const std::string &name)
 {
-    if (name.empty())
+    return writeUiMaterial(zw, name, name);
+}
+
+bool writeUiMaterial(iw8::ZoneWriter &zw, const std::string &name, const std::string &imageName)
+{
+    if (name.empty() || imageName.empty())
     {
         return false;
     }
 
-    zw.add(ASSET_TYPE_MATERIAL, name, [name](iw8::ZoneWriter &w) {
+    zw.add(ASSET_TYPE_MATERIAL, name, [name, imageName](iw8::ZoneWriter &w) {
         constexpr const char *techset = "cust_2_2d_rpl_ta0_0_0_0_0_0";
         uint8_t material[0x78]{};
         put(material, 0x00, iw8::PTR_FOLLOWS);
@@ -170,7 +175,7 @@ bool writeCompassMaterial(iw8::ZoneWriter &zw, const std::string &name)
         put(image, 0, iw8::PTR_FOLLOWS);
         w.write(image, sizeof(image));
         w.pushStream(iw8::XFILE_BLOCK_VIRTUAL);
-        w.writeStr(std::string(",") + name);
+        w.writeStr(std::string(",") + imageName);
         w.popStream();
         w.popStream();
 
@@ -212,7 +217,7 @@ bool writeCompassMaterial(iw8::ZoneWriter &zw, const std::string &name)
         w.reserveCalc(sizeof(image));
         w.popStream();
     });
-    info("write_material: native compass material '%s'", name.c_str());
+    info("write_material: native 2D material '%s' (image %s)", name.c_str(), imageName.c_str());
     return true;
 }
 

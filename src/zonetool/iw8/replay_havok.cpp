@@ -530,7 +530,7 @@ CollisionInput ReadCollision(const std::filesystem::path &path)
             (hull.glassId ? hull.contents != kBreakableGlassContents
                           : (hull.contents & ~supportedContents) != 0) ||
             hull.materialOverride > 63 || !std::isfinite(hull.ladderRungOffset) ||
-            std::abs(hull.ladderRungOffset) > 6.0f ||
+            std::abs(hull.ladderRungOffset) > 16.0f ||
             slabCount > 252 || ladderPlaneCount > 8 || (hull.surfaceFlags & ~0x7FFFFu) != 0 ||
             cursor + std::size_t(vertexCount) * 12 + std::size_t(slabCount) * 20 +
                     std::size_t(ladderPlaneCount) * (hasLadderModelTangents ? 24 : 16) >

@@ -952,7 +952,8 @@ bool PrepareNativeLightGrid(const std::filesystem::path &sourceRoot,
 
 std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
     const std::filesystem::path &sourceRoot, const std::string &sourceAsset,
-    const std::vector<std::array<float, 3>> &points)
+    const std::vector<std::array<float, 3>> &points, const unsigned sunPrimaryLight,
+    std::vector<float> *sunVisibility)
 {
     std::vector<std::array<std::array<float, 3>, 6>> cubes;
     const auto metadataPath = sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
@@ -973,12 +974,12 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
         return static_cast<std::uint64_t>(x & 0xffff) | static_cast<std::uint64_t>(y & 0xffff) << 16 |
                static_cast<std::uint64_t>(z & 0xffff) << 32;
     };
-    std::unordered_map<std::uint64_t, std::uint16_t> grid;
+    std::unordered_map<std::uint64_t, Entry> grid;
     grid.reserve(cells.size());
     for (const Cell &cell : cells)
         grid.emplace(key((cell.position[0] + 131072) / 32, (cell.position[1] + 131072) / 32,
                          (cell.position[2] + 131072) / 64),
-                     cell.entry.color);
+                     cell.entry);
     constexpr std::array<std::array<float, 3>, 6> directions{
         {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, 1}, {0, 0, -1}}};
     std::array<std::array<float, 9>, 6> basis{};
@@ -986,7 +987,9 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
         basis[face] = EvaluateShBasis(directions[face]);
 
     cubes.resize(points.size());
-    std::size_t nearestFallbacks = 0, unlit = 0;
+    if (sunVisibility)
+        sunVisibility->assign(points.size(), 1.0f);
+    std::size_t nearestFallbacks = 0, unlit = 0, shaded = 0;
     for (std::size_t index = 0; index < points.size(); ++index)
     {
         const std::array<double, 3> coordinate{(points[index][0] + 131072.0) / 32.0,
@@ -1000,7 +1003,7 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
             fraction[axis] = coordinate[axis] - static_cast<double>(base[axis]);
         }
         Probe sum{};
-        double total = 0.0;
+        double total = 0.0, sunlit = 0.0;
         for (unsigned corner = 0; corner < 8; ++corner)
         {
             const auto found = grid.find(key(base[0] + (corner & 1), base[1] + ((corner >> 1) & 1),
@@ -1014,15 +1017,17 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
                 continue;
             for (unsigned channel = 0; channel < 3; ++channel)
                 for (unsigned coefficient = 0; coefficient < 9; ++coefficient)
-                    sum[channel][coefficient] +=
-                        static_cast<float>(weight * probes.at(found->second)[channel][coefficient]);
+                    sum[channel][coefficient] += static_cast<float>(
+                        weight * probes.at(found->second.color)[channel][coefficient]);
             total += weight;
+            if (found->second.primaryLight == sunPrimaryLight)
+                sunlit += weight;
         }
         if (total < 1.0e-3)
         {
             // No surrounding cells (solid volume or outside the grid): the
             // nearest cell in growing shells, as IW3 falls back to.
-            std::optional<std::uint16_t> nearest;
+            std::optional<Entry> nearest;
             for (std::int64_t radius = 1; radius <= 8 && !nearest; ++radius)
                 for (std::int64_t z = -radius; z <= radius && !nearest; ++z)
                     for (std::int64_t y = -radius; y <= radius && !nearest; ++y)
@@ -1040,8 +1045,14 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
                 continue;
             }
             ++nearestFallbacks;
-            sum = probes.at(*nearest);
+            sum = probes.at(nearest->color);
             total = 1.0;
+            sunlit = nearest->primaryLight == sunPrimaryLight ? 1.0 : 0.0;
+        }
+        if (sunVisibility)
+        {
+            (*sunVisibility)[index] = static_cast<float>(sunlit / total);
+            shaded += sunlit / total < 0.5;
         }
         for (std::size_t face = 0; face < 6; ++face)
             for (unsigned channel = 0; channel < 3; ++channel)
@@ -1053,8 +1064,8 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
             }
     }
     zt::info("iw3: lit %zu static model instance(s) from the IW3 light grid (%zu nearest-cell, %zu "
-             "outside the grid)",
-             points.size() - unlit, nearestFallbacks, unlit);
+             "outside the grid, %zu out of the sun)",
+             points.size() - unlit, nearestFallbacks, unlit, shaded);
     return cubes;
 }
 

@@ -62,10 +62,6 @@ Output main(uint id : SV_VertexID) {
     relative.w = 1;
     Output o;
     o.relativePosition = relative.xyz;
-    o.position.x = dot(relative, replayView[0]);
-    o.position.y = dot(relative, replayView[1]);
-    o.position.z = dot(relative, replayView[2]);
-    o.position.w = dot(relative, replayView[3]);
 #ifdef GLASS_PANE
     o.uv = float4(f16tof32(vertex.texcoord & 0xffff), f16tof32(vertex.texcoord >> 16), 0, 0);
     o.metadata = float2(GLASS_TILE, GLASS_FLAGS);
@@ -83,6 +79,15 @@ Output main(uint id : SV_VertexID) {
     o.lightmapUV = s.lightmapOffset ? asfloat(attributes.Load2(s.lightmapOffset + id * 8)) : 0;
     uint packed = attributes.Load(s.tangentOffset + id * 4);
 #endif
+    // IW3 layer rank (flags bits 12-17, sort - 8): decal and blended layers move
+    // toward the camera along their own view ray by rank * 1.2e-5 of their distance, so
+    // coplanar layers keep IW3's order at any distance and view angle.
+    precise float4 projected = relative;
+    projected.xyz *= 1 - (((uint)o.metadata.y >> 12) & 63) * 1.2e-5;
+    o.position.x = dot(projected, replayView[0]);
+    o.position.y = dot(projected, replayView[1]);
+    o.position.z = dot(projected, replayView[2]);
+    o.position.w = dot(projected, replayView[3]);
     float3 xyz = (float3(packed & 1023, (packed >> 10) & 1023, (packed >> 20) & 511) *
                       float3(2.0 / 1023, 2.0 / 1023, 2.0 / 511) -
                   1) *

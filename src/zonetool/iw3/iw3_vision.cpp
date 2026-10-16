@@ -8,8 +8,10 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <fstream>
 #include <map>
 #include <regex>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 
@@ -330,12 +332,61 @@ std::optional<Film> ReadMapFilm(const std::filesystem::path &exportRoot,
     return film;
 }
 
-std::string FogShaderDefines(const std::optional<ExpFog> &fog, const MapStyle style)
+std::optional<SunSprite> ReadMapSun(const std::filesystem::path &exportRoot,
+                                    const std::string &sourceMap)
+{
+    std::ifstream input(exportRoot / "sun" / (sourceMap + ".sun"));
+    if (!input)
+        return std::nullopt;
+    std::map<std::string, std::string> values;
+    static const std::regex line(R"re(^\s*(\w+)\s+"([^"]*)")re");
+    for (std::string text; std::getline(input, text);)
+        if (std::smatch match; std::regex_search(text, match, line))
+            values[Lower(match[1].str())] = match[2].str();
+    const auto sprite = values.find("r_sunsprite_shader");
+    if (sprite == values.end() || sprite->second.empty())
+        return std::nullopt;
+    const auto number = [&](const std::string &key, const float fallback) {
+        float value = fallback;
+        if (const auto found = values.find(key); found != values.end())
+            ParseFloat(found->second, value);
+        return value;
+    };
+    std::array<float, 3> angles{};
+    if (const auto found = values.find("r_sun_fx_position"); found != values.end())
+    {
+        std::istringstream stream(found->second);
+        stream >> angles[0] >> angles[1] >> angles[2];
+    }
+    // IW3 angles: negative pitch looks up.
+    constexpr float degrees = 3.14159265f / 180.0f;
+    SunSprite sun;
+    sun.direction = {std::cos(angles[0] * degrees) * std::cos(angles[1] * degrees),
+                     std::cos(angles[0] * degrees) * std::sin(angles[1] * degrees),
+                     -std::sin(angles[0] * degrees)};
+    // r_sunsprite_size is in 480-line virtual pixels at CoD4's 65 degree view.
+    sun.radiusDegrees =
+        std::clamp(number("r_sunsprite_size", 16.0f) / 480.0f * 65.0f * 0.5f, 0.2f, 10.0f);
+    sun.flareAlpha = std::clamp(number("r_sunflare_max_alpha", 0.0f), 0.0f, 1.0f);
+    zt::info("iw3: sun sprite pitch %g yaw %g radius %g degrees, flare %g", angles[0], angles[1],
+             sun.radiusDegrees, sun.flareAlpha);
+    return sun;
+}
+
+std::string FogShaderDefines(const std::optional<ExpFog> &fog, const MapStyle style,
+                             const std::optional<SunSprite> &sun)
 {
     // iw8: the surface shader adds Replay's probe reflections and sun specular
-    // (MAP_IW8_LIGHTING). Both styles bake IW3's own exponential fog: the owner
-    // wants IW3's fog colour and placement in --style iw8 too (2026-10-14).
-    const std::string lighting = style == MapStyle::iw8 ? "#define MAP_IW8_LIGHTING 1\n" : "";
+    // (MAP_IW8_LIGHTING) and draws the map's IW3 sun sprite and flare in the sky
+    // (owner, 2026-10-15: sun position and glow as in the original map; a map
+    // without a sun file, such as Discovery's night, shows no sun). Both styles
+    // bake IW3's own exponential fog.
+    std::string lighting = style == MapStyle::iw8 ? "#define MAP_IW8_LIGHTING 1\n" : "";
+    if (style == MapStyle::iw8 && sun)
+        lighting += "#define MAP_SUN_SPRITE float4(" + Number(sun->direction[0]) + "," +
+                    Number(sun->direction[1]) + "," + Number(sun->direction[2]) + "," +
+                    Number(sun->radiusDegrees * 3.14159265f / 180.0f) +
+                    ")\n#define MAP_SUN_FLARE " + Number(sun->flareAlpha) + "\n";
     if (!fog)
         return lighting;
     return lighting + "#define MAP_FOG 1\n#define MAP_FOG_START " + Number(fog->start) +
@@ -394,6 +445,18 @@ std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::strin
         };
         for (const auto &[token, value] : kTemplate)
             overrides[token] = std::string(value);
+        // Shipment's fog, atmosphere and height-fog fields (35-62) are dropped:
+        // fogAtmosphericScattering hazed every object of a map without IW3 fog
+        // white while the sky stayed clear (owner test 2026-10-15: Aerodrome,
+        // Agroprom, Arnhem, Greenband, Gulag too bright, sky haze mismatched).
+        // Both styles use IW3's fog below.
+        for (const std::string_view token :
+             {"MSTOLQOTKN", "RPNOKKL", "NTPTLNNQQL", "NMLMMNQLSQ", "TRPROKTLS", "MPNPSMMTTT",
+              "MLORTTKOLN", "MRTOMMTTQM", "NKLTMMOOLP", "NONQQTPNLT", "NORQKLTPTR", "LOROLOTNMP",
+              "SPQNRNKQR", "MKKLQTSKSO", "SNNNRLTML", "NRTMTRQTRQ", "NLQKSSPMKP", "MKQSQRPPQR",
+              "LNOQTMMLSP", "LNMRMNLNTT", "LRKPNSNORL", "MPRLMQNQO", "NPMPRRLNPO", "NOSTLRKPQ",
+              "POKSTQPPQ", "LOLKSRNSMR", "NKOQRKQRMT"})
+            overrides.erase(token);
         overrides["RLNQONPKS"] = Vector(sunDirection); // fogSunDir
         // IW3 sky textures already carry their haze; scattering on top washed the
         // sky out (owner test, 2026-10-14). Stock skies are HDR, ours are not.

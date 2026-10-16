@@ -176,10 +176,19 @@ Output main(uint id : SV_VertexID) {
 
     Output o;
     o.relativePosition = relative.xyz;
-    o.position.x = dot(relative, replayView[0]);
-    o.position.y = dot(relative, replayView[1]);
-    o.position.z = dot(relative, replayView[2]);
-    o.position.w = dot(relative, replayView[3]);
+    // Bits 0-3 of the attribute word: blend and falloff flags (256-2048);
+    // bits 4-9: the IW3 layer rank. A ranked surface (a decal or blended
+    // layer) moves toward the camera along its own view ray by rank * 1.2e-5 of
+    // its distance: same screen position, IW3's layer order in depth.
+    uint extended = attributes.x & 0xfff;
+    precise float4 projected = relative;
+#ifndef MAP_MODEL_SHADOW_PASS
+    projected.xyz *= 1 - ((extended >> 4) & 63) * 1.2e-5;
+#endif
+    o.position.x = dot(projected, replayView[0]);
+    o.position.y = dot(projected, replayView[1]);
+    o.position.z = dot(projected, replayView[2]);
+    o.position.w = dot(projected, replayView[3]);
 #ifdef MAP_ENTITY_VELOCITY
     // The previous-frame rows and view origin feed Replay's velocity target.
     float4 previous = EntityPosition(row + 4, local, asint(replayView[9].xyz));
@@ -192,8 +201,13 @@ Output main(uint id : SV_VertexID) {
     o.normal = normal;
     o.tangent = float4(tangent, binormalSign);
 
-    o.metadata = float2(attributes.x & 0xffff, (attributes.x >> 16) & 0xff);
+    // Models sample their own textures: no atlas tile.
+    o.metadata = float2(0, ((attributes.x >> 16) & 0xff) | ((extended & 15) << 8) |
+                               (((extended >> 4) & 63) << 12));
     o.materialParameters = float4(.8, 4, 2.5, .625);
+    // IW3 falloff layers on models (lamp glows): the stock falloff ramp.
+    if ((extended & 4) != 0)
+        o.materialParameters = float4(2.128, -.064, .5, 0);
     uint colorPageStart = drawSurfaces.Load(0x00240000 + drawSurface * 4);
     uint colorByte = (id & 0xffff) * 4;
     uint colorPage = colorPages.Load((colorPageStart + (colorByte >> 10)) * 4);

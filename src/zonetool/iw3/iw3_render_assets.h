@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <string>
 #include <set>
@@ -30,8 +31,10 @@ struct MaterialPlan
     unsigned flags{};
     // IW3 cull state: 0 none, 1 back, 2 front.
     unsigned cullMode{1};
-    // IW3 polygonOffset (decals layered on coplanar geometry).
+    // IW3 polygonOffset or a decal sort (decals layered on coplanar geometry).
     bool depthBias{};
+    // Blended layer: 0 alpha, 1 additive, 2 multiply, 3 srcalpha additive.
+    unsigned blend{};
     unsigned sourceSurfaceTypeBits{};
     std::array<float, 4> environment{0.8f, 4.0f, 2.5f, 0.625f};
     unsigned worldMaterialIndex{};
@@ -48,6 +51,27 @@ inline std::string CutoutVariantKind(const MaterialPlan &material)
 {
     return std::string("foliage") + (material.cullMode == 1 ? "_back" : "") +
            (material.depthBias ? "_bias" : "");
+}
+
+// World blended surfaces share generated atlas materials per blend and depth bias.
+inline std::string GlassVariantKind(const MaterialPlan &material)
+{
+    return std::string("glass") + (material.blend ? "_b" + std::to_string(material.blend) : "") +
+           (material.depthBias ? "_bias" : "");
+}
+
+// Replay GfxBlendStateBits: srcRgb | dstRgb << 4 | opRgb << 8 | srcAlpha << 11 |
+// dstAlpha << 15 | opAlpha << 19 (source ONE = 0, ZERO = 1, SRCCOLOR = 2,
+// SRCALPHA = 4, INVSRCALPHA = 5; destination ZERO = 0, ONE = 1, SRCCOLOR = 2).
+inline std::uint64_t GlassBlendBits(const unsigned blend)
+{
+    switch (blend)
+    {
+    case 1: return 0x8010;  // one / one
+    case 2: return 0x8821;  // zero / srccolor (alpha zero / one)
+    case 3: return 0x8014;  // srcalpha / one
+    default: return 0x28050; // srcalpha / invsrcalpha (alpha one / invsrcalpha)
+    }
 }
 
 struct LightmapRectangle
@@ -100,6 +124,10 @@ struct RenderPlan
     // texels per instance, 256 instances per row; written by PrepareFastfile).
     std::string instanceLightingImage;
     std::string instanceLightingFile;
+    // Baked world-space sun depth (replaysunshadow::BakeDepthImage), sampled by
+    // the world, static-model and entity shaders; written by PrepareFastfile.
+    std::string sunDepthImage;
+    std::string sunDepthFile;
     unsigned instanceLightingCount{};
     std::vector<LightmapRectangle> lightmaps;
     std::array<std::size_t, 6> skyTiles{};

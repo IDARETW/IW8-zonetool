@@ -2803,12 +2803,22 @@ unsigned MaterialIndex(const RenderPlan &plan, const MaterialPlan &material,
     const std::string suffix = material.kind == SurfaceKind::opaque ? "_opaque_bias"
                                : material.kind == SurfaceKind::cutout
                                    ? "_" + CutoutVariantKind(material)
-                               : material.kind == SurfaceKind::glass ? "_glass"
+                               : material.kind == SurfaceKind::glass ? "_" + GlassVariantKind(material)
                                                                      : "_sky";
     for (std::size_t index = 0; index < plan.additionalMaterials.size(); ++index)
         if (plan.additionalMaterials[index].at("material").get<std::string>().ends_with(suffix))
             return static_cast<unsigned>(index + 1);
     throw std::runtime_error("IW3 render plan is missing a material variant");
+}
+
+// A source reflection probe as the shader's tag: converted slot + 1, 0 for
+// none. IW3 probe 0 is R_CreateDefaultProbe's image, which the converter drops
+// when authored captures exist (slot = index - 1); a lone default is slot 0.
+unsigned ReflectionProbeTag(const std::size_t sourceProbe, const std::size_t sourceProbeCount)
+{
+    if (sourceProbe >= sourceProbeCount || sourceProbeCount > 256)
+        return 0;
+    return sourceProbeCount > 1 ? static_cast<unsigned>(sourceProbe) : 1u;
 }
 
 Vec2 EncodedLightmap(const Vertex &vertex, const Surface &surface, const MaterialPlan &material,
@@ -3356,6 +3366,7 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
     xmodels.reserve(source.models.size());
     staticModels.models.reserve(source.models.size());
     std::vector<std::optional<std::size_t>> collisionModelIndices(source.models.size());
+    std::size_t visualCollisionModels = 0;
     for (std::size_t modelIndex = 0; modelIndex < source.models.size(); ++modelIndex)
     {
         const SourceStaticModel &sourceModel = source.models[modelIndex];
@@ -3554,10 +3565,16 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                 const unsigned kind = material.kind == SurfaceKind::cutout  ? 3u
                                       : material.kind == SurfaceKind::glass ? 2u
                                                                             : 0u;
-                if (material.tile > UINT16_MAX || kind + material.flags > UINT8_MAX)
+                // Models bind their own textures, so the low 16 bits carry no atlas
+                // tile: bits 0-3 hold the blend and falloff flags (256-2048), bits
+                // 4-9 the layer rank (flags bits 12-17), bits 16-23 the low flags.
+                const unsigned lowFlags = (kind + material.flags) & 0xFFu;
+                const unsigned blendFlags = (material.flags >> 8) & 0xFu;
+                const unsigned layer = (material.flags >> 12) & 0x3Fu;
+                if (material.flags > 0x3FFFFu)
                     throw std::runtime_error("IW3 model material metadata exceeds Replay fields");
-                const std::uint32_t metadata = static_cast<std::uint32_t>(material.tile) |
-                                               ((kind + material.flags) << 16) | 0xFF000000u;
+                const std::uint32_t metadata =
+                    blendFlags | (layer << 4) | (lowFlags << 16) | 0xFF000000u;
                 auto &destinationSurface = converted.surfaces[surfaceIndex];
                 constexpr std::size_t packedVertexSize = 20;
                 constexpr std::size_t selfVisibilityOffset = 8;
@@ -3649,8 +3666,42 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
         // a hull even when the model has no collision LOD: use its first LOD.
         const bool clutter =
             nativePhysics && sourceModel.clutter && !collisionModels && !scriptModelPhysics;
-        const std::size_t physicsLod =
+        std::size_t physicsLod =
             sourceModel.collisionLod != SIZE_MAX ? sourceModel.collisionLod : clutter ? 0 : SIZE_MAX;
+        // A static placement without an IW3 collision LOD stopped no bullet in
+        // IW3; maps relied on clip brushes, and prefab-built maps such as
+        // Greenband have none around their props and walls (owner: bullets and
+        // grenades through rocks and buildings). Its opaque visual surfaces
+        // collide instead, from the coarsest LOD that keeps a quarter of LOD0's
+        // triangles (at least 300). Contents 0xB180 stay outside the player
+        // mask: players still pass props, as in IW3.
+        const auto solidSurface = [&](const Surface &surface) {
+            const auto material = plan.materials.find(surface.material);
+            return material != plan.materials.end() &&
+                   material->second.kind == SurfaceKind::opaque && !material->second.depthBias &&
+                   (material->second.flags & 0x700u) == 0;
+        };
+        const bool visualCollision = nativePhysics && collisionModels &&
+                                     physicsLod == SIZE_MAX && !sourceModel.lods.empty();
+        if (visualCollision)
+        {
+            std::vector<std::size_t> triangles;
+            for (const auto &lod : sourceModel.lods)
+            {
+                std::size_t count = 0;
+                for (const Surface &surface : lod.surfaces)
+                    if (solidSurface(surface))
+                        count += surface.indices.size() / 3;
+                triangles.push_back(count);
+            }
+            const std::size_t wanted =
+                std::min(triangles.front(), std::max<std::size_t>(triangles.front() / 4, 300));
+            for (std::size_t lod = 0; lod < triangles.size(); ++lod)
+                if (triangles[lod] && triangles[lod] >= wanted)
+                    physicsLod = lod;
+            if (physicsLod != SIZE_MAX)
+                ++visualCollisionModels;
+        }
         if (nativePhysics && physicsLod != SIZE_MAX)
         {
             iw8::havok::PhysicsMesh physics;
@@ -3678,6 +3729,8 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
             std::map<unsigned, float> surfaceAreas;
             for (const Surface &surface : sourceModel.lods.at(physicsLod).surfaces)
             {
+                if (visualCollision && !solidSurface(surface))
+                    continue;
                 const auto material = plan.materials.find(surface.material);
                 // Script-model glass (car windows, lights) breaks by hiding its
                 // part, which cannot remove a mesh shape: keep glass out of the
@@ -3767,6 +3820,10 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
         zt::warn("iw3: %zu static model(s) have a mirrored or skewed IW3 placement; placed with "
                  "the nearest rotation",
                  unrotatedInstances);
+    if (visualCollisionModels)
+        zt::info("iw3: %zu static model(s) without an IW3 collision LOD collide by their visual "
+                 "mesh (bullets and grenades)",
+                 visualCollisionModels);
 }
 
 void BuildShadowScene(const std::vector<BrushModel> &brushModels,
@@ -3957,8 +4014,10 @@ Json BuildGlassPanes(const std::vector<BrushModel> &models, const RenderPlan &pl
         const bool intactGlass =
             std::any_of(model.surfaces.begin(), model.surfaces.end(), [&](const Surface &surface) {
                 const auto material = plan.materials.find(surface.material);
+                // Additive and multiply layers (blend != 0) are not panes.
                 return material != plan.materials.end() &&
                        material->second.kind == SurfaceKind::glass &&
+                       material->second.blend == 0 &&
                        surface.material.find("shattered") == std::string::npos;
             });
         if (!intactGlass)
@@ -4666,12 +4725,25 @@ Json BuildRender(const Json &world, const VisibilityGroups &visibility,
                         const std::uint32_t index = static_cast<std::uint32_t>(targetVertices++);
                         const Vec2 lightmap =
                             EncodedLightmap(vertex, surface, material, plan, nativeWorld);
+                        // The tile word carries the surface's IW3 reflection probe
+                        // as converted slot + 1 above bit 16 (the shader reflects
+                        // that probe alone); added in double so the lightmap
+                        // fraction keeps its precision.
+                        Json encoded = Json::array({lightmap[0], lightmap[1]});
+                        if (!nativeWorld)
+                        {
+                            if (material.tile >= 0x10000)
+                                throw std::runtime_error("IW3 atlas tile exceeds the 16-bit tile word");
+                            encoded[0] = static_cast<double>(lightmap[0]) +
+                                         65536.0 * ReflectionProbeTag(surface.reflectionProbe,
+                                                                      geometryProbeBounds.size());
+                        }
                         (*target)["vertices"].push_back(
                             {{"position", vertex.position},
                              {"uv", uv},
                              {"normal", PackedNormal(vertex.normal, vertex.tangent,
                                                      vertex.binormalSign, vertex.authoredTangent)},
-                             {"lightmapUV", lightmap},
+                             {"lightmapUV", encoded},
                              {"color", vertex.color}});
                         found = remap.emplace(remapKey, index).first;
                     }
@@ -5731,8 +5803,12 @@ std::size_t AddStairRamps(CollisionData &collision)
     return ramps;
 }
 
-void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels &models,
-                              const RenderPlan &renderPlan)
+// Returns the rung spacing of the map's ladder models (0 when none were
+// measured). Replay climbs in rungs of 12 by default; the DW client applies a
+// map's own spacing from map.json (ladderRungDistance) so hands meet the
+// original IW3 rungs (Discovery's p_rus_ladder_metal: 16, owner 2026-10-15).
+float AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels &models,
+                               const RenderPlan &renderPlan)
 {
     struct LadderModel
     {
@@ -5742,6 +5818,7 @@ void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels
         Vec3 maximum{-INFINITY, -INFINITY, -INFINITY};
         std::vector<Vec3> vertices;
         float rungPhase{};
+        float rungSpacing{12.0f};
         bool hasRungPhase{};
     };
     std::vector<LadderModel> ladders;
@@ -5768,8 +5845,7 @@ void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels
                     break;
                 }
         }
-        double phaseCos = 0.0, phaseSin = 0.0;
-        std::size_t rungTriangles = 0;
+        std::vector<float> rungHeights;
         for (const Surface &surface : model.lods.front().surfaces)
         {
             std::vector<Vec3> worldVertices;
@@ -5801,17 +5877,48 @@ void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels
                 if (high - low > 4.0f ||
                     (std::max)({broad(a, b), broad(b, c), broad(c, a)}) < 144.0f)
                     continue;
-                const double angle = (double(a[2]) + b[2] + c[2]) * (2.0 * 3.141592653589793 / 36.0);
-                phaseCos += std::cos(angle);
-                phaseSin += std::sin(angle);
-                ++rungTriangles;
+                rungHeights.push_back((a[2] + b[2] + c[2]) / 3.0f);
             }
         }
+        // Rung spacing: the most common gap between consecutive rung heights.
+        // com_ladder_wood keeps 12: its 24-unit bands get midpoint rungs
+        // (AddLadderMidpointRungs).
+        {
+            std::vector<float> levels = rungHeights;
+            std::ranges::sort(levels);
+            std::vector<float> rungs;
+            for (const float level : levels)
+                if (rungs.empty() || level - rungs.back() > 2.0f)
+                    rungs.push_back(level);
+            std::map<int, unsigned> gaps;
+            for (std::size_t index = 1; index < rungs.size(); ++index)
+                ++gaps[static_cast<int>(std::lround((rungs[index] - rungs[index - 1]) * 2.0f))];
+            const auto common = std::ranges::max_element(
+                gaps, {}, [](const auto &entry) { return entry.second; });
+            if (common != gaps.end() && common->second >= 2 && common->first >= 16 &&
+                common->first <= 64)
+                candidate.rungSpacing = common->first * 0.5f;
+            std::string lower = model.name;
+            std::ranges::transform(lower, lower.begin(), [](const unsigned char letter) {
+                return static_cast<char>(std::tolower(letter));
+            });
+            if (lower == "com_ladder_wood")
+                candidate.rungSpacing = 12.0f;
+        }
+        double phaseCos = 0.0, phaseSin = 0.0;
+        for (const float height : rungHeights)
+        {
+            const double angle = height * (2.0 * 3.141592653589793 / candidate.rungSpacing);
+            phaseCos += std::cos(angle);
+            phaseSin += std::sin(angle);
+        }
+        const std::size_t rungTriangles = rungHeights.size();
         if (rungTriangles >= 16 &&
             std::hypot(phaseCos, phaseSin) / rungTriangles >= 0.75)
         {
             candidate.rungPhase = static_cast<float>(
-                std::atan2(phaseSin, phaseCos) * (12.0 / (2.0 * 3.141592653589793)));
+                std::atan2(phaseSin, phaseCos) *
+                (candidate.rungSpacing / (2.0 * 3.141592653589793)));
             const float halfUnit = std::round(candidate.rungPhase * 2.0f) * 0.5f;
             if (std::abs(candidate.rungPhase - halfUnit) < 0.15f)
                 candidate.rungPhase = halfUnit;
@@ -5822,6 +5929,7 @@ void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels
     }
 
     std::size_t aligned = 0;
+    std::map<float, unsigned> spacings;
     for (CollisionHull &hull : collision.hulls)
     {
         if (hull.ladderPlanes.empty() || hull.points.empty())
@@ -5910,19 +6018,58 @@ void AlignLadderEdgesToModels(CollisionData &collision, const SourceStaticModels
         }
         if (!valid)
             continue;
+        // The player stands against this hull, and Replay's climb IK reaches
+        // a fixed SuitDef distance (+0x1AC) toward the edge on the model face.
+        // An IW3 ladder brush that stands proud of its model kept the player
+        // too far back: the hands hung in front of the rungs (Discovery, owner
+        // test 2026-10-16). Pull the climbable side back onto the model face,
+        // as stock ladders' own collision is.
+        float largestInset = 0.0f;
+        for (std::size_t index = 0; index < adjusted.size(); ++index)
+        {
+            const Vec4 &plane = hull.ladderPlanes[index];
+            float back = INFINITY;
+            for (const Vec3 &point : hull.points)
+                back = (std::min)(back, plane[0] * point[0] + plane[1] * point[1] +
+                                            plane[2] * point[2]);
+            // Keep at least 2 units of hull behind the face.
+            const float face = (std::max)(adjusted[index], back + 2.0f);
+            for (Vec3 &point : hull.points)
+            {
+                const float beyond =
+                    plane[0] * point[0] + plane[1] * point[1] + plane[2] * point[2] - face;
+                if (beyond <= 0.0f)
+                    continue;
+                for (std::size_t axis = 0; axis < 3; ++axis)
+                    point[axis] -= plane[axis] * beyond;
+            }
+            largestInset = (std::max)(largestInset, plane[3] - face);
+        }
         for (std::size_t index = 0; index < adjusted.size(); ++index)
             hull.ladderPlanes[index][3] = adjusted[index];
         hull.ladderModelTangents = std::move(modelTangents);
         hull.materialOverride = best->material;
         if (best->hasRungPhase)
+        {
             hull.ladderRungOffset =
-                std::remainder(best->rungPhase + 2.0f - minimum[2], 12.0f);
+                std::remainder(best->rungPhase + 2.0f - minimum[2], best->rungSpacing);
+            ++spacings[best->rungSpacing];
+        }
         ++aligned;
-        zt::info("iw3: aligned ladder edge to %s at (%.1f %.1f %.1f), rung phase offset %.1f",
-                 best->name.c_str(), center[0], center[1], center[2], hull.ladderRungOffset);
+        zt::info("iw3: aligned ladder edge to %s at (%.1f %.1f %.1f), rung phase offset %.1f, "
+                 "hull pulled back %.1f to the model face",
+                 best->name.c_str(), center[0], center[1], center[2], hull.ladderRungOffset,
+                 largestInset);
     }
     if (aligned)
         zt::info("iw3: aligned %zu ladder edge pairs to rendered models", aligned);
+    if (spacings.empty())
+        return 0.0f;
+    const auto common = std::ranges::max_element(
+        spacings, {}, [](const auto &entry) { return entry.second; });
+    zt::info("iw3: ladder rung spacing %.1f units (%zu spacing value(s) among aligned ladders)",
+             common->first, spacings.size());
+    return common->first;
 }
 
 void WriteCollision(const std::filesystem::path &path, const CollisionData &collision)
@@ -8257,6 +8404,45 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             generated += "    precachemodel( \"" + model + "\" );\n    level.mw120r_models[\"" +
                          model + "\"] = 1;\n";
         }
+        {
+            // The play space for iw3compat_out_of_bounds: the minimap region
+            // (or the world without its sky) plus a margin, from below the
+            // lowest geometry to well above the highest. Past it Replay's
+            // visibility pass indexed a light bitset with a negative index
+            // (crash at 0x141959080+0x71A when falling or flying out; IW8 maps
+            // kill out-of-bounds players before that).
+            Vec3 low{INFINITY, INFINITY, INFINITY}, high{-INFINITY, -INFINITY, -INFINITY};
+            for (const auto &surface : world.at("surfaces"))
+            {
+                if (surface.value("material", std::string{}).find("sky") != std::string::npos)
+                    continue;
+                for (const auto &vertex : surface.at("vertices"))
+                    for (std::size_t axis = 0; axis < 3; ++axis)
+                    {
+                        const float value = vertex.at("position").at(axis).get<float>();
+                        low[axis] = std::min(low[axis], value);
+                        high[axis] = std::max(high[axis], value);
+                    }
+            }
+            convert::CompassBounds compass;
+            if (convert::iw3CompassBounds(entities, compass))
+            {
+                low[0] = std::min(compass.northwestX, compass.southeastX);
+                high[0] = std::max(compass.northwestX, compass.southeastX);
+                low[1] = std::min(compass.northwestY, compass.southeastY);
+                high[1] = std::max(compass.northwestY, compass.southeastY);
+            }
+            if (low[0] <= high[0] && low[2] <= high[2])
+            {
+                char bounds[256];
+                std::snprintf(bounds, sizeof(bounds),
+                              "    level.mw120r_playspace_min = ( %.0f, %.0f, %.0f );\n"
+                              "    level.mw120r_playspace_max = ( %.0f, %.0f, %.0f );\n",
+                              low[0] - 1024, low[1] - 1024, low[2] - 512, high[0] + 1024,
+                              high[1] + 1024, high[2] + 2048);
+                generated += bounds;
+            }
+        }
         generated += "}\n";
         try
         {
@@ -8370,7 +8556,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                             modelMaterialNames, entityMaterialNames, fxMaterials, shadowWorldMaterialNames,
                             shadowModelMaterialNames, options.searchPaths, mapDirectory,
                             options.map, options.scratchRoot / ".iw3-render-cache",
-                            FogShaderDefines(expFog, options.style),
+                            FogShaderDefines(expFog, options.style, ReadMapSun(exportRoot, sourceMap)),
                             static_cast<unsigned>(sourceStaticModels.instances.size()),
                             entityLightVolume ? &*entityLightVolume : nullptr);
     timing.lap("render assets");
@@ -8441,7 +8627,11 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                     origin[row] += rotation[row][column] * mid[column] * instance.scale;
             origins.push_back(origin);
         }
-        auto cubes = SampleLightGridAmbientCubes(exportRoot, sourceAsset, origins);
+        // Alpha of face 0: IW3's baked sun visibility for the instance.
+        std::vector<float> sunVisibility;
+        auto cubes = SampleLightGridAmbientCubes(
+            exportRoot, sourceAsset, origins,
+            world.at("sun_primary_light_index").get<unsigned>(), &sunVisibility);
         constexpr unsigned columns = 256;
         const unsigned rows = (renderPlan.instanceLightingCount + columns - 1) / columns;
         std::vector<std::uint8_t> pixels(std::size_t(columns) * 6 * rows * 4, 0);
@@ -8456,7 +8646,17 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                     pixels[texel * 4 + channel] = static_cast<std::uint8_t>(
                         std::lround(std::clamp(value * 0.5f, 0.0f, 1.0f) * 255.0f));
                 }
-                pixels[texel * 4 + 3] = 255;
+                // Alpha of face 1: the instance's IW3 reflection probe tag
+                // (converted slot + 1, 0 for none).
+                pixels[texel * 4 + 3] =
+                    face == 0 && index < sunVisibility.size()
+                        ? static_cast<std::uint8_t>(
+                              std::lround(std::clamp(sunVisibility[index], 0.0f, 1.0f) * 255.0f))
+                    : face == 1
+                        ? static_cast<std::uint8_t>(ReflectionProbeTag(
+                              sourceStaticModels.instances.at(index).reflectionProbe,
+                              world.at("reflection_probes").size()))
+                        : 255;
             }
         if (cubes.empty())
             zt::warn("iw3: no IW3 light grid; static models use a flat 0.31 ambient");
@@ -8465,6 +8665,58 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     }
     result.shadowScene = std::move(renderPlan.shadowScene);
     BuildShadowScene(brushModels, sourceStaticModels, renderPlan, result.shadowScene);
+    {
+        // Baked sun visibility for every converted receiver (world, static
+        // models, entities) over the play space: the minimap region plus a
+        // margin, at every height a caster there reaches. Native shadow
+        // cascades drop casters outside their range and view; this does not.
+        float minX = -16384, maxX = 16384, minY = -16384, maxY = 16384;
+        convert::CompassBounds compass;
+        if (convert::iw3CompassBounds(entities, compass))
+        {
+            constexpr float margin = 512;
+            minX = std::min(compass.northwestX, compass.southeastX) - margin;
+            maxX = std::max(compass.northwestX, compass.southeastX) + margin;
+            minY = std::min(compass.northwestY, compass.southeastY) - margin;
+            maxY = std::max(compass.northwestY, compass.southeastY) + margin;
+        }
+        float minZ = INFINITY, maxZ = -INFINITY;
+        for (const auto &surface : result.shadowScene.surfaces)
+            for (const auto &vertex : surface.vertices)
+            {
+                const auto &p = vertex.position;
+                if (p[0] >= minX && p[0] <= maxX && p[1] >= minY && p[1] <= maxY &&
+                    std::abs(p[2]) <= 100000.0f)
+                {
+                    minZ = std::min(minZ, p[2]);
+                    maxZ = std::max(maxZ, p[2]);
+                }
+            }
+        replaysunshadow::DepthImage depth;
+        if (minZ <= maxZ)
+        {
+            replaybounds::Bounds region;
+            region.midpoint = {(minX + maxX) * .5f, (minY + maxY) * .5f, (minZ + maxZ) * .5f};
+            region.halfSize = {(maxX - minX) * .5f, (maxY - minY) * .5f, (maxZ - minZ) * .5f + 64};
+            const Vec3 sun = Unit(SunDirection(world, entities));
+            depth = replaysunshadow::BakeDepthImage(result.shadowScene, {sun[0], sun[1], sun[2]},
+                                                    region);
+            zt::info("iw3: baked sun depth %ux%u at %.3g units per texel over %.0f..%.0f, "
+                     "%.0f..%.0f, %.0f..%.0f",
+                     depth.width, depth.height, depth.texelSize, minX, maxX, minY, maxY, minZ, maxZ);
+        }
+        if (depth.rgba.empty())
+        {
+            // No caster in the play space: an image whose header marks it unbaked.
+            depth.rgba.assign(std::size_t(replaysunshadow::DepthImageWidth) *
+                                  replaysunshadow::DepthImageHeight * 4,
+                              0);
+            zt::warn("iw3: no sun shadow casters in the play space; baked sun depth is empty");
+        }
+        if (!zt::write_file((mapDirectory / renderPlan.sunDepthFile).string(), depth.rgba))
+            throw std::runtime_error("cannot write the baked sun depth image");
+        timing.lap("baked sun depth");
+    }
     replayrender::StaticModels unusedDynamicTables;
     BuildPreparedStaticModels(sourceDynamicEntities.models, renderPlan, options.map, "dynmodel",
                               result.xmodels, unusedDynamicTables, true, true);
@@ -8820,7 +9072,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     timing.lap("fx and audits");
     std::size_t triangles = 0;
     auto nativeCollision = ReadCollision(collision);
-    AlignLadderEdgesToModels(nativeCollision, sourceStaticModels, renderPlan);
+    result.ladderRungDistance =
+        AlignLadderEdgesToModels(nativeCollision, sourceStaticModels, renderPlan);
     AddStairRamps(nativeCollision);
     std::set<std::uint32_t> nativeGlassModels;
     std::set<std::string> nativeGlassTargets;

@@ -92,6 +92,8 @@ bool writeMaterial(iw8::ZoneWriter &zw, const Iw8Material &im);
 
 // Register the Replay HUD material used by compass_map_<map>.
 bool writeCompassMaterial(iw8::ZoneWriter &zw, const std::string &name);
+// The same native 2D (UI) material drawing the named image.
+bool writeUiMaterial(iw8::ZoneWriter &zw, const std::string &name, const std::string &imageName);
 
 // One-shot convenience: read -> convert -> register-for-write. Returns false on any failure.
 // The build-map path calls this for each listed material.

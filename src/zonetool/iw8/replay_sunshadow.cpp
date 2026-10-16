@@ -8,6 +8,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -120,42 +121,55 @@ std::vector<std::uint8_t> EncodeIntervalTile(const std::span<const float> upper,
         throw std::runtime_error("compressed sun-shadow tile must contain 512x512 intervals");
     CheckDepthRange(origin, inverseSpan);
     // Level k holds (512 >> k)^2 nodes: the lowest upper bound and the highest
-    // lower bound of the texels with a caster (+inf / -inf without one).
+    // lower bound of their texels, and whether any texel has a caster. A texel
+    // without a caster still bounds the stored depth: whatever receives there
+    // (water and other non-casting surfaces, players) is lit, so a shared leaf
+    // must stay below the lowest receiver (normalized depth inverseSpan, the
+    // one-unit padding). Treating those texels as free let a leaf carry a
+    // neighbouring caster's depth over open water (Discovery's ship shadow).
+    const float floorDepth = 0.5f * inverseSpan;
     constexpr unsigned levels = 10;
     std::array<std::vector<float>, levels> high, low;
+    std::array<std::vector<std::uint8_t>, levels> occupied;
     high[0].resize(texels);
     low[0].resize(texels);
+    occupied[0].resize(texels);
     for (std::size_t index = 0; index < texels; ++index)
     {
         if (!std::isfinite(upper[index]) || upper[index] < 0.0f || upper[index] > 1.0f ||
             std::isnan(lower[index]))
             throw std::runtime_error("compressed sun-shadow depth is outside [0, 1]");
         const bool caster = upper[index] > 0.0f;
-        high[0][index] = caster ? upper[index] : INFINITY;
+        high[0][index] = caster ? upper[index] : floorDepth;
         low[0][index] = caster ? lower[index] : -INFINITY;
+        occupied[0][index] = caster;
     }
     for (unsigned level = 1; level < levels; ++level)
     {
         const unsigned size = TileResolution >> level, previous = size * 2;
         high[level].resize(std::size_t(size) * size);
         low[level].resize(std::size_t(size) * size);
+        occupied[level].resize(std::size_t(size) * size);
         for (unsigned y = 0; y < size; ++y)
             for (unsigned x = 0; x < size; ++x)
             {
                 float h = INFINITY, l = -INFINITY;
+                std::uint8_t any = 0;
                 for (unsigned child = 0; child < 4; ++child)
                 {
                     const std::size_t from =
                         std::size_t(y * 2 + (child >> 1)) * previous + x * 2 + (child & 1);
                     h = std::min(h, high[level - 1][from]);
                     l = std::max(l, low[level - 1][from]);
+                    any |= occupied[level - 1][from];
                 }
                 high[level][std::size_t(y) * size + x] = h;
                 low[level][std::size_t(y) * size + x] = l;
+                occupied[level][std::size_t(y) * size + x] = any;
             }
     }
     uniform = 0.0f;
-    if (!std::isfinite(high[levels - 1][0]))
+    if (!occupied[levels - 1][0])
         throw std::runtime_error("compressed sun-shadow tile has no caster");
     if (low[levels - 1][0] < high[levels - 1][0])
     {
@@ -194,7 +208,7 @@ std::vector<std::uint8_t> EncodeIntervalTile(const std::span<const float> upper,
             const std::size_t index = std::size_t(y >> level) * levelWidth + (x >> level);
             const float h = high[level][index], l = low[level][index];
             // 0: no caster (inherited zero), 3: one depth for the block, 1: split.
-            const unsigned type = !std::isfinite(h) ? 0 : (childSize == 1 || l < h) ? 3 : 1;
+            const unsigned type = !occupied[level][index] ? 0 : (childSize == 1 || l < h) ? 3 : 1;
             packed |= type << (2 * child);
             if (!type)
                 continue;
@@ -212,7 +226,7 @@ std::vector<std::uint8_t> EncodeIntervalTile(const std::span<const float> upper,
 
     // Decode the tree and check every texel against its interval: first
     // surfaces stay lit (stored <= upper), the surface behind stays shadowed
-    // (stored > lower), texels without a caster are free.
+    // (stored > lower), texels without a caster stay lit (stored <= floor).
     std::vector<float> decoded(texels, 0.0f);
     std::vector<Node> walk;
     for (unsigned root = 0; root < 4; ++root)
@@ -243,9 +257,10 @@ std::vector<std::uint8_t> EncodeIntervalTile(const std::span<const float> upper,
         }
     }
     for (std::size_t index = 0; index < texels; ++index)
-        if (upper[index] > 0.0f &&
-            (decoded[index] > upper[index] ||
-             (decoded[index] <= lower[index] && decoded[index] != upper[index])))
+        if (upper[index] > 0.0f ? decoded[index] > upper[index] ||
+                                      (decoded[index] <= lower[index] &&
+                                       decoded[index] != upper[index])
+                                : decoded[index] > floorDepth)
             throw std::runtime_error("compressed sun-shadow interval tile failed verification");
     return tile;
 }
@@ -309,20 +324,52 @@ std::vector<std::uint8_t> EncodeForest(
     return forest;
 }
 
-Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
-          const replaybounds::Bounds &receiverBounds, const float sampleSize,
-          const replaybounds::Bounds *focus)
+namespace
 {
-    if (!(sampleSize == 1.0f || sampleSize == 2.0f))
-        throw std::runtime_error("compressed sun-shadow sample size must be 1 or 2 (shipped values)");
-    using Microsoft::WRL::ComPtr;
-    using Vec3 = std::array<float, 3>;
+using Vec3 = std::array<float, 3>;
+
+// Sun-space grid shared by the compressed shadow and the depth image: x =
+// right.p, y = -up.p and depth (sun.p + origin) * inverseSpan; tile (x, y)
+// covers texels [x * 512, x * 512 + 512) from (startX, startY).
+struct TileGrid
+{
+    Vec3 right{}, up{};
+    float startX{}, startY{}, sampleSize{};
+    std::uint32_t width{}, height{};
+    float origin{}, inverseSpan{};
+};
+
+using TileVisitor = std::function<void(unsigned x, unsigned y, const std::vector<float> &first,
+                                       const std::vector<float> &behind)>;
+
+void SunAxes(const Vec3 &sunDirection, Vec3 &right, Vec3 &up)
+{
     const auto dot = [](const Vec3 &a, const Vec3 &b) {
         return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     };
     const auto cross = [](const Vec3 &a, const Vec3 &b) -> Vec3 {
         return {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2],
                 a[0] * b[1] - a[1] * b[0]};
+    };
+    right = cross(std::abs(sunDirection[2]) > 0.9f ? Vec3{1, 0, 0} : Vec3{0, 0, 1}, sunDirection);
+    const float rightLength = std::sqrt(dot(right, right));
+    for (float &component : right)
+        component /= rightLength;
+    up = cross(sunDirection, right);
+}
+
+// Rasterizes the casters into 512x512 sun-space tiles: the first surface
+// along the sun and, by depth peeling, the nearest surface behind it. Tiles
+// without a caster are skipped. Two-sided rasterization treats every caster
+// as an occluder whatever its facing (a ceiling seen from above).
+bool RenderTiles(const Scene &scene, const std::array<float, 3> &sunDirection,
+                 const replaybounds::Bounds &receiverBounds, const float sampleSize,
+                 const replaybounds::Bounds *focus, const bool twoSided,
+                 const std::function<void(const TileGrid &)> &begin, const TileVisitor &visit)
+{
+    using Microsoft::WRL::ComPtr;
+    const auto dot = [](const Vec3 &a, const Vec3 &b) {
+        return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     };
     const auto check = [](const HRESULT result, const char *operation) {
         if (FAILED(result))
@@ -333,16 +380,12 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
     if (!std::isfinite(sunLength) || std::abs(sunLength - 1.0f) > 0.001f)
         throw std::runtime_error("compressed sun-shadow direction must be a unit vector");
     if (scene.surfaces.empty())
-        return {};
+        return false;
 
     // Replay 0xEB9090 -> 0x198E4B0. Keep the stored direction unchanged:
     // 0xEB8230 compares it with the active sun with a 0.001 component tolerance.
-    Vec3 right = cross(std::abs(sunDirection[2]) > 0.9f ? Vec3{1, 0, 0} : Vec3{0, 0, 1},
-                       sunDirection);
-    const float rightLength = std::sqrt(dot(right, right));
-    for (float &component : right)
-        component /= rightLength;
-    const Vec3 up = cross(sunDirection, right);
+    Vec3 right, up;
+    SunAxes(sunDirection, right, up);
     std::vector<Surface> projected = scene.surfaces;
     // Distant background geometry (IW3 terrain past 100000 units) casts no
     // shadow on the play space and would stretch the shadow crop; drop it.
@@ -366,7 +409,7 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
     }
     std::erase_if(projected, [](const Surface &surface) { return surface.vertices.empty(); });
     if (projected.empty())
-        return {};
+        return false;
     // The focus box's footprint in sun space (x = right, y = -up).
     float focusMinX = -INFINITY, focusMinY = -INFINITY, focusMaxX = INFINITY, focusMaxY = INFINITY;
     if (focus)
@@ -433,7 +476,7 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
     }
     std::erase_if(projected, [](const Surface &surface) { return surface.vertices.empty(); });
     if (projected.empty())
-        return {};
+        return false;
     // The shadow covers at most the focus footprint.
     minimum[0] = std::max(minimum[0], focusMinX);
     minimum[1] = std::max(minimum[1], focusMinY);
@@ -448,15 +491,6 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
         std::ceil((maximum[1] - startY) / tileWorldSize)));
     if (width > UINT16_MAX || height > UINT16_MAX)
         throw std::runtime_error("compressed sun-shadow crop exceeds native dimensions");
-    Data result;
-    auto &parameters = result.parameters;
-    parameters.sunDirection = sunDirection;
-    parameters.resolution = std::bit_ceil(std::max(width, height)) * TileResolution;
-    parameters.sampleSize = sampleSize;
-    parameters.centerX = parameters.resolution * sampleSize * 0.5f + startX;
-    parameters.centerY = -startY - parameters.resolution * sampleSize * 0.5f;
-    parameters.forestSize = width * height;
-    parameters.reserved = width << 16;
     // The shader's outer near-plane guard makes receivers below the depth
     // range unconditionally lit. Include the physical world's receiver
     // bounds, not just eligible casters: a non-casting floor can be below
@@ -479,6 +513,7 @@ Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
     // receivers and occluders use the same origin and inverse span.
     const float origin = 1.0f - minimum[2];
     const float inverseSpan = 1.0f / (maximum[2] - minimum[2] + 2.0f);
+    begin({right, up, startX, startY, sampleSize, width, height, origin, inverseSpan});
     std::vector<std::vector<std::size_t>> candidates(std::size_t(width) * height);
     for (std::size_t index = 0; index < projected.size(); ++index)
     {
@@ -629,13 +664,9 @@ void peel(Output input) {
     ComPtr<ID3D11ShaderResourceView> firstView;
     check(device->CreateShaderResourceView(firstCopy.Get(), &firstViewDescription, &firstView),
           "create first-surface view");
-    // Interval bounds in normalized depth (one world unit along the sun is
-    // inverseSpan): a surface within peelEpsilon of the first is the same
-    // layer; the stored depth stays margin above the surface behind and at
-    // most tolerance below the first surface (dynamic receivers under cover).
+    // A surface within peelEpsilon of the first (one world unit along the sun
+    // is inverseSpan) is the same layer.
     const float peelEpsilon = 0.25f * inverseSpan;
-    const float margin = 2.0f * inverseSpan;
-    const float tolerance = 32.0f * inverseSpan;
     ComPtr<ID3D11Buffer> peelConstants, opaqueConstants;
     {
         const std::array<float, 4> values{peelEpsilon, 0, 0, 0};
@@ -719,13 +750,9 @@ void peel(Output input) {
               "create alpha image view");
     }
 
-    std::vector<std::vector<std::uint8_t>> tiles(std::size_t(width) * height);
-    std::vector<float> uniformCells(tiles.size());
     std::vector<float> pixels(TileResolution * TileResolution);
     std::vector<float> behind(TileResolution * TileResolution);
-    std::vector<float> lowerBounds(TileResolution * TileResolution);
     std::vector<Vertex> vertices;
-    std::size_t encodedSize = 32 + tiles.size() * 4;
     // Draws one tile's casters into the depth image: the first surface, or
     // with peel the nearest surface behind the first (firstCopy).
     const auto drawCasters = [&](const unsigned x, const unsigned y,
@@ -773,7 +800,7 @@ void peel(Output input) {
             check(device->CreateBuffer(&buffer, &vertexData, &vertexBuffer), "create caster vertices");
             const UINT stride = sizeof(Vertex), offset = 0;
             context->IASetVertexBuffers(0, 1, vertexBuffer.GetAddressOf(), &stride, &offset);
-            context->RSSetState(rasterizers[material.cullMode].Get());
+            context->RSSetState(rasterizers[twoSided ? 0u : material.cullMode].Get());
             context->PSSetShader(peel ? peelShader.Get() : material.alphaTest ? pixelShader.Get() : nullptr,
                                  nullptr, 0);
             context->PSSetConstantBuffers(0, 1, material.alphaTest
@@ -812,12 +839,64 @@ void peel(Output input) {
             context->CopyResource(firstCopy.Get(), target.Get());
             drawCasters(x, y, candidates[cell], true);
             readDepth(behind);
+            visit(x, y, pixels, behind);
+        }
+    return true;
+}
+
+// Stored-depth interval of a texel with a caster (first > 0): the first
+// surface stays lit, the surface behind stays shadowed and receivers more
+// than tolerance below the first surface (players under cover) are shadowed.
+// A caster with no surface behind it (a hull over non-casting water) keeps
+// the same tolerance; an unbounded lower let merged leaves drop its occluder
+// onto the receivers below.
+float LowerBound(const float first, const float behind, const float inverseSpan)
+{
+    const float margin = 2.0f * inverseSpan;
+    const float tolerance = 32.0f * inverseSpan;
+    return behind > 0.0f ? std::max(behind + margin, first - tolerance) : first - tolerance;
+}
+} // namespace
+
+Data Bake(const Scene &scene, const std::array<float, 3> &sunDirection,
+          const replaybounds::Bounds &receiverBounds, const float sampleSize,
+          const replaybounds::Bounds *focus)
+{
+    if (!(sampleSize == 1.0f || sampleSize == 2.0f))
+        throw std::runtime_error("compressed sun-shadow sample size must be 1 or 2 (shipped values)");
+    Data result;
+    TileGrid grid;
+    std::vector<std::vector<std::uint8_t>> tiles;
+    std::vector<float> uniformCells;
+    std::vector<float> lowerBounds(TileResolution * TileResolution);
+    std::size_t encodedSize = 0;
+    // Two-sided: IW3 light baking blocks the sun with every opaque surface.
+    // With material culling a ceiling (back-facing the sun) let sunlight into
+    // rooms whose roof top IW3 never drew.
+    const bool baked = RenderTiles(
+        scene, sunDirection, receiverBounds, sampleSize, focus, true,
+        [&](const TileGrid &value) {
+            grid = value;
+            auto &parameters = result.parameters;
+            parameters.sunDirection = sunDirection;
+            parameters.resolution = std::bit_ceil(std::max(grid.width, grid.height)) * TileResolution;
+            parameters.sampleSize = sampleSize;
+            parameters.centerX = parameters.resolution * sampleSize * 0.5f + grid.startX;
+            parameters.centerY = -grid.startY - parameters.resolution * sampleSize * 0.5f;
+            parameters.forestSize = grid.width * grid.height;
+            parameters.reserved = grid.width << 16;
+            tiles.assign(std::size_t(grid.width) * grid.height, {});
+            uniformCells.assign(tiles.size(), 0.0f);
+            encodedSize = 32 + tiles.size() * 4;
+        },
+        [&](const unsigned x, const unsigned y, const std::vector<float> &pixels,
+            const std::vector<float> &behind) {
             for (std::size_t index = 0; index < pixels.size(); ++index)
-                lowerBounds[index] = behind[index] > 0.0f
-                                         ? std::max(behind[index] + margin, pixels[index] - tolerance)
-                                         : -INFINITY;
+                lowerBounds[index] = LowerBound(pixels[index], behind[index], grid.inverseSpan);
+            const auto cell = y * grid.width + x;
             float uniform = 0.0f;
-            tiles[cell] = EncodeIntervalTile(pixels, lowerBounds, origin, inverseSpan, uniform);
+            tiles[cell] =
+                EncodeIntervalTile(pixels, lowerBounds, grid.origin, grid.inverseSpan, uniform);
             uniformCells[cell] = uniform;
             if (uniform != 0.0f)
                 ++result.uniformCells;
@@ -826,10 +905,105 @@ void peel(Output input) {
             if (tiles[cell].size() > MaximumBytes - encodedSize)
                 throw std::runtime_error("compressed sun-shadow bake exceeds 31-bit pointers");
             encodedSize += tiles[cell].size();
-        }
-    result.bytes = EncodeForest(parameters.resolution, static_cast<std::uint16_t>(width),
-                                static_cast<std::uint16_t>(height), origin, inverseSpan, tiles,
-                                uniformCells);
+        });
+    if (!baked)
+        return {};
+    result.bytes = EncodeForest(result.parameters.resolution,
+                                static_cast<std::uint16_t>(grid.width),
+                                static_cast<std::uint16_t>(grid.height), grid.origin,
+                                grid.inverseSpan, tiles, uniformCells);
     return result;
+}
+
+DepthImage BakeDepthImage(const Scene &scene, const std::array<float, 3> &sunDirection,
+                          const replaybounds::Bounds &region)
+{
+    // Texel size: the smallest (in eighths of a unit) whose tile grid, with
+    // one tile of slack per axis for the alignment to whole tiles, fits the
+    // image.
+    Vec3 right, up;
+    SunAxes(sunDirection, right, up);
+    float minX = INFINITY, minY = INFINITY, maxX = -INFINITY, maxY = -INFINITY;
+    for (unsigned corner = 0; corner < 8; ++corner)
+    {
+        Vec3 point{};
+        for (unsigned axis = 0; axis < 3; ++axis)
+            point[axis] = region.midpoint[axis] +
+                          ((corner >> axis) & 1 ? region.halfSize[axis] : -region.halfSize[axis]);
+        const float x = right[0] * point[0] + right[1] * point[1] + right[2] * point[2];
+        const float y = -(up[0] * point[0] + up[1] * point[1] + up[2] * point[2]);
+        minX = std::min(minX, x);
+        maxX = std::max(maxX, x);
+        minY = std::min(minY, y);
+        maxY = std::max(maxY, y);
+    }
+    float texel = 1.0f;
+    const auto tilesFor = [&](const float value) {
+        // The grid starts at a whole tile below the footprint (RenderTiles).
+        const float tile = TileResolution * value;
+        return std::max(1.0f, std::ceil((maxX - std::floor(minX / tile) * tile) / tile)) *
+               std::max(1.0f, std::ceil((maxY - std::floor(minY / tile) * tile) / tile));
+    };
+    while (tilesFor(texel) > DepthImageTiles)
+        texel += 0.125f;
+
+    DepthImage image;
+    image.width = DepthImageWidth;
+    image.height = DepthImageHeight;
+    std::vector<std::uint16_t> depth;
+    std::uint32_t stride = 0;
+    TileGrid grid;
+    const bool baked = RenderTiles(
+        scene, sunDirection, region, texel, &region, true,
+        [&](const TileGrid &value) {
+            grid = value;
+            if (grid.width * grid.height > DepthImageTiles)
+                throw std::runtime_error("sun depth image grid exceeds the image");
+            stride = grid.width * TileResolution;
+            depth.assign(std::size_t(stride) * grid.height * TileResolution, 0);
+        },
+        [&](const unsigned x, const unsigned y, const std::vector<float> &pixels,
+            const std::vector<float> &behind) {
+            for (unsigned row = 0; row < TileResolution; ++row)
+                for (unsigned column = 0; column < TileResolution; ++column)
+                {
+                    const std::size_t index = std::size_t(row) * TileResolution + column;
+                    const float first = pixels[index];
+                    if (first <= 0.0f)
+                        continue;
+                    // The interval's midpoint, at most the first surface.
+                    const float lower =
+                        std::min(LowerBound(first, behind[index], grid.inverseSpan), first);
+                    const float stored = (first + lower) * 0.5f;
+                    depth[std::size_t(y * TileResolution + row) * stride + x * TileResolution +
+                          column] = static_cast<std::uint16_t>(
+                        std::clamp(std::lround(stored * 65535.0f), 1l, 65535l));
+                }
+        });
+    // Row 0: header floats; from row 1 the depths in row-major order, two
+    // 16-bit depths per RGBA8 texel (high byte first), 0 where nothing casts.
+    image.rgba.assign(std::size_t(image.width) * image.height * 4, 0);
+    const std::array<float, 18> header{right[0], right[1], right[2], up[0], up[1], up[2],
+                                       sunDirection[0], sunDirection[1], sunDirection[2],
+                                       grid.startX, grid.startY, texel, grid.origin,
+                                       grid.inverseSpan, float(grid.width * TileResolution),
+                                       float(grid.height * TileResolution), baked ? 1.0f : 0.0f,
+                                       float(stride)};
+    for (std::size_t index = 0; index < header.size(); ++index)
+    {
+        const auto bits = std::bit_cast<std::uint32_t>(header[index]);
+        for (unsigned byte = 0; byte < 4; ++byte)
+            image.rgba[index * 4 + byte] = static_cast<std::uint8_t>(bits >> (8 * byte));
+    }
+    for (std::size_t linear = 0; linear < depth.size(); ++linear)
+    {
+        const std::uint16_t value = depth[linear];
+        const std::size_t at = (std::size_t(image.width) + linear / 2) * 4 + (linear & 1) * 2;
+        image.rgba[at] = static_cast<std::uint8_t>(value >> 8);
+        image.rgba[at + 1] = static_cast<std::uint8_t>(value);
+    }
+    image.texelSize = texel;
+    image.baked = baked;
+    return image;
 }
 } // namespace replaysunshadow

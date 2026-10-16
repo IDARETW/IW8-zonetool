@@ -77,6 +77,8 @@ struct MapMetadata
     std::string description;
     unsigned compassRotation{};
     bool compassRotationSet{};
+    // Ladder rung spacing for the DW client (0 = Replay's 12).
+    float ladderRungDistance{};
     // Contraction of the IW3 minimap region about its centre (see the compass
     // bounds below); build-time only, not written to the package map.json.
     // 1.0 = IW3's own squared region: Nuketown's art measures about 12 units per
@@ -93,6 +95,7 @@ void printUsage()
                 "usage:\n"
                 "  iw8-zonetool build-map <dump> <map> [-o <output>] [options]\n"
                 "  iw8-zonetool build-iw3 <map.ff> [map] [-o <output>] [options]\n"
+                "  iw8-zonetool build-map-images -o <output> <map id>=<preview.rgba>...\n"
                 "  iw8-zonetool build-weapon <weapon.json> [-o <output>]\n"
                 "  iw8-zonetool build-weapon-placeholders <manifest.json> [-o <output>]\n"
                 "  iw8-zonetool inspect-iw7 <file.ff>\n"
@@ -315,6 +318,12 @@ bool readMetadata(const std::string &path, MapMetadata &metadata)
                 metadata.compassRotation != 180 && metadata.compassRotation != 270)
                 throw std::runtime_error("compassRotation must be 0, 90, 180, or 270 clockwise");
         }
+        if (const auto rungs = data.find("ladderRungDistance"); rungs != data.end())
+        {
+            if (!rungs->is_number() || rungs->get<double>() < 8 || rungs->get<double>() > 32)
+                throw std::runtime_error("ladderRungDistance must be a number from 8 to 32");
+            metadata.ladderRungDistance = rungs->get<float>();
+        }
         if (const auto scale = data.find("minimapScale"); scale != data.end())
         {
             if (!scale->is_number() || scale->get<double>() < 0.5 || scale->get<double>() > 1.5)
@@ -372,6 +381,10 @@ bool writeMetadata(const std::string &directory, const MapMetadata &metadata)
     if (metadata.compassRotation)
     {
         data["compassRotation"] = metadata.compassRotation;
+    }
+    if (metadata.ladderRungDistance > 0.0f && metadata.ladderRungDistance != 12.0f)
+    {
+        data["ladderRungDistance"] = metadata.ladderRungDistance;
     }
     std::ofstream output(std::filesystem::path(directory) / "map.json", std::ios::binary);
     if (!output)
@@ -1827,6 +1840,7 @@ int buildIw3(const Args &args)
     build.positional = {prepared.root.string(), map};
     build.collisionPath = prepared.collision.string();
     build.footstepsPath = prepared.footsteps.string();
+    metadata.ladderRungDistance = prepared.ladderRungDistance;
     if (!writeMetadata(prepared.root.string(), metadata))
     {
         return 1;
@@ -1949,6 +1963,277 @@ int validate(const Args &args)
     return validatePackage(args.positional[0], args.positional[1]) ? 0 : 1;
 }
 
+// Box-filter an RGBA8 image to width x height.
+std::vector<uint8_t> resizeRgba(const std::vector<uint8_t> &pixels, const unsigned width,
+                                const unsigned height, const unsigned newWidth,
+                                const unsigned newHeight)
+{
+    std::vector<uint8_t> result(size_t(newWidth) * newHeight * 4);
+    for (unsigned y = 0; y < newHeight; ++y)
+    {
+        const unsigned y0 = y * height / newHeight;
+        const unsigned y1 = (std::max)(y0 + 1, (y + 1) * height / newHeight);
+        for (unsigned x = 0; x < newWidth; ++x)
+        {
+            const unsigned x0 = x * width / newWidth;
+            const unsigned x1 = (std::max)(x0 + 1, (x + 1) * width / newWidth);
+            unsigned sum[4]{};
+            for (unsigned sy = y0; sy < y1; ++sy)
+                for (unsigned sx = x0; sx < x1; ++sx)
+                    for (unsigned c = 0; c < 4; ++c)
+                        sum[c] += pixels[(size_t(sy) * width + sx) * 4 + c];
+            const unsigned count = (y1 - y0) * (x1 - x0);
+            for (unsigned c = 0; c < 4; ++c)
+                result[(size_t(y) * newWidth + x) * 4 + c] = uint8_t((sum[c] + count / 2) / count);
+        }
+    }
+    return result;
+}
+
+// Opaque BC1: endpoints at the extremes of each block's principal colour axis.
+std::vector<uint8_t> encodeBc1(const std::vector<uint8_t> &pixels, const unsigned width,
+                               const unsigned height)
+{
+    std::vector<uint8_t> result;
+    result.reserve(size_t(width) * height / 2);
+    const auto pack = [](const float *colour) {
+        const auto channel = [](const float value, const int bits) {
+            const int maximum = (1 << bits) - 1;
+            return uint16_t(std::clamp(int(value * maximum / 255.0f + 0.5f), 0, maximum));
+        };
+        return uint16_t(channel(colour[0], 5) << 11 | channel(colour[1], 6) << 5 |
+                        channel(colour[2], 5));
+    };
+    const auto unpack = [](const uint16_t packed, float *colour) {
+        colour[0] = float((packed >> 11) & 31) * 255.0f / 31.0f;
+        colour[1] = float((packed >> 5) & 63) * 255.0f / 63.0f;
+        colour[2] = float(packed & 31) * 255.0f / 31.0f;
+    };
+    for (unsigned by = 0; by < height; by += 4)
+        for (unsigned bx = 0; bx < width; bx += 4)
+        {
+            float block[16][3];
+            float mean[3]{};
+            for (unsigned i = 0; i < 16; ++i)
+            {
+                const uint8_t *source = &pixels[(size_t(by + i / 4) * width + bx + i % 4) * 4];
+                for (unsigned c = 0; c < 3; ++c)
+                {
+                    block[i][c] = source[c];
+                    mean[c] += source[c] / 16.0f;
+                }
+            }
+            float covariance[6]{};
+            for (const auto &colour : block)
+            {
+                const float d[3]{colour[0] - mean[0], colour[1] - mean[1], colour[2] - mean[2]};
+                covariance[0] += d[0] * d[0];
+                covariance[1] += d[0] * d[1];
+                covariance[2] += d[0] * d[2];
+                covariance[3] += d[1] * d[1];
+                covariance[4] += d[1] * d[2];
+                covariance[5] += d[2] * d[2];
+            }
+            float axis[3]{1.0f, 1.0f, 1.0f};
+            for (int iteration = 0; iteration < 8; ++iteration)
+            {
+                const float next[3]{
+                    covariance[0] * axis[0] + covariance[1] * axis[1] + covariance[2] * axis[2],
+                    covariance[1] * axis[0] + covariance[3] * axis[1] + covariance[4] * axis[2],
+                    covariance[2] * axis[0] + covariance[4] * axis[1] + covariance[5] * axis[2]};
+                const float length =
+                    std::sqrt(next[0] * next[0] + next[1] * next[1] + next[2] * next[2]);
+                if (length < 1e-6f)
+                    break;
+                for (unsigned c = 0; c < 3; ++c)
+                    axis[c] = next[c] / length;
+            }
+            float low = 1e30f, high = -1e30f;
+            for (const auto &colour : block)
+            {
+                const float t = (colour[0] - mean[0]) * axis[0] + (colour[1] - mean[1]) * axis[1] +
+                                (colour[2] - mean[2]) * axis[2];
+                low = (std::min)(low, t);
+                high = (std::max)(high, t);
+            }
+            float a[3], b[3];
+            for (unsigned c = 0; c < 3; ++c)
+            {
+                a[c] = std::clamp(mean[c] + axis[c] * high, 0.0f, 255.0f);
+                b[c] = std::clamp(mean[c] + axis[c] * low, 0.0f, 255.0f);
+            }
+            uint16_t c0 = pack(a), c1 = pack(b);
+            if (c0 < c1)
+                std::swap(c0, c1);
+            uint32_t indices = 0;
+            if (c0 != c1)
+            {
+                float palette[4][3];
+                unpack(c0, palette[0]);
+                unpack(c1, palette[1]);
+                for (unsigned c = 0; c < 3; ++c)
+                {
+                    palette[2][c] = (2.0f * palette[0][c] + palette[1][c]) / 3.0f;
+                    palette[3][c] = (palette[0][c] + 2.0f * palette[1][c]) / 3.0f;
+                }
+                for (unsigned i = 0; i < 16; ++i)
+                {
+                    unsigned best = 0;
+                    float bestDistance = 1e30f;
+                    for (unsigned p = 0; p < 4; ++p)
+                    {
+                        float distance = 0.0f;
+                        for (unsigned c = 0; c < 3; ++c)
+                            distance += (block[i][c] - palette[p][c]) * (block[i][c] - palette[p][c]);
+                        if (distance < bestDistance)
+                        {
+                            bestDistance = distance;
+                            best = p;
+                        }
+                    }
+                    indices |= best << (2 * i);
+                }
+            }
+            const uint8_t bytes[8]{uint8_t(c0), uint8_t(c0 >> 8), uint8_t(c1), uint8_t(c1 >> 8),
+                                   uint8_t(indices), uint8_t(indices >> 8),
+                                   uint8_t(indices >> 16), uint8_t(indices >> 24)};
+            result.insert(result.end(), bytes, bytes + 8);
+        }
+    return result;
+}
+
+// A zero-payload Replay patch (.fp) for a written zone: the patch header, then the
+// zone's 0x88-byte header as both the previous and the target header. Zones loaded
+// with the common zones' failure mode need one beside every .ff.
+bool writeHeaderOnlyPatch(const std::string &fastfile)
+{
+    std::vector<uint8_t> header;
+    if (!read_file(fastfile, header) || header.size() < 0x88 || std::memcmp(header.data(), "IWff", 4))
+    {
+        err("map images: cannot read the zone header of %s", fastfile.c_str());
+        return false;
+    }
+    header.resize(0x88);
+    std::vector<uint8_t> patch(0x38);
+    std::memcpy(patch.data(), "IWffd100", 8);
+    const uint32_t version = 6, flags = 4;
+    std::memcpy(patch.data() + 8, &version, 4);
+    std::memcpy(patch.data() + 12, &flags, 4);
+    patch.insert(patch.end(), header.begin(), header.end());
+    patch.insert(patch.end(), header.begin(), header.end());
+    std::string path = fastfile;
+    path.replace(path.size() - 3, 3, ".fp");
+    return write_file(path, patch);
+}
+
+// build-map-images -o <out> <map id>=<preview.rgba>...
+// One always-loaded zone with each map's lobby and loading-screen image. Replay's
+// map info names that art by image (mp_shipment: the 2048x1024 BC1 sRGB image
+// loading_mp_shipment_bg), so every map gets the image loading_<id>_bg (BC1,
+// 1024x512) and a 2D material of the same name. IW3 loadscreens are square
+// images shown at 4:3; their middle two thirds give the 2:1 frame unstretched.
+// Writes mw120r_map_images (images), techsets_ (materials), empty srv_/eng_/ww_
+// companions, a .fp patch beside each, and map_images.txt listing the ids.
+int buildMapImages(const Args &args)
+{
+    if (args.outputDirectory.empty() || args.positional.empty())
+    {
+        printUsage();
+        return 2;
+    }
+    const std::string zone = "mw120r_map_images";
+    iw8::ZoneWriter writer;
+    iw8::ZoneWriter techsets;
+    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> encoded; // preview -> BC1
+    std::string ids;
+    constexpr unsigned targetWidth = 1024, targetHeight = 512;
+    for (const std::string &pair : args.positional)
+    {
+        const auto equals = pair.find('=');
+        const std::string id = pair.substr(0, equals);
+        if (equals == std::string::npos || id.size() < 4 || !id.starts_with("mp_"))
+        {
+            err("map images: expected <map id>=<preview.rgba>, got '%s'", pair.c_str());
+            return 2;
+        }
+        std::vector<uint8_t> preview;
+        uint32_t header[4]{};
+        if (!read_file(pair.substr(equals + 1), preview) || preview.size() < 16 ||
+            (std::memcpy(header, preview.data(), 16), header[0] != 0x4952574Du) || header[1] != 1 ||
+            !header[2] || !header[3] || preview.size() != 16 + size_t(header[2]) * header[3] * 4)
+        {
+            err("map images: %s is not a preview.rgba image", pair.substr(equals + 1).c_str());
+            return 1;
+        }
+        const std::string name = "loading_" + id + "_bg";
+        const std::vector<uint8_t> *bc1 = nullptr;
+        for (const auto &[source, blocks] : encoded)
+            if (source == preview)
+                bc1 = &blocks;
+        if (!bc1)
+        {
+            const unsigned width = header[2], height = header[3];
+            std::vector<uint8_t> pixels(preview.begin() + 16, preview.end());
+            if (width == height && height >= 6)
+            {
+                // Square IW3 loadscreen: keep rows height/6 .. 5 height/6.
+                const unsigned top = height / 6, rows = height - 2 * top;
+                pixels = std::vector<uint8_t>(pixels.begin() + size_t(top) * width * 4,
+                                              pixels.begin() + size_t(top + rows) * width * 4);
+                pixels = resizeRgba(pixels, width, rows, targetWidth, targetHeight);
+            }
+            else
+                pixels = resizeRgba(pixels, width, height, targetWidth, targetHeight);
+            encoded.emplace_back(std::move(preview), encodeBc1(pixels, targetWidth, targetHeight));
+            bc1 = &encoded.back().second;
+            info("map images: %s %ux%u -> %ux%u BC1", name.c_str(), width, height, targetWidth,
+                 targetHeight);
+        }
+        dumpimg::Iw8ImageDef image;
+        image.name = name;
+        image.format = 34; // BC1 sRGB, as the stock loading images
+        image.width = uint16_t(targetWidth);
+        image.height = uint16_t(targetHeight);
+        image.semantic = 2; // colour map
+        image.category = 3; // loaded from the fastfile
+        image.pixels = *bc1;
+        image.totalSize = uint32_t(image.pixels.size());
+        if (!dumpimg::addImageAsset(writer, image) ||
+            !convdump::mtl::writeUiMaterial(techsets, name, name))
+            return 1;
+        replayrender::RegisterMaterialReference(writer, name);
+        ids += id + "\n";
+    }
+
+    if (!mkdirs(args.outputDirectory))
+    {
+        err("map images: cannot create %s", args.outputDirectory.c_str());
+        return 1;
+    }
+    techsets.build();
+    writer.build();
+    std::vector<std::string> written;
+    const auto write = [&](const std::string &name, const std::vector<uint8_t> &body,
+                           const Iw8WriteParams &params) {
+        const std::string path = path_join(args.outputDirectory, name + ".ff");
+        written.push_back(path);
+        return iw8_write(path, body, params);
+    };
+    bool ok = write("techsets_" + zone, techsets.body(), writeParams(techsets)) &&
+              write(zone, writer.body(), writeParams(writer));
+    for (const std::string prefix : {"srv_", "eng_", "ww_"})
+    {
+        iw8::ZoneBuffer buffer;
+        iw8::buildEmptyZone(buffer);
+        ok = ok && write(prefix + zone, buffer.data(), writeParams(buffer));
+    }
+    for (const std::string &path : written)
+        ok = ok && writeHeaderOnlyPatch(path);
+    ok = ok && write_file_str(path_join(args.outputDirectory, "map_images.txt"), ids);
+    info("map images: %zu map image(s) from %zu preview(s)", args.positional.size(), encoded.size());
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int main(const int argc, char **argv)
@@ -1999,6 +2284,10 @@ try
     if (args.command == "build-iw3")
     {
         return buildIw3(args);
+    }
+    if (args.command == "build-map-images")
+    {
+        return buildMapImages(args);
     }
     if (args.command == "inspect")
     {
