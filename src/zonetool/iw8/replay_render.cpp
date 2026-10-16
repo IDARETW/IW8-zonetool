@@ -1681,6 +1681,8 @@ void StampWorld(std::vector<uint8_t> &w, const Mesh &m)
         put(w.data(), 0x3F98 + off, PTR_FOLLOWS);
     put(w.data(), 0x41E0, PTR_FOLLOWS); // sortedSurfaces[words*32], disk-backed uint32
     put(w.data(), 0x41F8, PTR_FOLLOWS); // surface casts-sun-shadow bits, runtime
+    // materialLod0SizeThreshold (+0x3EE8): shipped worlds store 0.5 (mp_hideout).
+    put(w.data(), 0x3EE8, 0.5f);
 }
 
 namespace

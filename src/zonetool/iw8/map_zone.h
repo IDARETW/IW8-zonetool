@@ -1014,7 +1014,8 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                    uint8_t cm[kSizeClipMap];
                    std::memset(cm, 0, sizeof(cm));
                    stamp64(cm, kCM_name, PTR_FOLLOWS);
-                   stamp32(cm, kCM_isInUse, 1);
+                   // Shipped clip maps store isInUse 0; the loader marks the live asset.
+                   stamp32(cm, kCM_isInUse, 0);
                    stamp32(cm, 0x0C, staticCollisionPlan->models.empty() ? 0u : 1u);
                    stamp64(cm, 0x10, staticCollisionPlan->models.empty() ? PTR_NULL : PTR_FOLLOWS);
                    stamp64(cm, kCM_mapEnts, output.assetAlias(ASSET_TYPE_MAP_ENTS, assetName));
@@ -1022,8 +1023,16 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                    cm[0x28] = 1; // R_UpdateActiveStage 19864E0 always copies stage zero.
                    for (int k = 0; k < 3; ++k)
                    {
-                       stampf(cm, kCM_bpMin + (size_t)k * 4, bounds.valid ? bounds.mn[k] : -100000.f);
-                       stampf(cm, kCM_bpMax + (size_t)k * 4, bounds.valid ? bounds.mx[k] : 100000.f);
+                   {
+                       // q_HavokPhysics_CreateWorld sizes every physics world's broadphase
+                       // from these bounds, and a body that leaves it is frozen in place
+                       // (q_HavokPhysics_OnBodyExitedBroadphase). Shipped maps pad far past
+                       // the playable area (mp_hideout -53152..77920, z -3584..29184), so
+                       // flung ragdolls and props keep simulating; pad likewise.
+                       const float pad = k < 2 ? 16384.f : 8192.f;
+                       stampf(cm, kCM_bpMin + (size_t)k * 4, bounds.valid ? bounds.mn[k] - pad : -100000.f);
+                       stampf(cm, kCM_bpMax + (size_t)k * 4, bounds.valid ? bounds.mx[k] + pad : 100000.f);
+                   }
                    }
                    stamp32(cm, kCM_havokSize, static_cast<uint32_t>(collision.world.size()));
                    stamp64(cm, kCM_havokData, collision.world.empty() ? PTR_NULL : PTR_FOLLOWS);
@@ -1048,6 +1057,11 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                        throw std::runtime_error("sun primary-light index exceeds Replay stage range");
                    stage[offsetof(iw8::maps::Stage, sunPrimaryLightIndex)] =
                        static_cast<uint8_t>(lighting.sunPrimaryLightIndex);
+                   // Stage 0 is the fallback R_UpdateActiveStage (19864E0) never tests
+                   // against a trigger; shipped maps mark it 1024 (no trigger).
+                   const uint16_t noTrigger = 1024;
+                   std::memcpy(stage + offsetof(iw8::maps::Stage, triggerIndex), &noTrigger,
+                               sizeof(noTrigger));
                    zb.write(stage, sizeof(stage));
                    zb.writeStr("default");
                    if (!collision.world.empty())
