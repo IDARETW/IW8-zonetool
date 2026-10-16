@@ -1,5 +1,7 @@
 #pragma once
 #include "iw8_zone.h"
+#include "replay_heightfield.h"
+#include "replay_locallights.h"
 #include "replay_map_layout.h"
 #include "replay_render.h"
 #include "replay_sunshadow.h"
@@ -45,6 +47,8 @@ void emitGfxMapBody(iw8::ZoneWriter &zw, const char *assetName, const std::strin
                     const replayrender::StaticModels &staticModels,
                     uint32_t dynamicModelCount, uint32_t dynamicBrushCount,
                     const replaysunshadow::Data &sunShadow,
-                    const std::array<float, 3> &sunDirection = {0.0f, 0.0f, 1.0f});
+                    const std::array<float, 3> &sunDirection = {0.0f, 0.0f, 1.0f},
+                    const iw8::heightfield::Data *heightfield = nullptr,
+                    const iw8::locallights::Data *localLights = nullptr);
 
 } // namespace iw8maps

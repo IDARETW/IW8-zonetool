@@ -218,6 +218,10 @@ struct Mesh : Material
     std::vector<unsigned> surfaceMaterials;
     unsigned opaqueCount = 0;
     std::vector<uint8_t> surfaces, bounds, drawSurfs, surfData, positions, aux, indices;
+    // Nine floats per opaque, non-sky world-model triangle (GfxWorld heightfield).
+    std::vector<float> solidTriangles;
+    // The same surfaces by index: static casters for local-light shadow lists.
+    std::vector<uint32_t> shadowCasterSurfaces;
     unsigned count = 0;
     unsigned words() const
     {
@@ -248,5 +252,9 @@ BuildCellTreeBounds(const Mesh &mesh, const StaticModels &models);
 void StampReflectionProbes(std::vector<uint8_t> &world, const Mesh &mesh,
                            const iw8::ZoneWriter &writer);
 void EmitReflectionProbes(iw8::ZoneWriter &writer, const Mesh &mesh);
-std::vector<uint8_t> BuildUmbraTome(const Mesh &mesh, const StaticModels &staticModels);
+// World-space bounds of one static-model instance.
+replaybounds::Bounds StaticModelWorldBounds(const StaticModels &models, size_t instance);
+// primaryLights: static local-light indices registered as Umbra light objects.
+std::vector<uint8_t> BuildUmbraTome(const Mesh &mesh, const StaticModels &staticModels,
+                                    const std::vector<uint32_t> &primaryLights = {});
 } // namespace replayrender

@@ -53,8 +53,11 @@ iw8_focus::XModel buildStruct(const cx::Iw8XModelRecord &rec)
     // 0x40 (SELF_VISIBILITY) and 0x2000000 (HAS_ANY_STREAMED_IMAGES) describe data
     // converted models do not carry.
     xm.characterCollBoundsType = 1;
+    // lgvData (light-grid-volume packing): 0x4008040 on all 1902 shipped mp_hideout
+    // XModels; the value is tool-baked (absent from the exe), so every model gets it.
+    xm.lgvData = 0x4008040;
     // numAimAssistBones / numClothAssets / mdaoVolumeCount / physicsUseCategory / impactType /
-    // mdaoType / characterCollBoundsType / edgeLength / lgvData / physicsUsageCounter /
+    // mdaoType / edgeLength / physicsUsageCounter /
     // noScalePartBits: 0 (no IW5 source) -> all their //PTR/CNT pairs are null/zero (load-safe).
 
     // ---- pointer fields -> sentinels ----

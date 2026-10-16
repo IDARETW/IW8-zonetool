@@ -17,6 +17,8 @@
 #include "iw8/maps_write.h"
 #include "iw8/replay_dynentity.h"
 #include "iw8/replay_havok.h"
+#include "iw8/replay_heightfield.h"
+#include "iw8/replay_locallights.h"
 #include "iw8/replay_impact.h"
 #include "iw8/replay_navigation.h"
 #include "iw8/replay_rawfile.h"
@@ -1256,14 +1258,48 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             prepared ? prepared->staticModels : replayrender::StaticModels{};
         const std::array<float, 3> sunDirection{lighting.direction[0], lighting.direction[1],
                                                 lighting.direction[2]};
+        // Native GfxWorld heightfield and outdoor mask (shipped worlds carry
+        // both); the images precede the world that references them.
+        std::optional<iw8::heightfield::Data> heightfield;
+        if (!renderMesh.solidTriangles.empty())
+        {
+            heightfield = iw8::heightfield::Build(renderMesh.solidTriangles, renderMesh.sceneBounds);
+            iw8::heightfield::Register(writer, *heightfield);
+            info("heightfield: %ux%u over %zu triangles", heightfield->size, heightfield->size,
+                 renderMesh.solidTriangles.size() / 9);
+        }
+        // Local (spot/omni) primary lights: GfxWorld volumes, shadow frustums,
+        // BVH and static caster lists.
+        std::vector<iw8::locallights::Light> localLightSources;
+        for (const auto &source : lighting.primaryLights)
+        {
+            iw8::locallights::Light light;
+            light.type = source.type;
+            light.canUseShadowMap = source.canUseShadowMap;
+            std::copy(std::begin(source.origin), std::end(source.origin), light.origin.begin());
+            std::copy(std::begin(source.direction), std::end(source.direction),
+                      light.direction.begin());
+            light.radius = source.radius;
+            light.cosHalfFovOuter = source.cosHalfFovOuter;
+            localLightSources.push_back(light);
+        }
+        const auto localLights = iw8::locallights::Build(localLightSources, sunPrimaryLightIndex,
+                                                         renderMesh, staticModels);
+        if (!localLights.Empty())
+            info("local lights: %zu volume(s), %zu dynamic-shadow, %zu mesh vertices",
+                 localLights.umbraLights.size(), localLights.aabbLights.size(),
+                 localLights.vertices.size());
         writer.add(ASSET_TYPE_GFX_MAP, assetName,
                    [assetName, renderPath, &renderMesh, primaryLightCount,
                     sunPrimaryLightIndex, staticModels, dynamicCounts,
-                    &sunShadow, sunDirection](iw8::ZoneWriter &output) {
+                    &sunShadow, sunDirection, &heightfield,
+                    &localLights](iw8::ZoneWriter &output) {
                        iw8maps::emitGfxMapBody(output, assetName.c_str(), renderPath,
                                                renderMesh, primaryLightCount, sunPrimaryLightIndex,
                                                staticModels, dynamicCounts.models,
-                                               dynamicCounts.brushes, sunShadow, sunDirection);
+                                               dynamicCounts.brushes, sunShadow, sunDirection,
+                                               heightfield ? &*heightfield : nullptr,
+                                               &localLights);
                    });
         writer.add(ASSET_TYPE_GLASS_MAP, assetName,
                    [assetName, &renderMesh](iw8::ZoneWriter &output) {

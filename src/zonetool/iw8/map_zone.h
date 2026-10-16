@@ -867,8 +867,25 @@ inline void emitComWorldBody(ZoneBuffer &zb, const char *assetName, const MapSun
             stampf(light, 0x50, source->radius);
             stampf(light, 0x6C, source->cosHalfFovOuter);
             stampf(light, 0x70, source->cosHalfFovInner);
-            stampf(light, 0x80, source->type >= 2 ? 0.0018f : 0.0f);
-            stampf(light, 0x84, source->type >= 2 ? 0.2f : 0.0f);
+            if (source->type >= 2)
+            {
+                // needsDynamicShadows: shipped mp_hideout sets it on exactly the
+                // shadow-mapped spots, the lights GfxWorld lightAABB lists
+                // (replay_locallights NeedsDynamicShadows). IW3 spot shadow maps
+                // include entities, so its shadowed spots qualify.
+                light[3] = source->type == 2 && source->canUseShadowMap ? 1 : 0;
+                // Shipped local-light defaults (mp_hideout, 124 lights): IW3 lights
+                // are points (smallest shipped bulb 1), shadow near-plane bias 8,
+                // softness 0.55, bias 0.75, area 0.0018, distance falloff 0.2, and
+                // collimation cos(90 deg) = no collimation.
+                stampf(light, 0x5C, 1.0f);
+                stampf(light, 0x74, 8.0f);
+                stampf(light, 0x78, 0.55f);
+                stampf(light, 0x7C, 0.75f);
+                stampf(light, 0x80, 0.0018f);
+                stampf(light, 0x84, 0.2f);
+                stampf(light, 0x88, -4.371138828673793e-08f);
+            }
             stampf(light, 0x8C, source->rotationLimit);
             stampf(light, 0x90, source->translationLimit);
             stamp64(light, 0x98, source->definition.empty() ? PTR_NULL : PTR_FOLLOWS);

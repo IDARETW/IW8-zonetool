@@ -307,13 +307,19 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
                     const replayrender::StaticModels &staticModels,
                     const uint32_t dynamicModelCount, const uint32_t dynamicBrushCount,
                     const replaysunshadow::Data &sunShadow,
-                    const std::array<float, 3> &sunDirection)
+                    const std::array<float, 3> &sunDirection,
+                    const iw8::heightfield::Data *heightfield,
+                    const iw8::locallights::Data *localLights)
 {
     if (primaryLightCount < 2 || sunPrimaryLightIndex >= primaryLightCount)
         throw std::runtime_error("invalid primary-light table for GfxWorld");
 
     const auto lightGrid = replaylightgrid::Load(meshPath);
-    const auto umbraTome = replayrender::BuildUmbraTome(mesh, staticModels);
+    static const iw8::locallights::Data noLocalLights;
+    const auto &lights = localLights ? *localLights : noLocalLights;
+    if (!lights.Empty() && lights.lightCount != primaryLightCount)
+        throw std::runtime_error("GfxWorld local-light data does not match the primary lights");
+    const auto umbraTome = replayrender::BuildUmbraTome(mesh, staticModels, lights.umbraLights);
     const auto cellCount = static_cast<uint32_t>(mesh.cells.size());
     const auto cellWordCount = (cellCount + 31u) >> 5;
     std::vector<uint8_t> gw(kSizeGfxWorld, 0);
@@ -351,6 +357,9 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
     for (size_t index = 0; index < sortKeys.size(); ++index)
         stamp32(gw.data(), 0x3C + index * sizeof(uint32_t), sortKeys[index]);
     stamp64(gw.data(), 0x3D68, PTR_FOLLOWS);     // runtime GfxLight[], zero-fill stream 4
+    if (heightfield)
+        iw8::heightfield::Stamp(gw, *heightfield, zw);
+    iw8::locallights::Stamp(gw, lights, dynamicModelCount, dynamicBrushCount);
     // sunflare_t at +0x3E28 (Load_sunflare_t 0xE41700): hasValidData, sprite and
     // flare materials (stock ",sun" / ",sun_flare", as shipped mp_rust), the
     // converted sizes, cosines and fade times, and sunFxPosition (the direction
@@ -646,6 +655,13 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
     // follows lightmapTransientIndex and precedes the brush-model array.
     if (!sunShadow.bytes.empty())
         zw.write(sunShadow.bytes.data(), sunShadow.bytes.size());
+    // Load_GfxWorld then visits frustumLights (+0x3CA0, Load_GfxFrustumLights
+    // 0xD91900), lightViewFrustums (+0x3D60) and the heightfields (+0x3D88)
+    // before the brush models.
+    iw8::locallights::EmitFrustumLights(zw, lights);
+    iw8::locallights::EmitViewFrustums(zw, lights);
+    if (heightfield)
+        iw8::heightfield::Emit(zw, *heightfield);
     zw.align(3);
     for (const auto &model : mesh.brushModels)
     {
@@ -677,6 +693,10 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
             zw.popStream();
         }
     }
+    // After the stream-4 bitsets: shadowGeomOptimized (+0x3F78) and lightAABB
+    // (+0x3F80) precede the static DPVS.
+    iw8::locallights::EmitShadowGeometry(zw, lights);
+    iw8::locallights::EmitLightAABB(zw, lights);
     replayrender::EmitSortedSurfaces(zw, mesh, staticModels);
     zw.align(15);
     zw.write(umbraTome.data(), umbraTome.size());
@@ -724,7 +744,13 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
                     additionalPrimaryLights + additionalPrimaryLightVis + reflectionProbeVis +
                     additionalSmodelVis +
                    dynEntCellBitsBytes + dynEntViewBitsBytes + dynEntSceneBytes +
-                   dynEntMotionBytes);
+                   dynEntMotionBytes +
+                   // Light shadow/motion bitsets, plus slack for the realignment
+                   // they cause to later 128-byte-aligned allocations.
+                   (lights.Empty() ? 0
+                                   : iw8::locallights::ZeroFillBytes(lights, dynamicModelCount,
+                                                                     dynamicBrushCount) +
+                                         256));
     zw.popStream();
 }
 

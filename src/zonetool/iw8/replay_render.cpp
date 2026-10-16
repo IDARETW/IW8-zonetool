@@ -794,7 +794,7 @@ void validateRange(const std::vector<uint8_t> &data, uint32_t offset, uint64_t s
 }
 
 void validateUmbraTome(const std::vector<uint8_t> &data, uint32_t objectCount,
-                       uint32_t worldSurfaceCount, unsigned width)
+                       const std::vector<uint32_t> &expectedUserIDs, unsigned width)
 {
     if (data.size() < kUmbraHeaderSize || data.size() > UINT32_MAX ||
         read32(data, 0) != kUmbraVersion || read32(data, 8) != data.size())
@@ -827,9 +827,7 @@ void validateUmbraTome(const std::vector<uint8_t> &data, uint32_t objectCount,
     const uint32_t objectLists = read32(data, 0x58);
     for (uint32_t object = 0; object < objectCount; ++object)
     {
-        const uint32_t expectedUserID =
-            object < worldSurfaceCount ? object : 0x10000000u + object - worldSurfaceCount;
-        if (read32(data, userIDs + object * 4) != expectedUserID ||
+        if (read32(data, userIDs + object * 4) != expectedUserIDs.at(object) ||
             unpackObjectIndex(data, objectLists, uint64_t(object) * width, width) != object)
             throw std::runtime_error("Conservative Umbra object mapping is not lossless");
     }
@@ -1624,6 +1622,18 @@ Mesh Load(const std::string &path)
         put(sf, 8, uint16_t(vertices.size()));
         put(sf, 10, uint16_t(indices.size() / 3));
         put(sf, 12, baseIndex);
+        // Opaque world triangles (alpha-tested foliage included; sky, blended
+        // layers and brush models excluded) feed the GfxWorld heightfield.
+        if (opaque && !sky && activeModel == 0)
+            m.shadowCasterSurfaces.push_back(i);
+        if (opaque && !sky && activeModel == 0)
+            for (size_t ix = 0; ix < indices.size(); ++ix)
+            {
+                const unsigned a = indices[ix].get<unsigned>();
+                float point[3];
+                std::memcpy(point, m.positions.data() + posOffset + 12 * a, sizeof(point));
+                m.solidTriangles.insert(m.solidTriangles.end(), point, point + 3);
+            }
         put(sf, 16, PTR_FOLLOWS);
         put(sf, 24, i);
         put(sf, 30, uint16_t(lightmapIndex));
@@ -1838,6 +1848,12 @@ uint16_t PackQuaternionComponent(const float value)
         std::lround((std::clamp(value, -1.0f, 1.0f) * 0.5f + 0.5f) * 65535.0f));
 }
 } // namespace
+
+replaybounds::Bounds StaticModelWorldBounds(const StaticModels &models, const size_t instance)
+{
+    const auto &placement = models.instances.at(instance);
+    return TransformBounds(models.models.at(placement.model).bounds, placement);
+}
 
 void StampStaticModels(std::vector<uint8_t> &world, const StaticModels &models)
 {
@@ -2582,12 +2598,30 @@ void EmitVertices(ZoneWriter &w, const Mesh &m)
     w.write(m.indices.data(), m.indices.size());
 }
 
-std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticModels)
+std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticModels,
+                                    const std::vector<uint32_t> &primaryLights)
 {
     BuildStaticModelLayout(staticModels);
     const uint32_t worldSurfaceCount = m.worldSurfaceCount();
     const uint32_t staticModelCount = static_cast<uint32_t>(staticModels.instances.size());
-    const uint32_t objectCount = worldSurfaceCount + staticModelCount;
+    const uint32_t objectCount =
+        worldSurfaceCount + staticModelCount + static_cast<uint32_t>(primaryLights.size());
+    // Umbra user IDs carry the object class in bits 28-30 (query consumer
+    // 0x18CCA80): 0 world surface, 1 static model, 4 primary light (sets the
+    // light's primaryLightVisData bit). Static local lights reach the light
+    // binning (0x186C4F0) only through these query results.
+    std::vector<uint32_t> userIDList;
+    userIDList.reserve(objectCount);
+    for (uint32_t surface = 0; surface < worldSurfaceCount; ++surface)
+        userIDList.push_back(surface);
+    for (uint32_t model = 0; model < staticModelCount; ++model)
+        userIDList.push_back(0x10000000u + model);
+    for (const uint32_t light : primaryLights)
+    {
+        if (light > 0xFFFFFF)
+            throw std::runtime_error("Replay primary light exceeds the Umbra user-ID range");
+        userIDList.push_back(0x40000000u + light);
+    }
     if (!objectCount || objectCount > 0x01000000 ||
         uint64_t(worldSurfaceCount) * 56 > m.bounds.size())
         throw std::runtime_error("Replay world surfaces cannot be represented by Umbra object IDs");
@@ -2673,11 +2707,7 @@ std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticMod
 
     const uint32_t userIDs = allocate16(tome, uint64_t(objectCount) * 4);
     for (uint32_t object = 0; object < objectCount; ++object)
-    {
-        const uint32_t userID =
-            object < worldSurfaceCount ? object : 0x10000000u + object - worldSurfaceCount;
-        put(tome.data(), userIDs + uint64_t(object) * 4, userID);
-    }
+        put(tome.data(), userIDs + uint64_t(object) * 4, userIDList[object]);
     put(tome.data(), 0x50, userIDs);
 
     const uint32_t objectLists = allocate16(tome, packedObjects.size());
@@ -2748,7 +2778,7 @@ std::vector<uint8_t> BuildUmbraTome(const Mesh &m, const StaticModels &staticMod
 
     put(tome.data(), 0x08, static_cast<uint32_t>(tome.size()));
     put(tome.data(), 0x04, crc32c(tome.data() + 8, tome.size() - 8));
-    validateUmbraTome(tome, objectCount, worldSurfaceCount, indexWidth);
+    validateUmbraTome(tome, objectCount, userIDList, indexWidth);
     return tome;
 }
 
