@@ -6,6 +6,16 @@ ByteAddressBuffer vertexPages : register(t65);
 ByteAddressBuffer vertexColors : register(t66);
 ByteAddressBuffer colorPages : register(t67);
 
+// IW3 falloff layers (god rays, lamp glows), six values per row: falloffParms
+// .z and .w, end/begin colour, unused, the near fade (featherParms.x) and the
+// eye offset (eyeOffsetParms.x). Row 0 is the stock ramp; the converter writes
+// the map's rows and stores each surface's row in metadata bits 10-15.
+#ifndef MAP_FALLOFF_TABLE
+#define MAP_FALLOFF_TABLE {2.128, -.064, .5, 0, 0, 0}
+#define MAP_FALLOFF_ROWS 1
+#endif
+static const float falloffTable[MAP_FALLOFF_ROWS * 6] = MAP_FALLOFF_TABLE;
+
 #ifdef MAP_ENTITY
 // Replay's XModel (DObj) shaders take the object from the per-draw constants:
 // cb0[0] holds the surface bounds and each bone owns object-matrix rows from
@@ -181,10 +191,18 @@ Output main(uint id : SV_VertexID) {
     // layer) moves toward the camera along its own view ray by rank * 1.2e-5 of
     // its distance: same screen position, IW3's layer order in depth.
     uint extended = attributes.x & 0xfff;
+    bool falloff = (extended & 4) != 0;
+    uint falloffRow = min((attributes.x >> 10) & 63, MAP_FALLOFF_ROWS - 1) * 6;
     precise float4 projected = relative;
 #ifndef MAP_MODEL_SHADOW_PASS
     projected.xyz *= 1 - ((extended >> 4) & 63) * 1.2e-5;
 #endif
+    // IW3 eye offset (zfeather_foa_nf_eo): the vertex moves along its view ray
+    // until it is eyeOffsetParms.x units nearer in view depth.
+    float viewDepth = dot(projected.xyz, replayView[3].xyz);
+    float eyeOffset = falloff ? falloffTable[falloffRow + 5] : 0;
+    if (eyeOffset > 0 && viewDepth > eyeOffset)
+        projected.xyz *= (viewDepth - eyeOffset) / viewDepth;
     o.position.x = dot(projected, replayView[0]);
     o.position.y = dot(projected, replayView[1]);
     o.position.z = dot(projected, replayView[2]);
@@ -205,9 +223,11 @@ Output main(uint id : SV_VertexID) {
     o.metadata = float2(0, ((attributes.x >> 16) & 0xff) | ((extended & 15) << 8) |
                                (((extended >> 4) & 63) << 12));
     o.materialParameters = float4(.8, 4, 2.5, .625);
-    // IW3 falloff layers on models (lamp glows): the stock falloff ramp.
-    if ((extended & 4) != 0)
-        o.materialParameters = float4(2.128, -.064, .5, 0);
+    // IW3 falloff layers on models: the material's own falloff row.
+    if (falloff)
+        o.materialParameters =
+            float4(falloffTable[falloffRow], falloffTable[falloffRow + 1],
+                   falloffTable[falloffRow + 2], falloffTable[falloffRow + 3]);
     uint colorPageStart = drawSurfaces.Load(0x00240000 + drawSurface * 4);
     uint colorByte = (id & 0xffff) * 4;
     uint colorPage = colorPages.Load((colorPageStart + (colorByte >> 10)) * 4);
@@ -217,6 +237,11 @@ Output main(uint id : SV_VertexID) {
     // Replay decodes authored model RGB from sRGB; alpha remains linear.
     o.color = float4(lerp(color.rgb / 12.92, pow((color.rgb + .055) / 1.055, 2.4),
                           step(.04045, color.rgb)), color.a);
+    // IW3 zfeather near fade: alpha *= saturate(view depth * featherParms.x);
+    // its additive pixel shader scales the colour by that alpha.
+    float nearFade = falloff ? falloffTable[falloffRow + 4] : 0;
+    if (nearFade > 0)
+        o.color *= saturate(viewDepth * nearFade);
 #ifdef MAP_ENTITY
     o.instance = 0xffffffff;
 #else

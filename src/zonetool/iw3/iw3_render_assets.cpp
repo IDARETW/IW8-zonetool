@@ -75,6 +75,10 @@ struct SourceMaterial
     bool depthBias{};     // IW3 polygonOffset on the color pass, or a decal sort.
     unsigned sortKey{4};
     unsigned blend{};     // 0 alpha or opaque, 1 additive, 2 multiply, 3 srcalpha additive
+    // IW3 effect-model terms of falloff layers: the near fade (featherParms.x,
+    // alpha *= saturate(view depth * x)) and the eye offset (eyeOffsetParms.x
+    // units toward the camera).
+    std::array<float, 2> effect{0, 0};
 };
 
 enum class FxMaterialFamily
@@ -1892,8 +1896,12 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
         material.castsShadow = false;
         material.flags |= material.blend == 2 ? 512u : 256u;
     }
-    // IW3 falloff: lerp(falloffEndColor, falloffBeginColor,
-    // saturate(|N.V| * falloffParms.z + falloffParms.w)); god rays fade edge on.
+    // IW3 falloff (vertcol_simple_fog_foa, zfeather_foa_nf_eo_dtex vertex
+    // shaders): f = saturate((N.V)^2 * falloffParms.z + falloffParms.w) and
+    // colour *= f * lerp(falloffEndColor, falloffBeginColor, f), so god rays
+    // fade to nothing edge on. The zfeather and eyeoffset model techniques also
+    // fade alpha by saturate(view depth * featherParms.x) and draw
+    // eyeOffsetParms.x units nearer the camera.
     if (techset.find("falloff") != std::string::npos)
     {
         std::array<float, 4> parms{0, 0, 2.128f, -0.064f}, begin{1, 1, 1, 1}, end{.5f, .5f, .5f, .5f};
@@ -1906,6 +1914,10 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
                 begin = Literal<4>(constant.at("literal"), begin);
             else if (key == "falloffEndColor")
                 end = Literal<4>(constant.at("literal"), end);
+            else if (key == "featherParms" && techset.find("zfeather") != std::string::npos)
+                material.effect[0] = Literal<4>(constant.at("literal"), {0, 0, 0, 0})[0];
+            else if (key == "eyeOffsetParms" && techset.find("eyeoffset") != std::string::npos)
+                material.effect[1] = Literal<4>(constant.at("literal"), {0, 0, 0, 0})[0];
         }
         const float beginLevel = std::max({begin[0], begin[1], begin[2], 1.0e-3f});
         const float endLevel = std::max({end[0], end[1], end[2], 0.0f});
@@ -2363,7 +2375,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
                   const TechniqueGeometry geometry,
                   const std::string &glassEnvironment, const bool instanceLighting = false,
                   const std::string &lightVolumeDefines = {},
-                  const std::string &lightmapDefines = {}, const bool bakedSun = false)
+                  const std::string &lightmapDefines = {}, const bool bakedSun = false,
+                  const std::string &modelVertexDefines = {})
 {
     const bool staticModel = geometry == TechniqueGeometry::staticModel;
     const bool entity = geometry == TechniqueGeometry::entity;
@@ -2391,7 +2404,8 @@ Json BuildTechset(const std::string &map, const unsigned columns, const unsigned
     const std::string coverageSource =
         model ? "#define MAP_MIP_BIAS 0\n" + pixelSource : pixelSource;
     const auto pixel = Compile(pixelSource, "ps_5_0", "iw3_map_surface.hlsl");
-    const std::string vertexDefines = entity ? "#define MAP_ENTITY 1\n" : "";
+    const std::string vertexDefines =
+        (entity ? "#define MAP_ENTITY 1\n" : "") + (model ? modelVertexDefines : std::string{});
     const char *vertexName = entity        ? "iw3_entity_vertex.hlsl"
                              : staticModel ? "iw3_model_vertex.hlsl"
                                            : "iw3_world_vertex.hlsl";
@@ -3518,11 +3532,33 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
     std::array<std::vector<AtlasTileMipSource>, 3> atlasTileMips;
 
     plan.columns = columns;
+    // Model falloff layers take their own IW3 parameters from a per-map table
+    // in the model vertex shaders (row 0: the stock ramp). Model vertices have
+    // no material constants, and a fixed ramp drew Gulag's god-ray cones as
+    // flat sheets (owner test 2026-10-16).
+    std::vector<std::array<float, 6>> falloffRows{{2.128f, -0.064f, 0.5f, 0, 0, 0}};
     std::set<std::size_t> writtenTiles;
     std::set<std::string> bledColors;
     for (const SourceMaterial &material : materials)
     {
         MaterialPlan item;
+        if ((material.flags & 1024u) != 0)
+        {
+            const std::array<float, 6> row{material.environment[0], material.environment[1],
+                                           material.environment[2], 0,
+                                           material.effect[0], material.effect[1]};
+            const auto found = std::find(falloffRows.begin(), falloffRows.end(), row);
+            if (found != falloffRows.end())
+                item.falloffIndex = static_cast<unsigned>(found - falloffRows.begin());
+            else if (falloffRows.size() < 64)
+            {
+                item.falloffIndex = static_cast<unsigned>(falloffRows.size());
+                falloffRows.push_back(row);
+            }
+            else
+                zt::warn("iw3 render: falloff layer %s uses the stock ramp (64 rows in use)",
+                         material.name.c_str());
+        }
         item.kind = material.kind;
         item.castsShadow = material.castsShadow;
         item.flags = material.flags;
@@ -3584,6 +3620,16 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         }
         plan.materials.emplace(material.name, item);
     }
+    plan.modelFalloffDefines = "#define MAP_FALLOFF_TABLE {";
+    for (std::size_t row = 0; row < falloffRows.size(); ++row)
+    {
+        const auto &values = falloffRows[row];
+        for (std::size_t column = 0; column < values.size(); ++column)
+            plan.modelFalloffDefines +=
+                std::string(row || column ? "," : "") + HlslNumber(values[column]);
+    }
+    plan.modelFalloffDefines +=
+        "}\n#define MAP_FALLOFF_ROWS " + std::to_string(falloffRows.size()) + "\n";
 
     const std::set<std::string> worldCasters(shadowWorldMaterials.begin(),
                                              shadowWorldMaterials.end());
@@ -4415,7 +4461,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
         Json modelTechset =
             BuildTechset(map, columns, plan.atlasSize, geometry, plan.glassEnvironment,
                          instanceLighting, volumeLighting ? entityLightVolume->defines : std::string{},
-                         {}, true);
+                         {}, true, plan.modelFalloffDefines);
         std::array<Json, 5> modelTechsets{};
         modelTechsets[static_cast<unsigned>(SurfaceKind::opaque)] = modelTechset;
 

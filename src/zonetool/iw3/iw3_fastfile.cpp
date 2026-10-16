@@ -3567,14 +3567,16 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                                                                             : 0u;
                 // Models bind their own textures, so the low 16 bits carry no atlas
                 // tile: bits 0-3 hold the blend and falloff flags (256-2048), bits
-                // 4-9 the layer rank (flags bits 12-17), bits 16-23 the low flags.
+                // 4-9 the layer rank (flags bits 12-17), bits 10-15 the falloff
+                // table row, bits 16-23 the low flags.
                 const unsigned lowFlags = (kind + material.flags) & 0xFFu;
                 const unsigned blendFlags = (material.flags >> 8) & 0xFu;
                 const unsigned layer = (material.flags >> 12) & 0x3Fu;
-                if (material.flags > 0x3FFFFu)
+                if (material.flags > 0x3FFFFu || material.falloffIndex > 0x3Fu)
                     throw std::runtime_error("IW3 model material metadata exceeds Replay fields");
-                const std::uint32_t metadata =
-                    blendFlags | (layer << 4) | (lowFlags << 16) | 0xFF000000u;
+                const std::uint32_t metadata = blendFlags | (layer << 4) |
+                                               (material.falloffIndex << 10) | (lowFlags << 16) |
+                                               0xFF000000u;
                 auto &destinationSurface = converted.surfaces[surfaceIndex];
                 constexpr std::size_t packedVertexSize = 20;
                 constexpr std::size_t selfVisibilityOffset = 8;

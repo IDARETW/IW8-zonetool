@@ -37,6 +37,9 @@ struct MaterialPlan
     unsigned blend{};
     unsigned sourceSurfaceTypeBits{};
     std::array<float, 4> environment{0.8f, 4.0f, 2.5f, 0.625f};
+    // Model falloff layers: row of RenderPlan::modelFalloffDefines (0 = the
+    // stock ramp), packed into bits 10-15 of the model vertex metadata.
+    unsigned falloffIndex{};
     unsigned worldMaterialIndex{};
     std::string modelMaterial;
     // DObj-path (script, dynamic and effect XModel) material.
@@ -146,6 +149,9 @@ struct RenderPlan
     nlohmann::json reflectionProbeArrayImage;
     // HLSL define: map-average reflection SH evaluated by translucent glass.
     std::string glassEnvironment;
+    // HLSL defines for the model vertex shaders: the per-material IW3 falloff
+    // parameters, near fade and eye offset (MaterialPlan::falloffIndex rows).
+    std::string modelFalloffDefines;
     std::vector<NativeLightmapPlan> nativeLightmaps;
     replaysunshadow::Scene shadowScene;
     std::unordered_map<std::string, unsigned> worldShadowMaterials;

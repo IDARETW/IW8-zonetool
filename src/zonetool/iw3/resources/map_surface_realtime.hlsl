@@ -1019,15 +1019,18 @@ float4 main(Input input) : SV_TARGET0 {
     if (!sky)
         fogFactor = saturate(exp(-MAP_FOG_DENSITY * (length(input.relativePosition) - MAP_FOG_START)));
 #endif
-    // IW3 falloff (1024): lerp(falloffEndColor, falloffBeginColor,
-    // saturate(|N.V| * parms.x + parms.y)), the end colour as a fraction of the
-    // begin colour (parms.z) folded into the layer's tint. God rays and
-    // window hotspots fade out edge on.
+    // IW3 falloff (1024; vertcol_simple_fog_foa, zfeather_foa_nf_eo):
+    // f = saturate((N.V)^2 * parms.x + parms.y), colour *= f *
+    // lerp(falloffEndColor, falloffBeginColor, f), the end colour as a fraction
+    // of the begin colour (parms.z) folded into the layer's tint. God rays and
+    // window hotspots fade to nothing edge on; a linear ramp that stopped at
+    // the end colour left Gulag's god-ray cones as flat sheets.
     if ((flags & 1024) != 0)
     {
-        float facing = abs(dot(normalize(-input.relativePosition), normalize(input.normal)));
-        float ramp = saturate(facing * input.materialParameters.x + input.materialParameters.y);
-        color *= lerp(input.materialParameters.z, 1, ramp);
+        float facing = dot(normalize(-input.relativePosition), normalize(input.normal));
+        float ramp = saturate(facing * facing * input.materialParameters.x +
+                              input.materialParameters.y);
+        color *= ramp * lerp(input.materialParameters.z, 1, ramp);
     }
     // Multiply layers scale what is behind them by their colour; fog fades
     // them to neutral. Additive layers add light that fog fades out (IW3
