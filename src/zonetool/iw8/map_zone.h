@@ -4,6 +4,7 @@
 #include "iw8_zone.h"
 #include "iw8_zonebuffer.h"
 #include "physics_asset_serialization.h"
+#include "replay_dynentity.h"
 #include "replay_havok.h"
 #include "replay_map_layout.h"
 #include "replay_netconst.h"
@@ -512,15 +513,26 @@ inline void emitMapEdgeListBody(ZoneBuffer &zb, const std::vector<havok::LadderF
 }
 
 // Emit one MapEnts asset body: struct(0x408)->TEMP_PRELOAD(1), then name + entityString ->
+// SpatialPartition_Population_Partition {float dist; u32 axis:2, rightChild:29}.
+// Stock leaves (mp_hideout dynent tree, ACTS 2026-10-16) are dist 0, axis 3,
+// rightChild 0; axis 0-2 is a split with left child i+1. An all-zero entry is an
+// X split at 0 whose children are out of range / itself, not a leaf.
+inline void writeSpatialLeaf(ZoneBuffer &zb)
+{
+    zb.writeT<float>(0.0f);
+    zb.writeT<uint32_t>(3u);
+}
+
 // VIRTUAL(8). Caller is responsible for the surrounding push/pop. `ents` is the IW8 numeric-keyId
 // entityString (NUL added here).
 inline void emitMapEntsBody(ZoneBuffer &zb, const char *assetName, const std::string &ents,
                             const ReplaySpawns *spawns = nullptr,
                             const havok::BakeResult *collision = nullptr,
                             const uint64_t edgeListAlias = PTR_NULL,
-                            const uint32_t dynamicModelCount = 0,
-                            const uint32_t dynamicBrushCount = 0)
+                            const DynamicEntityCounts &dynamic = {})
 {
+    const uint32_t dynamicModelCount = dynamic.models;
+    const uint32_t dynamicBrushCount = dynamic.brushes;
     uint8_t me[kSizeMapEnts];
     std::memset(me, 0, sizeof(me));
     stamp64(me, kME_name, PTR_FOLLOWS);
@@ -584,7 +596,8 @@ inline void emitMapEntsBody(ZoneBuffer &zb, const char *assetName, const std::st
         stamp64(me, kME_dynEntListIds, PTR_FOLLOWS);
         if (dynamicModelCount > UINT16_MAX || dynamicBrushCount > UINT16_MAX)
             throw std::runtime_error("Replay no-spatial dynamic-entity count exceeds 16 bits");
-        stamp16(me, kME_dynEntNoSpatialCount, static_cast<uint16_t>(dynamicModelCount));
+        // Model clutter is spatial (replay_dynentity.cpp); brushes are not.
+        stamp16(me, kME_dynEntNoSpatialCount, 0);
         stamp16(me, kME_dynEntNoSpatialCount + sizeof(uint16_t),
                 static_cast<uint16_t>(dynamicBrushCount));
         stamp16(me, kME_dynEntMaxClientHistoryCount, 10000);
@@ -655,12 +668,15 @@ inline void emitMapEntsBody(ZoneBuffer &zb, const char *assetName, const std::st
         stamp32(tree, 16, 1);
         zb.write(tree, sizeof(tree));
         zb.align(3);
-        zb.writeT<uint64_t>(0); // unsplit leaf partition
+        writeSpatialLeaf(zb);
         zb.align(3);
+        // Population 0 is the radial clutter population; its leaf bounds the
+        // clutter. Stock leaf extents are the entries' bounds.
+        const bool clutter = i == 0 && dynamicModelCount;
         for (unsigned k = 0; k < 3; ++k)
-            zb.writeT<float>(-100000.f);
+            zb.writeT<float>(clutter ? dynamic.modelMins[k] : -100000.f);
         for (unsigned k = 0; k < 3; ++k)
-            zb.writeT<float>(100000.f);
+            zb.writeT<float>(clutter ? dynamic.modelMaxs[k] : 100000.f);
         zb.align(3);
         zb.writeT<uint32_t>(0xFFFFFFFFu);
     }
@@ -672,7 +688,7 @@ inline void emitMapEntsBody(ZoneBuffer &zb, const char *assetName, const std::st
     stamp32(scriptableTree, 16, 1);
     zb.write(scriptableTree, sizeof(scriptableTree));
     zb.align(3);
-    zb.writeT<uint64_t>(0);
+    writeSpatialLeaf(zb);
     zb.align(3);
     for (unsigned k = 0; k < 3; ++k)
         zb.writeT<float>(-100000.f);
@@ -969,8 +985,7 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                                    const MapBounds &bounds, const MapSun &lighting,
                                    const havok::BakeResult &collision,
                                    const uint32_t glassInitCount, const uint32_t glassPieceLimit,
-                                   const uint32_t dynamicModelCount,
-                                   const uint32_t dynamicBrushCount, const bool lightDefInZone,
+                                   const DynamicEntityCounts &dynamic, const bool lightDefInZone,
                                    const LevelNetConstStrings &levelStrings = {})
 {
     const auto spawns = strings.spawns;
@@ -984,13 +999,11 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
             emitMapEdgeListBody(output.buffer(), collision.ladders);
         });
     writer.add(ASSET_TYPE_MAP_ENTS, assetName,
-               [assetName, ents, spawns, &collision, hasLadders, dynamicModelCount,
-                dynamicBrushCount](ZoneWriter &output) {
+               [assetName, ents, spawns, &collision, hasLadders, dynamic](ZoneWriter &output) {
                    const uint64_t edgeListAlias =
                        hasLadders ? output.assetAlias(ASSET_TYPE_EDGELIST, assetName) : PTR_NULL;
                    emitMapEntsBody(output.buffer(), assetName.c_str(), ents, spawns.get(),
-                                   &collision, edgeListAlias, dynamicModelCount,
-                                   dynamicBrushCount);
+                                   &collision, edgeListAlias, dynamic);
                });
 
     // col_map(23): clipMap struct -> TEMP_PRELOAD, variable data -> VIRTUAL.

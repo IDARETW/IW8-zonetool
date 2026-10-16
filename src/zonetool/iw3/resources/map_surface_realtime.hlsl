@@ -351,7 +351,12 @@ float3 ProbeReflection(float2 screenPixel, float viewDepth, float3 relativePosit
             continue;
         float weight = fixedSlot ? 1 : containment / (length(offset) + 64);
         float3 direction = reflected;
-        if (asint(p.v[0]) != -1) {
+        // IW3 samples a surface's own probe as a distant cubemap. Box projection
+        // of that probe (whose box need not hold the surface) bent the ray
+        // toward "probe centre to point" and broke flat-faceted ice into
+        // per-triangle patches that lost the reflection looking up (Discovery,
+        // owner test 2026-10-16).
+        if (!fixedSlot && asint(p.v[0]) != -1) {
             // Distance along the ray to the box's (expanded) planes.
             float rx = dot(reflected, -xAxis), ox = dot(offset, -xAxis);
             float ry = dot(reflected, -yAxis), oy = dot(offset, -yAxis);

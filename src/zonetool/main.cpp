@@ -95,7 +95,7 @@ void printUsage()
                 "usage:\n"
                 "  iw8-zonetool build-map <dump> <map> [-o <output>] [options]\n"
                 "  iw8-zonetool build-iw3 <map.ff> [map] [-o <output>] [options]\n"
-                "  iw8-zonetool build-map-images -o <output> <map id>=<preview.rgba>...\n"
+                "  iw8-zonetool build-map-images -o <output> [zone=<name>] <map id>=<preview.rgba>...\n"
                 "  iw8-zonetool build-weapon <weapon.json> [-o <output>]\n"
                 "  iw8-zonetool build-weapon-placeholders <manifest.json> [-o <output>]\n"
                 "  iw8-zonetool inspect-iw7 <file.ff>\n"
@@ -1384,7 +1384,7 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
         }
         iw8::registerMapWorldAssets(
             writer, worldStrings, assetName, mapEntities, bounds, lighting, collision,
-            glassInitCount, glassPieceLimit, dynamicCounts.models, dynamicCounts.brushes,
+            glassInitCount, glassPieceLimit, dynamicCounts,
             prepared && prepared->vfxLightDef == "light_point_linear", levelStrings);
         timing.lap("asset registration");
         techsets.build();
@@ -2126,28 +2126,55 @@ bool writeHeaderOnlyPatch(const std::string &fastfile)
     return write_file(path, patch);
 }
 
-// build-map-images -o <out> <map id>=<preview.rgba>...
+// build-map-images -o <out> [zone=<name>] <map id>=<preview.rgba>...
 // One always-loaded zone with each map's lobby and loading-screen image. Replay's
 // map info names that art by image (mp_shipment: the 2048x1024 BC1 sRGB image
 // loading_mp_shipment_bg), so every map gets the image loading_<id>_bg (BC1,
 // 1024x512) and a 2D material of the same name. IW3 loadscreens are square
 // images shown at 4:3; their middle two thirds give the 2:1 frame unstretched.
-// Writes mw120r_map_images (images), techsets_ (materials), empty srv_/eng_/ww_
-// companions, a .fp patch beside each, and map_images.txt listing the ids.
+// Each map also gets featured_<id> (BC1 1024x120, the middle band of that
+// frame): a featured playlist tile's background material (430x50 in the MP play
+// menu, as the stock Button_* tiles).
+// Writes <zone> (default mw120r_map_images; images), techsets_ (materials), empty
+// srv_/eng_/ww_ companions, a .fp patch beside each, and map_images.txt listing
+// the ids.
 int buildMapImages(const Args &args)
 {
-    if (args.outputDirectory.empty() || args.positional.empty())
+    std::vector<std::string> pairs;
+    std::string zone = "mw120r_map_images";
+    for (const std::string &argument : args.positional)
+    {
+        if (!argument.starts_with("zone="))
+        {
+            pairs.push_back(argument);
+            continue;
+        }
+        zone = argument.substr(5);
+        if (zone.empty() || zone.size() > 40 ||
+            !std::ranges::all_of(zone, [](const char c) {
+                return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_';
+            }))
+        {
+            err("map images: invalid zone name '%s'", zone.c_str());
+            return 2;
+        }
+    }
+    if (args.outputDirectory.empty() || pairs.empty())
     {
         printUsage();
         return 2;
     }
-    const std::string zone = "mw120r_map_images";
     iw8::ZoneWriter writer;
     iw8::ZoneWriter techsets;
-    std::vector<std::pair<std::vector<uint8_t>, std::vector<uint8_t>>> encoded; // preview -> BC1
+    struct Encoded
+    {
+        std::vector<uint8_t> preview, loading, banner; // source, BC1 2:1, BC1 banner
+    };
+    std::vector<Encoded> encoded;
     std::string ids;
     constexpr unsigned targetWidth = 1024, targetHeight = 512;
-    for (const std::string &pair : args.positional)
+    constexpr unsigned bannerHeight = 120;
+    for (const std::string &pair : pairs)
     {
         const auto equals = pair.find('=');
         const std::string id = pair.substr(0, equals);
@@ -2166,10 +2193,10 @@ int buildMapImages(const Args &args)
             return 1;
         }
         const std::string name = "loading_" + id + "_bg";
-        const std::vector<uint8_t> *bc1 = nullptr;
-        for (const auto &[source, blocks] : encoded)
-            if (source == preview)
-                bc1 = &blocks;
+        const Encoded *bc1 = nullptr;
+        for (const auto &entry : encoded)
+            if (entry.preview == preview)
+                bc1 = &entry;
         if (!bc1)
         {
             const unsigned width = header[2], height = header[3];
@@ -2184,24 +2211,35 @@ int buildMapImages(const Args &args)
             }
             else
                 pixels = resizeRgba(pixels, width, height, targetWidth, targetHeight);
-            encoded.emplace_back(std::move(preview), encodeBc1(pixels, targetWidth, targetHeight));
-            bc1 = &encoded.back().second;
+            const size_t bannerTop = (targetHeight - bannerHeight) / 2;
+            const std::vector<uint8_t> band(
+                pixels.begin() + bannerTop * targetWidth * 4,
+                pixels.begin() + (bannerTop + bannerHeight) * targetWidth * 4);
+            encoded.push_back({std::move(preview), encodeBc1(pixels, targetWidth, targetHeight),
+                               encodeBc1(band, targetWidth, bannerHeight)});
+            bc1 = &encoded.back();
             info("map images: %s %ux%u -> %ux%u BC1", name.c_str(), width, height, targetWidth,
                  targetHeight);
         }
-        dumpimg::Iw8ImageDef image;
-        image.name = name;
-        image.format = 34; // BC1 sRGB, as the stock loading images
-        image.width = uint16_t(targetWidth);
-        image.height = uint16_t(targetHeight);
-        image.semantic = 2; // colour map
-        image.category = 3; // loaded from the fastfile
-        image.pixels = *bc1;
-        image.totalSize = uint32_t(image.pixels.size());
-        if (!dumpimg::addImageAsset(writer, image) ||
-            !convdump::mtl::writeUiMaterial(techsets, name, name))
-            return 1;
-        replayrender::RegisterMaterialReference(writer, name);
+        const std::tuple<std::string, const std::vector<uint8_t> *, unsigned> images[]{
+            {name, &bc1->loading, targetHeight},
+            {"featured_" + id, &bc1->banner, bannerHeight}};
+        for (const auto &[imageName, blocks, height] : images)
+        {
+            dumpimg::Iw8ImageDef image;
+            image.name = imageName;
+            image.format = 34; // BC1 sRGB, as the stock loading images
+            image.width = uint16_t(targetWidth);
+            image.height = uint16_t(height);
+            image.semantic = 2; // colour map
+            image.category = 3; // loaded from the fastfile
+            image.pixels = *blocks;
+            image.totalSize = uint32_t(image.pixels.size());
+            if (!dumpimg::addImageAsset(writer, image) ||
+                !convdump::mtl::writeUiMaterial(techsets, imageName, imageName))
+                return 1;
+            replayrender::RegisterMaterialReference(writer, imageName);
+        }
         ids += id + "\n";
     }
 
@@ -2230,7 +2268,8 @@ int buildMapImages(const Args &args)
     for (const std::string &path : written)
         ok = ok && writeHeaderOnlyPatch(path);
     ok = ok && write_file_str(path_join(args.outputDirectory, "map_images.txt"), ids);
-    info("map images: %zu map image(s) from %zu preview(s)", args.positional.size(), encoded.size());
+    info("map images: %s: %zu map image(s) from %zu preview(s)", zone.c_str(), pairs.size(),
+         encoded.size());
     return ok ? 0 : 1;
 }
 

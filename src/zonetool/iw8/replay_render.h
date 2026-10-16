@@ -148,12 +148,28 @@ struct GlassPane
     float halfHeight{};
     float halfThickness{};
 };
+// GfxSModelSurfMatIndirection.cullType classes of the GPU triangle/cluster
+// culling (stock mp_shipment survey of 1473 surfaces, 2026-10-16): 0xEF opaque
+// back-face culled; 0xFF only model decals laid on other geometry (logos,
+// "_decals" meshes, licence plates: bit 4); 0x6F glass/translucent (bit 7
+// clear); 0x6E double-sided (bit 0 clear). Decal and layer meshes classed as
+// ordinary opaque lost triangles to occlusion against the surface under them,
+// so they flickered and drew dotted (Greenband cables, posters, carpets).
+inline uint8_t StaticModelCullType(const bool backfaceCull, const bool decal,
+                                   const bool translucent)
+{
+    if (decal)
+        return backfaceCull ? 0xFF : 0x7E;
+    if (translucent)
+        return backfaceCull ? 0x6F : 0x6E;
+    return backfaceCull ? 0xEF : 0x6E;
+}
 struct StaticModelSurface
 {
     replaybounds::Bounds bounds{};
     std::string material;
-    // Two-sided surfaces must not be back-face culled by GPU triangle culling.
-    bool backfaceCull{true};
+    // StaticModelCullType: two-sided surfaces must not be back-face culled.
+    uint8_t cullType{0xEF};
 };
 struct StaticModelLod
 {

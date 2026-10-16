@@ -3604,7 +3604,11 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                 std::copy_n(destinationSurface.boundsHalf, 3,
                             staticSurface.bounds.halfSize.begin());
                 staticSurface.material = materialName;
-                staticSurface.backfaceCull = material.cullMode == 1;
+                // Decals and IW3 layers (polygon offset, sorts above opaque) lie
+                // on other geometry, as stock model decals do.
+                staticSurface.cullType = replayrender::StaticModelCullType(
+                    material.cullMode == 1, material.depthBias || ((material.flags >> 12) & 0x3Fu) != 0,
+                    material.kind == SurfaceKind::glass);
                 staticLod.surfaces.push_back(std::move(staticSurface));
             }
 

@@ -1697,7 +1697,7 @@ struct StaticModelLayout
         uint16_t material{};
         replaybounds::Bounds bounds{};
         float drawDistance{};
-        bool backfaceCull{};
+        uint8_t cullType{};
     };
 
     std::vector<Surface> surfaces;
@@ -1765,7 +1765,7 @@ StaticModelLayout BuildStaticModelLayout(const StaticModels &source)
                                            static_cast<uint8_t>(surfaceIndex),
                                            static_cast<uint16_t>(found - result.materials.begin()),
                                            surface.bounds, model.lods.back().distance,
-                                           surface.backfaceCull});
+                                           surface.cullType});
             }
             modelSurfaceCount += lod.surfaces.size();
         }
@@ -1992,10 +1992,8 @@ void EmitStaticModels(ZoneWriter &writer, const StaticModels &models,
     for (const auto &surface : layout.surfaces)
     {
         writer.writeT(surface.material);
-        // GfxSModelSurfMatIndirection.cullType: shipped Shipment uses 0xEF for
-        // back-face culled materials and 0x6E for cull-none ones (bit 0 enables
-        // the GPU triangle/cluster back-face tests).
-        writer.writeT<uint8_t>(surface.backfaceCull ? 0xEF : 0x6E);
+        // GfxSModelSurfMatIndirection.cullType (StaticModelCullType).
+        writer.writeT<uint8_t>(surface.cullType);
         writer.writeT<uint8_t>(0x0F);
     }
     writer.align(3);

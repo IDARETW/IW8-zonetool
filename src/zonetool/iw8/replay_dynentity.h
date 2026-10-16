@@ -32,6 +32,11 @@ struct DynamicEntityCounts
 {
     std::uint32_t models{};
     std::uint32_t brushes{};
+    // Model clutter sits in the radial spatial population like stock clutter:
+    // one leaf partition bounding every model origin (padded). Brush dynents
+    // stay on the no-spatial list.
+    std::array<float, 3> modelMins{};
+    std::array<float, 3> modelMaxs{};
 };
 
 DynamicEntityCounts CountDynamicEntities(const std::vector<DynamicEntity> &entities);
