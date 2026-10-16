@@ -113,6 +113,74 @@ than the map.
 * `validate-output <folder> <map id>`: Checks a converted map
 * `inspect <file.ff>`: Prints a fastfile's header and contents
 * `build-weapon <weapon.json>`: Builds a custom weapon, see [docs/CUSTOM_WEAPONS.md](docs/CUSTOM_WEAPONS.md)
+* `sim <map.sim.json> <command>`: Renders and checks a converted map without starting the game, see
+  [Map simulator](#map-simulator)
+
+## Map simulator
+
+The simulator renders a converted map with the IW8 shaders and data the converter wrote into its
+zones, so a map can be looked at and checked without loading it in the game. It runs headless on
+Direct3D 11 and can also serve a live web viewer with a free-flying camera.
+
+**Exact:** the map's own compiled IW8 vertex and pixel shaders, its materials, textures, geometry
+(world, static models, dynamic and script models, glass), baked lighting, sun, reflection probes and
+fog, drawn in the engine's pass order (depth prepass, opaque, then blended layers by sort key) with
+the engine's depth and polygon-offset settings.
+**Approximated:** inputs the engine computes every frame are held constant: screen-space ambient
+occlusion, real-time shadow cascades, screen-space reflections, local lights, decals and texture
+streaming. Effects, animation and physics are not run.
+
+### Getting the simulator data
+
+Build the map with the environment variable `IW8_ZONETOOL_KEEP_SCRATCH=1`. The converter then keeps
+its intermediate folder (`iw3*.tmp` next to the output) and writes
+`prepared\maps\mp\<map id>.d3dbsp.sim.json` with its `.sim.bin` there.
+
+```powershell
+$env:IW8_ZONETOOL_KEEP_SCRATCH = 1
+iw8-zonetool.exe build-iw3 C:\Maps\mp_example\mp_example.ff mp_example -o C:\Maps\mp_example\converted ...
+iw8-zonetool.exe sim C:\Maps\mp_example\iw3XXXX.tmp\prepared\maps\mp\mp_example.d3dbsp.sim.json render -o shot.png --spawn 0
+```
+
+### Simulator commands
+
+| Command | Meaning |
+| --- | --- |
+| `render -o <file.png\|jpg>` | One frame from `--camera` or `--spawn N`. |
+| `pick --at x,y` | Material, model and placement under a pixel. |
+| `info` | Map statistics, bounds and spawns as JSON. |
+| `serve [--port 8765] [--auth-file <file>]` | Web viewer: fly with WASD and the mouse, Q/E up and down, debug views, picking. `--auth-file` holds `user:password` for HTTP basic auth. |
+| `panorama -o <folder>` | 360° images from every spawn and a viewer page for them. |
+| `check --package <folder>` | Load checks on the built map, see [Map checks](#map-checks). |
+| `flicker [-o report.json]` | Draws each view in normal and reversed order and reports surfaces that swap, the cause of flickering layers. |
+| `rotation [-o report.json]` | Reports surfaces whose shading changes when only the camera turns. |
+
+| Option | Meaning |
+| --- | --- |
+| `--camera x,y,z,yaw,pitch[,fov]` | Camera position and angles (degrees, CoD convention). |
+| `--spawn N` | Camera at spawn point N, at eye height. |
+| `--size WxH` / `--fov F` | Image size and horizontal field of view. |
+| `--view <name>` | `exact` (default), `albedo`, `normals`, `surface`, `material`, `lightmap`, `sun`, `cull`, `depth`. |
+| `--exposure E` / `--lod N` | Exposure; force a model LOD. |
+| `--no-world`, `--no-models`, `--no-dynamic`, `--no-glass` | Leave a part of the map out. |
+| `--points spawns\|x,y,z;...` | Viewpoints for `panorama`, `flicker` and `rotation`. Default: every spawn. |
+| `--opaque-only` | Leave out blended layers (picks the surface under a decal). |
+| `--reverse-order` | Draw in reverse order within each pass. |
+
+### Map checks
+
+`tools\mapcheck.py <built map folder>` (or `sim ... check --package <folder>`) loads the built map
+through the game's own loaders using ACTS and reports:
+
+* **load**: every asset of the map zone loads, with failures listed.
+* **preload**: each zone's streamed data fits the space its header reserves (misaligned or
+  overrunning streams fail here).
+* **script**: the compiled map script's bytecode and string table are consistent, and every call into
+  the map's own script names a function it defines.
+* **entities**: spawn and objective counts for each game mode.
+
+Pass `--json` for a machine-readable report. ACTS, the game executable and its Oodle DLL are taken
+from `--acts`, `--game` and `--oodle`, or `IW8_SIM_ACTS`, `IW8_SIM_GAME` and `IW8_SIM_OODLE`.
 
 ## Asset Conversion Support
 

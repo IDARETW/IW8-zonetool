@@ -16,8 +16,8 @@ target("iw8-zonetool")
     add_defines("WIN32", "NOMINMAX", "WIN32_LEAN_AND_MEAN", "_CRT_SECURE_NO_WARNINGS")
     add_includedirs("src", "src/common", "src/zonetool")
     add_includedirs("src/thirdparty")
-    add_syslinks("bcrypt", "d3dcompiler", "d3d11", "kernel32", "mfplat", "mfreadwrite", "mfuuid",
-                 "shlwapi", "ole32")
+    add_syslinks("bcrypt", "d3dcompiler", "d3d11", "dxgi", "kernel32", "mfplat", "mfreadwrite", "mfuuid",
+                 "shlwapi", "ole32", "oleaut32", "windowscodecs", "ws2_32")
     add_cxflags("/permissive-", "/EHsc", "/W4", {tools = "cl"})
     add_ldflags("/BASE:0x180000000", "/DYNAMICBASE:NO", {force = true})
 

@@ -26,6 +26,8 @@
 #include "iw8/replay_vfx.h"
 #include "iw8/write_xsurface.h"
 #include "iw8/write_weapon.h"
+#include "sim/sim.h"
+#include "sim/sim_export.h"
 
 #include <algorithm>
 #include <array>
@@ -96,6 +98,7 @@ void printUsage()
                 "  iw8-zonetool build-map <dump> <map> [-o <output>] [options]\n"
                 "  iw8-zonetool build-iw3 <map.ff> [map] [-o <output>] [options]\n"
                 "  iw8-zonetool build-map-images -o <output> [zone=<name>] <map id>=<preview.rgba>...\n"
+                "  iw8-zonetool sim <map.sim.json> [render|pick|info|panorama|serve|check|flicker|rotation] [options]\n"
                 "  iw8-zonetool build-weapon <weapon.json> [-o <output>]\n"
                 "  iw8-zonetool build-weapon-placeholders <manifest.json> [-o <output>]\n"
                 "  iw8-zonetool inspect-iw7 <file.ff>\n"
@@ -1231,6 +1234,10 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             for (auto &effect : prepared->vfxEffects)
                 iw8::vfx::Register(writer, std::move(effect));
             iw8::RegisterDynamicEntityList(writer, prepared->dynamicEntities);
+            // The kept intermediate feeds `iw8-zonetool sim`; this adds what
+            // render.json lacks (model geometry, placements, dynents, sun).
+            if (const char *keep = std::getenv("IW8_ZONETOOL_KEEP_SCRATCH"); keep && *keep)
+                sim::Export(dumpDirectory, assetName, map, *prepared, lighting, args.style);
         }
         iw8::impact::Register(writer, map,
                               prepared ? prepared->smallGlassEffect : std::string{},
@@ -2294,6 +2301,8 @@ try
         }
         return iw8::buildWeaponPlaceholders(argv[2], argc == 5 ? argv[4] : "") ? 0 : 1;
     }
+    if (argc > 1 && !std::strcmp(argv[1], "sim"))
+        return sim::Main(argc - 2, argv + 2);
     if (argc == 4 && !std::strcmp(argv[1], "build-scene-assets"))
         return iw8::buildSceneAssets(argv[2], argv[3]);
     Args args;
