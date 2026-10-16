@@ -7652,6 +7652,58 @@ std::string WithIw3ModeAssets(const std::string &text, const bool enabled)
 // and ctf_flag_<team> (it sets the common_base_mp flag model on it), spawns
 // at mp_ctf_spawn for both teams, and the mp_ctf_spawn_<team>_start sets.
 // Without flags, no CTF entities are made and the gametype uses its fallbacks.
+// Replay's TDM respawns pick among mp_tdm_spawn points, and domination
+// registers mp_dom_spawn and its team starts the way TDM does. Some IW3 maps
+// author few of them: Greenband has one TDM respawn point (every TDM respawn
+// stacked on it) and no domination spawns, but 18 free-for-all spawns. Fill
+// TDM from the free-for-all spawns when it has fewer than 8 (a free-for-all
+// spawn is a valid standing point by construction), and give domination the
+// completed TDM respawns and TDM team starts when it has none.
+std::string WithCompletedModeSpawns(const std::string &text)
+{
+    constexpr std::size_t minimumRespawns = 8;
+    const auto entities = ParseEntityFields(text, nullptr);
+    std::map<std::string, std::vector<const EntityFields *>> byClass;
+    for (const auto &entity : entities)
+        if (const auto found = entity.find("classname"); found != entity.end())
+            byClass[found->second].push_back(&entity);
+    const auto write = [](const EntityFields &entity, const std::string &classname) {
+        std::string block = "\n{\n\"classname\" \"" + classname + "\"\n";
+        for (const char *key : {"origin", "angles"})
+            if (const auto found = entity.find(key); found != entity.end())
+                block += std::string("\"") + key + "\" \"" + found->second + "\"\n";
+        return block + "}";
+    };
+    std::string result = text;
+    std::vector<const EntityFields *> tdm = byClass["mp_tdm_spawn"];
+    std::size_t addedTdm = 0, addedDom = 0, addedDomStarts = 0;
+    if (tdm.size() < minimumRespawns && byClass["mp_dm_spawn"].size() >= minimumRespawns)
+        for (const auto *spawn : byClass["mp_dm_spawn"])
+        {
+            result += write(*spawn, "mp_tdm_spawn");
+            tdm.push_back(spawn);
+            ++addedTdm;
+        }
+    if (byClass["mp_dom_spawn"].empty() && tdm.size() >= minimumRespawns)
+        for (const auto *spawn : tdm)
+        {
+            result += write(*spawn, "mp_dom_spawn");
+            ++addedDom;
+        }
+    for (const char *team : {"allies", "axis"})
+        if (byClass[std::string("mp_dom_spawn_") + team + "_start"].empty())
+            for (const auto *spawn : byClass[std::string("mp_tdm_spawn_") + team + "_start"])
+            {
+                result += write(*spawn, std::string("mp_dom_spawn_") + team + "_start");
+                ++addedDomStarts;
+            }
+    if (addedTdm || addedDom || addedDomStarts)
+        zt::info("iw3: completed mode spawns: %zu TDM respawn(s) from free-for-all spawns, %zu domination "
+                 "spawn(s) and %zu domination start(s) from TDM",
+                 addedTdm, addedDom, addedDomStarts);
+    return result;
+}
+
 std::string WithIw3CtfObjectives(const std::string &text, const std::string &mapScript)
 {
     std::vector<std::pair<std::size_t, std::size_t>> spans;
@@ -8028,6 +8080,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             worldPath.parent_path() /
             (std::filesystem::path(sourceAsset).stem().string() + ".gsc");
         zt::read_file_str(scriptPath.string(), mapScript);
+        entities = WithCompletedModeSpawns(entities);
         entities = WithIw3CtfObjectives(entities, mapScript);
     }
     const auto entityModelNames = convert::iw3ReplayEntityModels(entities);
