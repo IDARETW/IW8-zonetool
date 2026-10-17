@@ -692,6 +692,139 @@ class Sound final : public AbstractAssetDumper<IW3::AssetSound>
     }
 };
 
+// IW3 XAnimParts, every stream verbatim. Replay 1.20 decodes the same part
+// types and data streams (verified on shipped desktop_fan_fn_01_loop), so the
+// converter repacks these into a Replay XAnimParts without re-encoding.
+// IW3_REPLAY_XANIMS (comma list) limits the dump to the anims a map plays.
+class XAnim final : public AbstractAssetDumper<IW3::AssetXAnim>
+{
+    static bool Wanted(const std::string &name)
+    {
+        const char *list = std::getenv("IW3_REPLAY_XANIMS");
+        if (!list || !*list)
+            return true;
+        std::string_view rest(list);
+        while (!rest.empty())
+        {
+            const auto comma = rest.find(',');
+            if (rest.substr(0, comma) == name)
+                return true;
+            if (comma == std::string_view::npos)
+                break;
+            rest.remove_prefix(comma + 1);
+        }
+        return false;
+    }
+
+    bool ShouldDump(const XAssetInfo<IW3::XAnimParts> &asset) override
+    {
+        return asset.Asset() && asset.Asset()->name && Wanted(asset.Asset()->name);
+    }
+
+    template <class T> static Json Values(const T *data, const size_t count, const char *field)
+    {
+        if (count && !data)
+            throw std::runtime_error(std::string("Missing IW3 XAnim ") + field);
+        Json out = Json::array();
+        for (size_t i = 0; i < count; ++i)
+            out.push_back(data[i]);
+        return out;
+    }
+
+    void DumpAsset(AssetDumpingContext &context, const XAssetInfo<IW3::XAnimParts> &asset) override
+    {
+        const auto &parts = *asset.Asset();
+        const auto &strings = asset.m_zone->m_script_strings;
+        const auto text = [&](const IW3::ScriptString value) -> std::string {
+            if (value >= strings.Count())
+                throw std::runtime_error("Invalid IW3 XAnim script string");
+            return strings.Value(value);
+        };
+        const bool byteIndices = parts.numframes < 256;
+        const size_t boneTotal = parts.boneCount[IW3::PART_TYPE_ALL];
+        Json names = Json::array();
+        if (boneTotal && !parts.names)
+            throw std::runtime_error("Missing IW3 XAnim bone names");
+        for (size_t i = 0; i < boneTotal; ++i)
+            names.push_back(text(parts.names[i]));
+        Json notify = Json::array();
+        for (size_t i = 0; parts.notify && i < parts.notifyCount; ++i)
+            notify.push_back({{"name", text(parts.notify[i].name)}, {"time", parts.notify[i].time}});
+        Json indices = byteIndices ? Values(parts.indices._1, parts.indexCount, "indices")
+                                   : Values(parts.indices._2, parts.indexCount, "indices");
+        const auto frameIndices = [&](const void *base, const size_t count) {
+            return byteIndices ? Values(static_cast<const unsigned char *>(base), count, "delta indices")
+                               : Values(static_cast<const uint16_t *>(base), count, "delta indices");
+        };
+        Json delta = nullptr;
+        if (parts.deltaPart)
+        {
+            delta = Json::object();
+            if (const auto *trans = parts.deltaPart->trans)
+            {
+                Json t = {{"size", trans->size}, {"small", trans->smallTrans != 0}};
+                if (!trans->size)
+                    t["frame0"] = V3(trans->u.frame0.v);
+                else
+                {
+                    const size_t count = size_t(trans->size) + 1;
+                    const auto &f = trans->u.frames;
+                    t["mins"] = V3(f.mins.v);
+                    t["extent"] = V3(f.size.v);
+                    t["indices"] = frameIndices(f.indices._1, count);
+                    Json frames = Json::array();
+                    for (size_t i = 0; i < count; ++i)
+                        for (unsigned k = 0; k < 3; ++k)
+                            frames.push_back(trans->smallTrans ? int(f.frames._1[i][k]) : int(f.frames._2[i][k]));
+                    t["frames"] = std::move(frames);
+                }
+                delta["trans"] = std::move(t);
+            }
+            if (const auto *quat = parts.deltaPart->quat)
+            {
+                Json q = {{"size", quat->size}};
+                if (!quat->size)
+                    q["frame0"] = {quat->u.frame0.value[0], quat->u.frame0.value[1]};
+                else
+                {
+                    const size_t count = size_t(quat->size) + 1;
+                    q["indices"] = frameIndices(quat->u.frames.indices._1, count);
+                    Json frames = Json::array();
+                    for (size_t i = 0; i < count; ++i)
+                        for (unsigned k = 0; k < 2; ++k)
+                            frames.push_back(quat->u.frames.frames[i].value[k]);
+                    q["frames"] = std::move(frames);
+                }
+                delta["quat"] = std::move(q);
+            }
+        }
+        Json boneCount = Json::array();
+        for (unsigned i = 0; i < IW3::PART_TYPE_COUNT; ++i)
+            boneCount.push_back(parts.boneCount[i]);
+        Save(context, std::string("xanim/") + parts.name + ".iw3.json",
+             {{"schema", 1},
+              {"name", parts.name},
+              {"numframes", parts.numframes},
+              {"framerate", parts.framerate},
+              {"frequency", parts.frequency},
+              {"loop", parts.bLoop},
+              {"delta", parts.bDelta},
+              {"asset_type", parts.assetType},
+              {"is_default", parts.isDefault},
+              {"bone_count", std::move(boneCount)},
+              {"names", std::move(names)},
+              {"notify", std::move(notify)},
+              {"data_byte", Values(parts.dataByte, parts.dataByteCount, "dataByte")},
+              {"data_short", Values(parts.dataShort, parts.dataShortCount, "dataShort")},
+              {"data_int", Values(parts.dataInt, parts.dataIntCount, "dataInt")},
+              {"random_data_byte", Values(parts.randomDataByte, parts.randomDataByteCount, "randomDataByte")},
+              {"random_data_short", Values(parts.randomDataShort, parts.randomDataShortCount, "randomDataShort")},
+              {"random_data_int", Values(parts.randomDataInt, parts.randomDataIntCount, "randomDataInt")},
+              {"indices", std::move(indices)},
+              {"delta_part", std::move(delta)}});
+    }
+};
+
 class Model final : public AbstractAssetDumper<IW3::AssetXModel>
 {
     void DumpAsset(AssetDumpingContext &context, const XAssetInfo<IW3::XModel> &asset) override
@@ -853,6 +986,27 @@ class World final : public AbstractAssetDumper<IW3::AssetGfxWorld>
                   {"primary_light_count", w.primaryLightCount},
                   {"sun_primary_light_index", w.sunPrimaryLightIndex},
                   {"sky", w.skyImage ? w.skyImage->name : ""}};
+        // Primary-light regions (R_CullBoxFromLightRegionHull): per light its
+        // hulls, each a 9-axis k-DOP plus extra axes, in light-relative space.
+        j["light_regions"] = Json::array();
+        for (unsigned light = 0; w.lightRegion && light < w.primaryLightCount; ++light)
+        {
+            Json hulls = Json::array();
+            const auto &region = w.lightRegion[light];
+            for (unsigned hull = 0; region.hulls && hull < region.hullCount; ++hull)
+            {
+                const auto &h = region.hulls[hull];
+                Json axes = Json::array();
+                for (unsigned axis = 0; h.axis && axis < h.axisCount; ++axis)
+                    axes.push_back({{"dir", V3(h.axis[axis].dir)},
+                                    {"mid", h.axis[axis].midPoint},
+                                    {"half", h.axis[axis].halfSize}});
+                hulls.push_back({{"kdop_mid", std::vector<float>(h.kdopMidPoint, h.kdopMidPoint + 9)},
+                                 {"kdop_half", std::vector<float>(h.kdopHalfSize, h.kdopHalfSize + 9)},
+                                 {"axes", std::move(axes)}});
+            }
+            j["light_regions"].push_back(std::move(hulls));
+        }
         j["sun"] = {{"color", V3(w.sunColorFromBsp)},
                     {"angles", V3(w.sunParse.angles)},
                     {"intensity", w.sunParse.sunLight},
@@ -871,10 +1025,17 @@ class World final : public AbstractAssetDumper<IW3::AssetGfxWorld>
                 {{"origin", V3(probe.origin)}, {"image", probe.reflectionImage->name}});
         }
 
+        // Plane and node counts are ints in IW3; only node entries are 16-bit.
+        // Large maps (mp_arnhem) exceed 65535 planes.
         if (!w.dpvsPlanes.cellCount || w.dpvsPlanes.cellCount > 65535 || w.planeCount < 0 ||
-            w.planeCount > 65535 || w.nodeCount <= 0 || w.nodeCount > 65535 ||
+            w.planeCount > (1 << 24) || w.nodeCount <= 0 || w.nodeCount > (1 << 24) ||
             !w.dpvsPlanes.planes || !w.dpvsPlanes.nodes || !w.cells)
-            throw std::runtime_error("Invalid IW3 DPVS topology");
+            throw std::runtime_error("Invalid IW3 DPVS topology: cells " +
+                                     std::to_string(w.dpvsPlanes.cellCount) + ", planes " +
+                                     std::to_string(w.planeCount) + ", nodes " +
+                                     std::to_string(w.nodeCount));
+        std::cerr << "dpvs: cells=" << w.dpvsPlanes.cellCount << " planes=" << w.planeCount
+                  << " nodes=" << w.nodeCount << std::endl;
         j["dpvs"] = {{"planes", Json::array()}, {"nodes", Json::array()}, {"cells", Json::array()}};
         for (int i = 0; i < w.planeCount; ++i)
         {
@@ -1098,7 +1259,14 @@ class World final : public AbstractAssetDumper<IW3::AssetGfxWorld>
                  {"axis", {V3(p.axis[0]), V3(p.axis[1]), V3(p.axis[2])}},
                  {"scale", p.scale},
                  {"reflection_probe", static_cast<unsigned char>(m.reflectionProbeIndex)},
-                 {"ground_lighting", w.dpvs.smodelInsts[i].groundLighting.packed}});
+                 {"cull_dist", m.cullDist},
+                 {"ground_lighting", w.dpvs.smodelInsts[i].groundLighting.packed},
+                 // R_SetStaticModelLighting inputs: lighting origin = avg(mins, maxs),
+                 // the instance's primary light, and XModel flags bit 0 (ground lit).
+                 {"mins", V3(w.dpvs.smodelInsts[i].mins)},
+                 {"maxs", V3(w.dpvs.smodelInsts[i].maxs)},
+                 {"primary_light", static_cast<unsigned char>(m.primaryLightIndex)},
+                 {"model_flags", static_cast<unsigned>(m.model->flags)}});
         }
         Save(context, std::string(w.name) + ".replay-world.json", j);
     }
