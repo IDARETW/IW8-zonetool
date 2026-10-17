@@ -12,8 +12,8 @@ under the MIT License. The source file retains its copyright and SPDX license no
 
 The IW3 exporters iw8-zonetool reads (world, collision, light grid, static-model lighting inputs,
 water spectrum, primary-light regions, map entities) live in a fork of OpenAssetTools:
-https://github.com/IDARETW/OpenAssetTools, branch `iw8-zonetool` (commit `400e3c8`, based on
-upstream `7d027e8`). Build its `Unlinker.exe` (Release, Win32) and pass it with `--unlinker`.
+https://github.com/IDARETW/OpenAssetTools, `main` (the export is commit `1b7fa28`, on upstream
+`f556729`). Build its `Unlinker.exe` (Release, Win32) and pass it with `--unlinker`.
 `tools/oat/ReplayMapDumpers.h` is a copy of the fork's main exporter header for reference. Both are
 distributed under GPL-3.0; the license text is stored beside the header.
 
