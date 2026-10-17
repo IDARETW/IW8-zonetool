@@ -9,6 +9,8 @@
 enum IW8_XAssetType : int32_t
 {
     ASSET_TYPE_PHYSICSASSET = 3,
+    ASSET_TYPE_PHYSICSFXPIPELINE = 4,
+    ASSET_TYPE_PHYSICSFXSHAPE = 5,
     ASSET_TYPE_XANIM = 7,
     ASSET_TYPE_XMODELSURFS = 8, // <- focus
     ASSET_TYPE_XMODEL = 9,      // <- focus
@@ -40,6 +42,7 @@ enum IW8_XAssetType : int32_t
     ASSET_TYPE_FOGSPLINE = 37,
     ASSET_TYPE_ANIMCLASS = 38,
     ASSET_TYPE_PLAYERANIM = 39,
+    ASSET_TYPE_LOCALIZE = 41, // LocalizeEntry
     ASSET_TYPE_VFX = 44, // ParticleSystemDef
     ASSET_TYPE_IMPACT_FX = 45,
     ASSET_TYPE_SURFACE_FX = 46,
@@ -48,6 +51,7 @@ enum IW8_XAssetType : int32_t
     ASSET_TYPE_STRINGTABLE = 54,
     ASSET_TYPE_NET_CONST_STRINGS = 61,
     ASSET_TYPE_LUAFILE = 62,
+    ASSET_TYPE_VECTORFIELD = 65,
     ASSET_TYPE_STREAMKEY = 102,
     ASSET_TYPE_DECAL_VOLUME_MATERIAL = 111,
     ASSET_TYPE_DYNENTITYLIST = 113,
@@ -87,6 +91,12 @@ inline const char *type_name(int t)
     {
     case ASSET_TYPE_PHYSICSASSET:
         return "physicsasset";
+    case ASSET_TYPE_PHYSICSFXPIPELINE:
+        return "physicsfxpipeline";
+    case ASSET_TYPE_PHYSICSFXSHAPE:
+        return "physicsfxshape";
+    case ASSET_TYPE_XANIM:
+        return "xanim";
     case ASSET_TYPE_XMODELSURFS:
         return "xmodelsurfs";
     case ASSET_TYPE_XMODEL:
@@ -127,12 +137,24 @@ inline const char *type_name(int t)
         return "soundbank";
     case ASSET_TYPE_STREAMKEY:
         return "streamkey";
+    case ASSET_TYPE_VFX:
+        return "vfx";
     case ASSET_TYPE_IMPACT_FX:
         return "impactfx";
     case ASSET_TYPE_SURFACE_FX:
         return "surfacefx";
+    case ASSET_TYPE_LOCALIZE:
+        return "localize";
     case ASSET_TYPE_RAWFILE:
         return "rawfile";
+    case ASSET_TYPE_SCRIPTFILE:
+        return "scriptfile";
+    case ASSET_TYPE_STRINGTABLE:
+        return "stringtable";
+    case ASSET_TYPE_GFX_MAP_TRZONE:
+        return "gfx_map_trzone";
+    case ASSET_TYPE_VECTORFIELD:
+        return "vectorfield";
     case ASSET_TYPE_NET_CONST_STRINGS:
         return "net_const_strings";
     case ASSET_TYPE_DECAL_VOLUME_MATERIAL:

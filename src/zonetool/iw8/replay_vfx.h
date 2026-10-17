@@ -24,6 +24,28 @@ struct Module
     // INIT_RUNNER and TEST_* modules both serialize ParticleSystemDef aliases.
     std::vector<std::string> childEffects;
     std::vector<std::array<std::string, 3>> decalMaterials;
+
+    // Imported stock modules (iw8::stock): `native` is the shipped record and
+    // every pointer it carries is one of these children, at its byte offset in
+    // the record, in load order: a ParticleCurveDef's control points, or a
+    // ParticleLinkedAssetListDef whose entries keep their shipped bytes and
+    // name the asset (or, for INIT_SOUND, the inline alias string) each
+    // pointer slot holds.
+    struct LinkedEntry
+    {
+        std::array<uint8_t, 0x20> native{};
+        std::vector<std::pair<std::size_t, std::pair<IW8_XAssetType, std::string>>> assets;
+        std::vector<std::pair<std::size_t, std::string>> strings;
+    };
+    struct ImportedChild
+    {
+        std::size_t offset{};
+        bool curve{};
+        std::vector<iw8_focus::ParticleCurveControlPointDef> points;
+        std::vector<LinkedEntry> entries;
+    };
+    bool imported = false;
+    std::vector<ImportedChild> importedChildren;
 };
 
 struct State

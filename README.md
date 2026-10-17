@@ -57,7 +57,9 @@ iw8-zonetool.exe build-iw3 C:\Maps\mp_example\mp_example.ff mp_example `
 | --- | --- |
 | `<id>.ff` | The map. |
 | `techsets_<id>.ff` | Its shaders and materials. |
-| `srv_<id>.ff`, `eng_<id>.ff`, `ww_<id>.ff` | Companion zones (empty). |
+| `srv_<id>.ff` | Server companion zone (empty). |
+| `eng_<id>.ff` | The map-intro chyron strings; with `--acts`, also the stock CODCaster image IW8 keeps there. |
+| `ww_<id>.ff` | Empty; with `--acts`, the stock CODCaster images IW8 keeps there. |
 | `map.json` | Map id, title and description. |
 | `preview.rgba` | Loading-screen image, when the CoD4 map has one. |
 
@@ -73,6 +75,8 @@ iw8-zonetool.exe build-iw3 C:\Maps\mp_example\mp_example.ff mp_example `
 | `--gsc-tool <exe>` | gsc-tool used to compile the map scripts. Also read from `IW8_GSC_TOOL`. |
 | `--metadata <map.json>` | Map title, description and minimap rotation (see below). |
 | `--style iw3` / `--style iw8` | Visual style, see [Styles](#styles). Default: `iw3`. |
+| `--acts <acts.exe>` | ACTS, used to copy the stock assets every shipped map carries and IW3 has no source for (see below). Also read from `IW8_ACTS`. Without it the build skips them with a warning. |
+| `--stock-cache <folder>` | Where the ACTS exports of the stock zones are kept between builds. Default: `_stock_cache` next to the output folder. |
 | `--no-navigation` | Skip the generated bot navigation. |
 | `--iw3-mode-assets on\|off` | Keep CoD4's Domination flag and Headquarters laptop models. Default: `on`. |
 | `-v` / `-q` | More / less console output. |
@@ -201,12 +205,12 @@ Legend:
 | 3 | ComWorld | com_map | ✔️ | Identical | Sun and primary lights with stock shadow defaults. Spot and omni intensities are set so IW8's inverse-square falloff matches IW3's brightness on the surface each light points at |
 | 4 | GfxWorld | gfx_map | ✔️ | Differs | Geometry, lightmap, reflection probes (IW3's rgb × a decode), cells, portals and Umbra visibility, sky, static models, brush models, sun and baked sun shadow, heightfield, spot and omni lights with volumes, shadow frustums and caster lists. Static models and entities are lit exactly as IW3 lights them (light grid with corner sight traces; entities at their spawn position). Stock-shaded players and weapons use IW8's own light grid, built from IW3's |
 | 5 | MapEnts | map_ents | ✔️ | Identical | Spawns, game mode objectives, script entities, triggers, glass prefabs, createfx one-shot effects |
-| 6 | XModel | xmodel, xmodelsurfs | ✔️ | Identical | All LODs, skeletons, car parts, model physics, script models |
+| 6 | XModel | xmodel, xmodelsurfs | ✔️ | Identical | All LODs, skeletons, car parts, model physics, script models. Vehicle parts fly off as physics props when the car explodes or the part breaks, at IW3's launch strength |
 | 7 | XAnimParts | xanim | ✔️ | Identical | Prop animations the map scripts play (such as the vehicle destroy animation), in IW3's own encoding |
 | 8 | Material | material | ✔️ | Differs | Every technique family the maps draw follows IW3's disassembled shader math: blend, layers, polygon offset, falloff, additive, multiply, detail maps, flag cloth, water (IW3's FFT wave map as a looping flipbook) and glass. `--style iw8` lights them in IW8's physically based model and units |
 | 9 | MaterialTechniqueSet | techset | ✔️ | Differs | Regenerated IW8 shaders (IW3's D3D9 bytecode cannot run on IW8), each checked against the IW3 disassembly |
 | 10 | GfxImage | image | ✔️ | Identical | Recompressed for IW8. World textures share one 8192 × 8192 BC7 atlas at source resolution (large textures take 2 × 2 tiles) |
-| 11 | GfxLightDef | lightdef | ✔️ | Identical | `light_point_linear`, matching the stock definition |
+| 11 | GfxLightDef | lightdef | ✔️ | Identical | `light_point_linear`, matching the stock definition. The stock IES lights for the flashlight and the night-vision illuminator, with the world's IES lookup image |
 | 12 | FxEffectDef | ParticleSystem | ✔️ | Differs | Effects the map uses, with soft particles, view-angle falloff and eye offset. Heat haze uses IW3's own distortion map and strength (`--style iw3`). With `--style iw8` a stock IW8 effect replaces each IW3 effect that has one with the same role |
 | 13 | FxImpactTable | impactfx | ✔️ | Differs | `--style iw3` maps IW3's impact rows onto IW8's impact types by calibre; `--style iw8` keeps IW8's own surface impacts |
 | 14 | snd_alias_list_t | sound bank aliases | ✔️ | Differs | Only the aliases the map uses. With `--style iw8`, vehicle and glass sounds use IW8's always-loaded aliases |
@@ -224,6 +228,14 @@ Generated for every map (no IW3 equivalent):
 * Bot navigation: navmesh, path nodes and tactical graph
 * Colour grading and vision settings from the map's IW3 film and fog settings
 * Minimap setup from the map's `minimap_corner` entities and compass image
+* The map-intro chyron (operation, clock from the IW3 sun, location, unit)
+* With `--acts`: the stock surface-effect table `void` with every effect, physics shape and model it uses
+  (brass resting on each surface, equipment explosions on water, ice and snow, 40 mm impacts), and the
+  stock CODCaster spectator images. They are read from your own game install; nothing stock is stored here
+
+Each build also writes two ledgers next to the output folder: `<output>.iw3-assets.tsv` (what happened to every
+IW3 asset of the source zones, with a reason) and `<output>.iw8-assets.tsv` (where every asset of the written zones
+comes from). The build log lists any row it cannot explain.
 
 ### Game modes
 

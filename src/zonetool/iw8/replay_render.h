@@ -72,6 +72,9 @@ struct DecalVolumeMaterial
 struct Material
 {
     std::string material;
+    // IW3 material this one converts (render JSON "source"); empty for
+    // generated variants and stock carriers.
+    std::string source;
     std::vector<uint8_t> materialInfo, constants, bufferIndices, textureHeaders;
     std::string techset;
     std::vector<uint8_t> techsetHeader;

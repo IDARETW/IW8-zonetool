@@ -203,8 +203,10 @@ void writeXModel(ZoneWriter &zw, const cx::Iw8XModelRecord &rec)
         rec.himipRadiusInvSq.size() != rec.numsurfs ||
         rec.numLods > 6 || rec.lods.size() != rec.numLods)
         throw std::runtime_error("writeXModel: inconsistent model counts for " + rec.name);
+    // An in-range collision LOD must exist; stock models also name out-of-range
+    // values (fx_rifle_shell: 8 with two LODs) besides 255.
     if (!std::isfinite(rec.scale) || rec.scale <= 0 || !std::isfinite(rec.radius) ||
-        rec.radius < 0 || (rec.collLod != UINT8_MAX && rec.collLod >= rec.numLods) ||
+        rec.radius < 0 || (rec.collLod < 6 && rec.collLod >= rec.numLods) ||
         rec.shadowCutoffLod > 6)
         throw std::runtime_error("writeXModel: invalid model scalars for " + rec.name);
     float previousDistance = 0;

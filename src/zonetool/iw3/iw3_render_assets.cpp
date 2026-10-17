@@ -1,4 +1,5 @@
 #include "iw3_render_assets.h"
+#include "iw3_ledger.h"
 
 #include "resources.h"
 
@@ -955,6 +956,7 @@ std::vector<Image> LoadImage(const std::filesystem::path &root,
                              const std::vector<std::filesystem::path> &sourcePaths,
                              const std::string &name)
 {
+    ledger::Use("image", name);
     if (name == "$white")
         return {SolidImage({255, 255, 255, 255})};
     if (name == "$black")
@@ -1504,6 +1506,7 @@ SourceFxMaterial ReadFxMaterial(const std::filesystem::path &root,
                                 const std::vector<std::filesystem::path> &sourcePaths,
                                 const std::string &name)
 {
+    ledger::Use("material", name);
     const auto path = FindMaterial(root, sourcePaths, name);
     if (path.empty())
         throw std::runtime_error("missing IW3 FX material '" + name +
@@ -1980,6 +1983,7 @@ SourceMaterial ReadMaterial(const std::filesystem::path &root,
                             const std::vector<std::filesystem::path> &sourcePaths,
                             const std::string &name)
 {
+    ledger::Use("material", name);
     const auto path = FindMaterial(root, sourcePaths, name);
     if (path.empty())
     {
@@ -3664,7 +3668,6 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
              static_cast<std::size_t>(std::count_if(
                  materials.begin(), materials.end(),
                  [](const SourceMaterial &material) { return !material.detail.empty(); })));
-    std::size_t nextTile = 0;
     const std::size_t visibleCount = tileNumbers.size();
     RenderPlan plan;
     const auto &sourceProbes = world.at("reflection_probes");
@@ -4585,7 +4588,7 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
             atlases[channel].mips.push_back(std::move(next));
         }
         auto chain = MipChain(std::move(atlases[channel]), mipCount, channel == 0);
-        if (atlasSize > 4096)
+        if constexpr (atlasSize > 4096)
         {
             chain = EncodeBc7Chain(chain, atlasSize, mipCount, cacheRoot);
             const std::string filename = map + "_atlas_" + std::to_string(channel) + ".bc7";
@@ -4599,18 +4602,20 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot, const Js
                                                     {"bc7", filename},
                                                     {"format", channel == 0 ? 45 : 44},
                                                     {"mipCount", mipCount}});
-            continue;
         }
-        const std::string filename = map + "_atlas_" + std::to_string(channel) + ".rgba";
-        const std::string name = ImageName(map, channel, chain);
-        WriteBytes(mapDirectory / filename, chain);
-        material["textures"][channel]["image"] = name;
-        material["imageDefinitions"].push_back({{"name", name},
-                                                {"width", atlasSize},
-                                                {"height", atlasSize},
-                                                {"rgba8", filename},
-                                                {"format", channel == 0 ? 7 : 6},
-                                                {"mipCount", mipCount}});
+        else
+        {
+            const std::string filename = map + "_atlas_" + std::to_string(channel) + ".rgba";
+            const std::string name = ImageName(map, channel, chain);
+            WriteBytes(mapDirectory / filename, chain);
+            material["textures"][channel]["image"] = name;
+            material["imageDefinitions"].push_back({{"name", name},
+                                                    {"width", atlasSize},
+                                                    {"height", atlasSize},
+                                                    {"rgba8", filename},
+                                                    {"format", channel == 0 ? 7 : 6},
+                                                    {"mipCount", mipCount}});
+        }
     }
     zt::info("iw3: source atlas %ux%u, %u columns, %u-pixel material tiles, %u mips", atlasSize,
              atlasSize, columns, cell, mipCount);

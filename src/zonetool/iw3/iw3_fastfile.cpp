@@ -1,4 +1,5 @@
 #include "iw3_fastfile.h"
+#include "iw3_ledger.h"
 #include "iw3_lightgrid.h"
 #include "iw3_render_assets.h"
 #include "iw3_scripts.h"
@@ -31,6 +32,7 @@
 #include <map>
 #include <numeric>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -1273,6 +1275,52 @@ constexpr const char *kIw3VehicleDestructibleEffects[] = {
     "props/car_glass_headlight",      "props/car_glass_brakelight",
 };
 
+// IW3 maps\mp\_destructible_types parts that become physics props: the part
+// model (<family>_<color><suffix>, lowercased as destructible_info does) is
+// launched from its tag when the vehicle explodes (physicsOnExplosion, the
+// velocity scale) and/or when the part itself breaks (destructible_physics).
+struct Iw3VehiclePhysicsPart
+{
+    const char *family, *tag, *suffix;
+    float explosionScale; // 0: the explosion leaves it on the wreck
+    bool onBreak;
+};
+constexpr Iw3VehiclePhysicsPart kIw3VehiclePhysicsParts[] = {
+    {"vehicle_80s_sedan1", "tag_hood", "_hood", 2.5f, false},
+    {"vehicle_80s_sedan1", "tag_wheel_front_right", "_wheel_lf", 0.7f, false},
+    {"vehicle_80s_sedan1", "tag_wheel_back_right", "_wheel_lf", 0.7f, false},
+    {"vehicle_80s_sedan1", "tag_door_right_front", "_door_rf", 1.0f, false},
+    {"vehicle_80s_sedan1", "tag_door_right_back", "_door_rb", 1.0f, false},
+    {"vehicle_80s_sedan1", "tag_bumper_front", "_bumper_f", 1.0f, false},
+    {"vehicle_80s_sedan1", "tag_bumper_back", "_bumper_b", 1.0f, false},
+    {"vehicle_80s_sedan1", "tag_mirror_left", "_mirror_l", 1.0f, true},
+    {"vehicle_80s_sedan1", "tag_mirror_right", "_mirror_r", 1.0f, true},
+    {"vehicle_80s_wagon1", "tag_hood", "_hood", 1.5f, false},
+    {"vehicle_80s_wagon1", "tag_door_right_back", "_door_rb", 1.0f, false},
+    {"vehicle_80s_wagon1", "tag_bumper_front", "_bumper_f", 0.7f, false},
+    {"vehicle_80s_wagon1", "tag_bumper_back", "_bumper_b", 0.6f, false},
+    {"vehicle_80s_wagon1", "tag_mirror_left", "_mirror_l", 0.0f, true},
+    {"vehicle_80s_wagon1", "tag_mirror_right", "_mirror_r", 0.0f, true},
+    {"vehicle_80s_hatch1", "tag_hood", "_hood", 1.5f, false},
+    {"vehicle_80s_hatch1", "tag_door_right_front", "_door_rf", 1.0f, false},
+    {"vehicle_80s_hatch1", "tag_mirror_left", "_mirror_l", 0.0f, true},
+    {"vehicle_80s_hatch1", "tag_mirror_right", "_mirror_r", 0.0f, true},
+    {"vehicle_80s_hatch2", "tag_hood", "_hood", 1.5f, false},
+    {"vehicle_80s_hatch2", "tag_door_right_front", "_door_rf", 1.0f, false},
+    {"vehicle_80s_hatch2", "tag_mirror_left", "_mirror_l", 0.0f, true},
+    {"vehicle_80s_hatch2", "tag_mirror_right", "_mirror_r", 0.0f, true},
+    {"vehicle_small_wagon", "tag_hood", "_hood", 1.5f, false},
+    {"vehicle_small_wagon", "tag_door_left_front", "_door_lf", 1.0f, false},
+    {"vehicle_small_wagon", "tag_door_right_front", "_door_rf", 1.0f, false},
+    {"vehicle_small_wagon", "tag_mirror_left", "_mirror_l", 1.0f, true},
+    {"vehicle_small_wagon", "tag_mirror_right", "_mirror_r", 1.0f, true},
+    {"vehicle_small_hatch", "tag_hood", "_hood", 1.5f, false},
+    {"vehicle_small_hatch", "tag_door_left_front", "_door_lf", 1.0f, false},
+    {"vehicle_small_hatch", "tag_door_right_front", "_door_rf", 1.0f, false},
+    {"vehicle_small_hatch", "tag_mirror_left", "_mirror_l", 1.0f, true},
+    {"vehicle_small_hatch", "tag_mirror_right", "_mirror_r", 1.0f, true},
+};
+
 // IW3 effects the compatibility layer plays for TVs and destructable pieces in
 // place of stock stand-ins (converted with the map's impact effects).
 constexpr const char *kIw3CompatPropEffects[] = {"impacts/small_glass",
@@ -1616,7 +1664,7 @@ std::string SourceAssetExamples(const std::set<std::string> &names)
 void AuditSourceAssetDeclarations(const std::filesystem::path &root,
                                   const std::set<std::string> &emittedFx,
                                   const std::set<std::string> &emittedRawFiles,
-                                  const bool emittedLinearLightDef)
+                                  const bool emittedLinearLightDef, const std::string &sourceMap)
 {
     const auto zoneRoot = root / "zone_source";
     std::error_code error;
@@ -1645,12 +1693,22 @@ void AuditSourceAssetDeclarations(const std::filesystem::path &root,
     }
     std::sort(zoneFiles.begin(), zoneFiles.end());
 
+    // One record per (zone, type, name); `reference` marks OAT's "type,,name"
+    // lines: the zone only points at an asset another IW3 zone defines.
+    struct Declaration
+    {
+        std::string zone, type, name;
+        bool reference{};
+    };
+    std::vector<Declaration> records;
     std::map<std::string, std::set<std::string>> declarations;
     for (const auto &zoneFile : zoneFiles)
     {
         std::ifstream input(zoneFile, std::ios::binary);
         if (!input)
             throw std::runtime_error("cannot read OpenAssetTools IW3 zone declaration");
+        const std::string zone = zoneFile.stem().string();
+        std::set<std::pair<std::string, std::string>> seen;
 
         std::string line;
         std::size_t lineNumber = 0;
@@ -1687,7 +1745,10 @@ void AuditSourceAssetDeclarations(const std::filesystem::path &root,
                                                                               : lastComma + 1));
             if (name.empty())
                 name = "<unnamed>";
-            declarations[std::move(type)].insert(std::move(name));
+            const bool reference = line.size() > firstComma + 1 && line[firstComma + 1] == ',';
+            declarations[type].insert(name);
+            if (seen.emplace(type, name).second)
+                records.push_back({zone, type, name, reference});
         }
         if (input.bad())
             throw std::runtime_error("cannot read OpenAssetTools IW3 zone declaration");
@@ -1705,32 +1766,289 @@ void AuditSourceAssetDeclarations(const std::filesystem::path &root,
     zt::info("iw3: accounted for %zu unique source asset declarations across %zu zone file(s): %s",
              declarationCount, zoneFiles.size(), summary.c_str());
 
-    for (const auto &[type, names] : declarations)
+    // What the conversion consumed: the readers' ledger plus the selections.
+    auto used = ledger::Used();
+    for (const auto &name : emittedFx)
+        used.emplace("fx", name);
+    for (const auto &name : emittedRawFiles)
+        used.emplace("rawfile", name);
+    if (emittedLinearLightDef)
+        used.emplace("lightdef", "light_point_linear");
+    const auto isUsed = [&](const std::string &type, const std::string &name) {
+        return used.contains({type, name}) || used.contains({type, "," + name});
+    };
+
+    // Material -> images (material JSON) and model -> materials (OBJ .mtl), to
+    // say why an image or material was left out.
+    std::map<std::string, std::vector<std::pair<std::string, std::string>>> materialImages;
+    std::map<std::string, std::set<std::string>> imageMaterials;
+    std::map<std::string, std::set<std::string>> materialModels;
+    const auto materialsRoot = root / "materials";
+    for (std::filesystem::recursive_directory_iterator iterator(materialsRoot, error), end;
+         !error && iterator != end; iterator.increment(error))
     {
-        if (IsConsumedIw3SourceAssetType(type))
+        if (!iterator->is_regular_file(error) || iterator->path().extension() != ".json")
             continue;
-        std::set<std::string> unconsumed(names);
-        if (type == "fx")
-            for (const auto &name : emittedFx)
-                unconsumed.erase(name);
-        if (type == "rawfile")
+        auto relative = iterator->path().lexically_relative(materialsRoot);
+        relative.replace_extension();
+        const std::string material = relative.generic_string();
+        try
         {
-            for (const auto &name : emittedRawFiles)
-                unconsumed.erase(name);
-            for (const auto &name : names)
-                if (std::filesystem::path(name).extension() == ".gsc")
-                    unconsumed.erase(name);
+            const Json source = ReadJson(iterator->path());
+            if (source.contains("textures") && source.at("textures").is_array())
+                for (const auto &texture : source.at("textures"))
+                {
+                    const std::string image = texture.value("image", std::string{});
+                    const std::string semantic = texture.value("semantic", std::string{});
+                    if (image.empty())
+                        continue;
+                    materialImages[material].emplace_back(image, semantic);
+                    imageMaterials[image].insert(material);
+                }
         }
-        if (type == "lightdef" && emittedLinearLightDef)
-            unconsumed.erase("light_point_linear");
-        if (unconsumed.empty())
-            continue;
-        const auto examples = SourceAssetExamples(unconsumed);
-        zt::warn("iw3: source type '%s' has %zu declaration(s) outside the native map package "
-                 "(%s); examples: %s",
-                 type.c_str(), unconsumed.size(), SourceAssetAuditReason(type).data(),
-                 examples.c_str());
+        catch (const std::exception &)
+        {
+        }
     }
+    error.clear();
+    for (std::filesystem::directory_iterator iterator(root / "model_export", error), end;
+         !error && iterator != end; iterator.increment(error))
+    {
+        if (iterator->path().extension() != ".mtl")
+            continue;
+        std::ifstream input(iterator->path());
+        std::string line;
+        while (std::getline(input, line))
+            if (line.starts_with("newmtl "))
+                materialModels[TrimSourceAssetField(std::string_view(line).substr(7))].insert(
+                    iterator->path().stem().string());
+    }
+
+    std::map<std::string, std::set<std::string>> presetModels;
+    error.clear();
+    for (std::filesystem::directory_iterator iterator(root / "xmodel", error), end;
+         !error && iterator != end; iterator.increment(error))
+    {
+        const auto path = iterator->path();
+        if (path.extension() != ".json" || path.stem().extension() == ".replay")
+            continue;
+        try
+        {
+            const Json model = ReadJson(path);
+            if (const auto preset = model.value("physPreset", std::string{}); !preset.empty())
+                presetModels[preset].insert(path.stem().string());
+        }
+        catch (const std::exception &)
+        {
+        }
+    }
+    // IW3 player characters (mptype bodies, heads, view hands): Replay players
+    // are its own operators.
+    const auto isCharacter = [](const std::string &model) {
+        return model.starts_with("body_mp_") || model.starts_with("head_mp_") ||
+               model.starts_with("viewhands_") || model.starts_with("viewmodel_");
+    };
+    // Parts of IW3 destructible vehicles: their geometry is also a bone set of
+    // the destructible model, which IW3 MP hides and shows by tag.
+    const auto isVehiclePart = [](const std::string &model) {
+        for (const auto &part : kIw3VehiclePhysicsParts)
+            if (model.starts_with(part.family) && !model.ends_with("_destructible_mp") &&
+                !model.ends_with("_destructible") && !model.ends_with("_destroyed"))
+                return true;
+        return false;
+    };
+    const std::string mapZone = Lowercase(sourceMap);
+    const auto lowered = [](std::string text) { return Lowercase(std::move(text)); };
+    const auto classify = [&](const Declaration &record) -> std::pair<std::string, std::string> {
+        const auto &[zone, type, name, reference] = record;
+        if (isUsed(type, name))
+            return {"converted", ""};
+        if (type == "sound" && used.contains({"sound:stock", name}))
+            return {"stock", "--style iw8 plays the stock Replay alias for this role"};
+        const bool shared = zone != mapZone && zone != mapZone + "_load";
+        if (shared)
+            return {"shared-unused", "IW3 shared zone " + zone +
+                                         " (read for the map's entity models): only what the map uses converts"};
+        if (reference)
+            return {"reference", "defined by an IW3 shared zone; the map zone only points at it"};
+        if (type == "clipmap" || type == "comworld" || type == "gfxworld" || type == "mapents" ||
+            type == "gameworldmp" || type == "impactfx")
+            return {"converted", "world root, exported whole by the Unlinker (layers 1-5, 13)"};
+        if (type == "techniqueset")
+            return {"n/a", "IW3 shader programs are not portable; each converted material gets a "
+                           "matched Replay techset"};
+        if (type == "image")
+        {
+            const std::string lower = lowered(name);
+            if (lower.starts_with("*lightmap") || lower.starts_with("lightmap"))
+                return {"converted", "lightmap: decoded from the GfxWorld export into the lightmap atlas"};
+            if (lower.starts_with("*reflection_probe") || lower.starts_with("reflection_probe"))
+                return {"converted", "reflection probe: decoded from the GfxWorld export"};
+            if (lower.starts_with("loadscreen_"))
+                return {"converted", "load screen: becomes the map preview / loading image"};
+            if (lower.starts_with("compass_map_"))
+                return {"converted", "minimap: converted by the compass step"};
+            if (lower == "$outdoor")
+                return {"n/a", "IW3 outdoor mask; Replay worlds carry their own $outdoor (heightfield)"};
+            const auto owners = imageMaterials.find(name);
+            if (owners == imageMaterials.end())
+                return {"UNEXPLAINED", "no exported material samples it"};
+            std::string usedOwner, unusedOwner, semantic;
+            for (const auto &material : owners->second)
+            {
+                if (isUsed("material", material))
+                {
+                    usedOwner = material;
+                    for (const auto &[image, slot] : materialImages[material])
+                        if (image == name)
+                            semantic = slot;
+                }
+                else if (unusedOwner.empty())
+                    unusedOwner = material;
+            }
+            if (!usedOwner.empty())
+                return {"n/a", "slot " + (semantic.empty() ? std::string("?") : semantic) +
+                                   " of converted material " + usedOwner +
+                                   " is not sampled by its Replay material"};
+            if (const auto models = materialModels.find(unusedOwner);
+                models != materialModels.end() &&
+                std::ranges::all_of(models->second, isCharacter))
+                return {"n/a", "on IW3 player character " + *models->second.begin() +
+                                   " (Replay players are its own operators)"};
+            if (lowered(unusedOwner) == "sun" || lowered(unusedOwner).starts_with("sun_flare"))
+                return {"n/a", "IW3 sun sprite/flare of material " + unusedOwner +
+                                   ": Replay's sunflare uses stock ,sun / ,sun_flare (layer 17)"};
+            if (unusedOwner.starts_with("$"))
+                return {"n/a", "IW3 menu backdrop " + unusedOwner + ": Replay's UI has its own"};
+            return {"unused", "only sampled by unconverted material " + unusedOwner};
+        }
+        if (type == "material")
+        {
+            const auto owners = materialModels.find(name);
+            if (owners != materialModels.end())
+            {
+                for (const auto &model : owners->second)
+                    if (isUsed("xmodel", model))
+                        return {"UNEXPLAINED", "on converted model " + model + " but never read"};
+                if (std::ranges::all_of(owners->second, isCharacter))
+                    return {"n/a", "on IW3 player character " + *owners->second.begin() +
+                                       " (Replay players are its own operators)"};
+                if (std::ranges::all_of(owners->second, isVehiclePart))
+                    return {"n/a", "on vehicle part model " + *owners->second.begin() +
+                                       ", whose geometry is a bone set of the converted destructible model"};
+                return {"unused", "only on unconverted model " + *owners->second.begin()};
+            }
+            if (lowered(name) == "sun" || lowered(name).starts_with("sun_flare"))
+                return {"n/a", "IW3 sun sprite/flare: Replay's sunflare uses stock ,sun / ,sun_flare (layer 17)"};
+            if (name.starts_with("$"))
+                return {"n/a", "IW3 menu backdrop: Replay's UI has its own"};
+            if (lowered(name).starts_with("compass_map_"))
+                return {"n/a", "minimap material: the image converts (compass step); Replay draws it with its own"};
+            return {"unused", "no converted surface, model or effect uses it"};
+        }
+        if (type == "xmodel")
+        {
+            if (isCharacter(name))
+                return {"n/a", "IW3 player character (mptype): Replay players are its own operators"};
+            if (isVehiclePart(name))
+                return {"n/a", "vehicle part: its geometry is a bone set of the converted destructible model "
+                               "(IW3 MP hides/shows it by tag); IW3 only spawns it when it launches as physics"};
+            return {"unused", "never placed, spawned or referenced by a converted entity or effect"};
+        }
+        if (type == "physpreset")
+        {
+            if (const auto models = presetModels.find(name); models != presetModels.end())
+            {
+                for (const auto &model : models->second)
+                    if (isUsed("xmodel", model))
+                        return {"n/a", "preset of converted model " + model +
+                                           ", which IW3 does not simulate on this map (static placement, or an "
+                                           "effect model whose Replay physics has its own values)"};
+                return {"unused", "preset of unconverted model " + *models->second.begin()};
+            }
+            return {"unused", "no exported model names this preset"};
+        }
+        if (type == "sound")
+        {
+            // CoD4's shared alias sets the map zone pulls in: the systems that
+            // play them are Replay's own on a converted map.
+            const std::string lower = lowered(name);
+            const auto any = [&](std::initializer_list<const char *> keys) {
+                return std::ranges::any_of(keys, [&](const char *key) { return lower.find(key) != std::string::npos; });
+            };
+            for (const auto &stock : used)
+                if (stock.first == "sound:stock" && lower.starts_with(lowered(stock.second) + "_"))
+                    return {"stock", "layer of " + stock.second + ", whose role --style iw8 plays as a stock alias"};
+            if (any({"_engine_", "_idle_", "hind_", "cobra_", "havoc_", "seaknight_", "mi17_", "blackhawk_",
+                     "t72_", "truck_", "veh_", "artillery", "mortar", "clusterbomb", "bm21", "vehicle_fire"}))
+                return {"n/a", "IW3 killstreak/vehicle system sound; Replay's own killstreaks and vehicles play theirs"};
+            if (any({"generic_death_", "breathing_", "_plr_"}))
+                return {"n/a", "IW3 player sound (death VO, breathing, footsteps); Replay players use their own"};
+            if (any({"rocket_explode", "detpack", "weap_", "weapons_", "explo_mine", "grenade"}))
+                return {"n/a", "IW3 weapon sound; Replay weapons use their own"};
+            if (lower.starts_with("ui_"))
+                return {"n/a", "IW3 UI sound; Replay's UI has its own"};
+            return {"unused", "alias the map's scripts, createfx, ambience and destructibles never play"};
+        }
+        if (type == "loadedsound")
+            return {"unused", "audio of an alias the map does not play (see the sound rows)"};
+        if (type == "soundcurve")
+            return {"unused", "falloff curve of no alias the map plays"};
+        if (type == "rawfile" && std::filesystem::path(name).extension() == ".gsc")
+            return {"converted", "map GSC: translated into the map script (layer 17)"};
+        if (type == "rawfile" && std::filesystem::path(name).extension() == ".vision")
+            return {"converted", "IW3 vision: converted into the Replay vision file and grading CLUT (layer 17)"};
+        if (type == "stringtable" && lowered(name) == "mp/mapstable.csv")
+            return {"n/a", "IW3 per-map team character sets; Replay factions and operators are its own"};
+        return {"unused", std::string(SourceAssetAuditReason(type))};
+    };
+
+    std::map<std::tuple<std::string, std::string, std::string>, std::size_t> counts;
+    std::map<std::string, std::vector<std::string>> unexplained;
+    std::ofstream report;
+    if (const auto path = ledger::Report(); !path.empty())
+    {
+        report.open(path, std::ios::binary | std::ios::trunc);
+        if (report)
+            report << "zone\ttype\tname\tfate\tdetail\n";
+    }
+    for (const auto &record : records)
+    {
+        const auto [fate, detail] = classify(record);
+        ++counts[{record.zone, record.type, fate}];
+        if (fate == "UNEXPLAINED")
+            unexplained[record.type].push_back(record.name + " (" + detail + ")");
+        if (report)
+            report << record.zone << '\t' << record.type << '\t' << record.name << '\t' << fate << '\t'
+                   << detail << '\n';
+    }
+    std::string line;
+    std::string current;
+    for (const auto &[key, count] : counts)
+    {
+        const auto &[zone, type, fate] = key;
+        const std::string head = zone + " " + type;
+        if (head != current)
+        {
+            if (!line.empty())
+                zt::info("iw3: ledger %s", line.c_str());
+            line = head + ":";
+            current = head;
+        }
+        line += " " + fate + "=" + std::to_string(count);
+    }
+    if (!line.empty())
+        zt::info("iw3: ledger %s", line.c_str());
+    for (const auto &[type, names] : unexplained)
+    {
+        std::string examples;
+        for (std::size_t index = 0; index < names.size() && index < 4; ++index)
+            examples += (index ? "; " : "") + names[index];
+        zt::warn("iw3: ledger: %zu %s declaration(s) of the map zone are UNEXPLAINED: %s%s", names.size(),
+                 type.c_str(), examples.c_str(), names.size() > 4 ? "; ..." : "");
+    }
+    if (report)
+        zt::info("iw3: per-asset ledger written to %s", ledger::Report().string().c_str());
 }
 
 Json ReadJson(const std::filesystem::path &path)
@@ -2269,6 +2587,7 @@ SourceStaticModel ReadSourceModel(const std::filesystem::path &root, const std::
                                   const bool placedStaticBindPose = false,
                                   const std::filesystem::path &skeletonRoot = {})
 {
+    ledger::Use("xmodel", modelName);
     const auto modelPath = SafeChild(root, std::filesystem::path("xmodel") / (modelName + ".json"));
     const Json model = ReadJson(modelPath);
     const auto modelType = model.value("type", std::string{});
@@ -2608,11 +2927,39 @@ std::array<Vec3, 3> BasisFromQuaternion(const Vec4 &source)
 // Replay clutter body. IW3 and Replay masses are both kilograms. The Replay
 // material comes from the preset's sound prefix or name; props up to 2 kg are
 // debris (Replay's shipped buckets, cans and bottles weigh 0.5-1.5).
+// One numeric field of an IW3 physics preset (physic/<name>: PHYSIC\key\value...).
+float PhysicsPresetValue(const std::filesystem::path &root, std::string name, const std::string &key,
+                         const float fallback)
+{
+    while (!name.empty() && name.front() == ',')
+        name.erase(name.begin());
+    std::string text;
+    if (name.empty() || name.find_first_of("/\\") != std::string::npos ||
+        !zt::read_file_str((root / "physic" / name).string(), text))
+        return fallback;
+    std::vector<std::string> fields(1);
+    for (const char character : text)
+    {
+        if (character == '\\')
+            fields.emplace_back();
+        else if (character != '\r' && character != '\n')
+            fields.back().push_back(character);
+    }
+    for (std::size_t index = 1; index + 1 < fields.size(); index += 2)
+        if (fields[index] == key)
+        {
+            const float value = std::strtof(fields[index + 1].c_str(), nullptr);
+            return std::isfinite(value) ? value : fallback;
+        }
+    return fallback;
+}
+
 std::optional<iw8::havok::ClutterBody> ReadPhysicsPreset(const std::filesystem::path &root,
                                                          std::string name)
 {
     while (!name.empty() && name.front() == ',')
         name.erase(name.begin());
+    ledger::Use("physpreset", name);
     std::string text;
     if (name.empty() || name.find_first_of("/\\") != std::string::npos ||
         !zt::read_file_str((root / "physic" / name).string(), text))
@@ -3577,6 +3924,8 @@ void BuildPreparedStaticModels(const SourceStaticModels &source, const RenderPla
                                                           : "mw120r/" + map + "/" + assetPrefix +
                                                                 "_" + std::to_string(modelIndex);
         PreparedXModel prepared;
+        prepared.source = sourceModel.name;
+        prepared.role = assetPrefix;
         prepared.model.name = assetName;
         const bool skinned = sourceModel.bones.size() > 1;
         if (skinned)
@@ -7775,6 +8124,8 @@ PreparedMap::PreparedMap(PreparedMap &&other) noexcept
     , gradingClutName(std::move(other.gradingClutName))
     , gradingClutPixels(std::move(other.gradingClutPixels))
     , soundBank(std::move(other.soundBank))
+    , chyronClock(std::move(other.chyronClock))
+    , chyronUnits(std::move(other.chyronUnits))
 {
     other.scratch.clear();
 }
@@ -7811,6 +8162,8 @@ PreparedMap &PreparedMap::operator=(PreparedMap &&other) noexcept
         gradingClutName = std::move(other.gradingClutName);
         gradingClutPixels = std::move(other.gradingClutPixels);
         soundBank = std::move(other.soundBank);
+        chyronClock = std::move(other.chyronClock);
+        chyronUnits = std::move(other.chyronUnits);
         other.scratch.clear();
     }
     return *this;
@@ -8523,6 +8876,25 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                  options.style == MapStyle::iw8 ? "iw8" : "iw3", expFog ? "yes" : "no",
                  result.gradingClutName.empty() ? "none" : result.gradingClutName.c_str());
     }
+    {
+        // Chyron clock from the IW3 sun: 0-90 degrees of elevation read 06:00-12:00;
+        // a night sun (blue moonlight, MatchIw8Lighting) reads 23:xx.
+        bool night = lightingMatch.night;
+        const auto sunIndex = world.at("sun_primary_light_index").get<std::size_t>();
+        const auto &lights = commonWorld.at("primary_lights");
+        if (options.style != MapStyle::iw8 && sunIndex < lights.size() &&
+            lights.at(sunIndex).at("type").get<int>() == 1)
+            night = MatchIw8Lighting(ReadVector<3>(lights.at(sunIndex).at("color"))).night;
+        const float elevation =
+            std::clamp(std::asin(std::clamp(SunDirection(world, entities)[2], -1.0f, 1.0f)) *
+                           57.2957795f,
+                       0.0f, 90.0f);
+        const int minutes = night ? 23 * 60 + std::min(static_cast<int>(elevation / 90.0f * 60.0f), 59)
+                                  : 6 * 60 + static_cast<int>(elevation / 90.0f * 360.0f);
+        char clock[32];
+        std::snprintf(clock, sizeof(clock), "Day 1 %02d:%02d:", minutes / 60 % 24, minutes % 60);
+        result.chyronClock = clock;
+    }
     result.fxEffects = ReadPreparedFx(exportRoot);
     auto declaredFx = ReadDeclaredFx(exportRoot / "zone_source" / (sourceMap + ".zone"));
     // Effect names the map scripts hold as plain literals (loaded at runtime
@@ -8685,6 +9057,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     // entities, and so destroyed-state models can be converted and precached.
     std::set<std::string> scriptStrings;
     std::vector<std::string> scriptModels;
+    // Vehicle parts the compatibility layer launches as physics props.
+    std::set<std::string> physicsPartModels;
     {
         std::vector<scripts::Source> scriptSources;
         // The map scripts, and the createfx (effect placement) and createart
@@ -8706,6 +9080,11 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                                              std::move(text)});
             }
         }
+        // Chyron unit names: stock IW8's most common pair (Shipment's), whatever
+        // the IW3 factions were (owner 2026-10-17: "OpFor" should not show).
+        result.chyronUnits = {"SAS - Detachment Delta", "12th Spetsnaz Brigade"};
+        zt::info("iw3: chyron units: allies %s, axis %s, clock '%s'", result.chyronUnits[0].c_str(),
+                 result.chyronUnits[1].c_str(), result.chyronClock.c_str());
         // Destroyed states of IW3 destructibles (<type>_destroyed, <model>_d).
         // Custom types (Broadcast2's cust_vehicle_80s_sedan1_green) name the
         // destroyed model after the vehicle model instead:
@@ -8788,6 +9167,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                     throw std::runtime_error("IW3 xanim was not found in common_mp.ff: " + anim);
                 result.xanims.push_back(
                     iw8::xanim::LoadIw3(exportRoot / "xanim" / (anim + ".iw3.json")));
+                ledger::Use("xanim", anim);
                 zt::info("iw3: converted xanim %s (%u frames, %zu bone(s))", anim.c_str(),
                          unsigned(result.xanims.back().numframes),
                          result.xanims.back().names.size());
@@ -8800,6 +9180,53 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             generated += "    level.mw120r_destroyed[\"" + type + "\"] = \"" + model + "\";\n";
         for (const auto &[type, anim] : destroyAnims)
             generated += "    level.mw120r_destroyanim[\"" + type + "\"] = \"" + anim + "\";\n";
+        // Physics parts per destructible_type (kIw3VehiclePhysicsParts), for
+        // iw3compat_vehicle_physics_parts().
+        generated += "    level.mw120r_vehicle_physics = [];\n";
+        {
+            std::set<std::string> types;
+            for (const EntityFields &entity : ParseEntityFields(entities))
+                if (const auto type = entity.find("destructible_type"); type != entity.end())
+                    types.insert(type->second);
+            for (const auto &type : types)
+            {
+                std::string parts;
+                std::size_t count = 0;
+                for (const auto &part : kIw3VehiclePhysicsParts)
+                {
+                    const std::string family = std::string(part.family) + "_";
+                    const auto at = type.find(family);
+                    if (at == std::string::npos)
+                        continue;
+                    const std::string model = Lowercase(std::string(part.family) + "_" +
+                                                        type.substr(at + family.size()) + part.suffix);
+                    if (!exportedModel(model))
+                        continue;
+                    physicsPartModels.insert(model);
+                    // IW3 physicsLaunch impulse = force * bulletForceScale;
+                    // velocity = impulse / mass (the scripted fallback flight).
+                    const Json source = ReadJson(
+                        SafeChild(exportRoot, std::filesystem::path("xmodel") / (model + ".json")));
+                    const auto preset = source.value("physPreset", std::string{});
+                    float mass = PhysicsPresetValue(exportRoot, preset, "mass", 0.0f);
+                    if (!(mass > 0.0f))
+                        mass = 10.0f;
+                    const float forceScale = PhysicsPresetValue(exportRoot, preset, "bulletForceScale", 1.0f);
+                    char line[448];
+                    std::snprintf(line, sizeof(line),
+                                  "    level.mw120r_vehicle_physics[\"%s\"][%zu] = iw3compat_physics_part( "
+                                  "\"%s\", \"%s\", %.2f, %d, %.3f, %.3f );\n    precachemodel( \"%s\" );\n",
+                                  type.c_str(), count++, part.tag, model.c_str(), part.explosionScale,
+                                  part.onBreak ? 1 : 0, mass, forceScale, model.c_str());
+                    parts += line;
+                }
+                if (count)
+                    generated += "    level.mw120r_vehicle_physics[\"" + type + "\"] = [];\n" + parts;
+            }
+            if (!physicsPartModels.empty())
+                zt::info("iw3: %zu vehicle part model(s) launch as physics props (IW3 physics_launch)",
+                         physicsPartModels.size());
+        }
         for (const auto &model : extraModels)
         {
             std::error_code missing;
@@ -8890,6 +9317,23 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                 fxModelNames.insert(dependency.name);
     for (const auto &model : sourceEntityModels.models)
         fxModelNames.erase(model.name);
+    // Launched vehicle parts: rigid models simulated with their IW3 physics
+    // preset (the xmodel's physPreset), under their source names for setmodel.
+    SourceStaticModels sourcePartModels;
+    for (const auto &name : physicsPartModels)
+    {
+        fxModelNames.erase(name);
+        SourceStaticModel model = ReadSourceModel(exportRoot, name);
+        const Json source =
+            ReadJson(SafeChild(exportRoot, std::filesystem::path("xmodel") / (name + ".json")));
+        if (const auto preset = source.value("physPreset", std::string{}); !preset.empty())
+            model.clutter = ReadPhysicsPreset(exportRoot, preset);
+        if (!model.clutter)
+            zt::warn("iw3: vehicle part %s has no readable physics preset; it launches as a static "
+                     "model",
+                     name.c_str());
+        sourcePartModels.models.push_back(std::move(model));
+    }
     sourceFxModels.models.reserve(fxModelNames.size());
     for (const auto &name : fxModelNames)
         sourceFxModels.models.push_back(ReadSourceModel(exportRoot, name));
@@ -8919,7 +9363,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                 modelMaterialNames.push_back(surface.material);
             }
     for (const SourceStaticModels *models :
-         {&sourceDynamicEntities.models, &sourceEntityModels, &sourceFxModels})
+         {&sourceDynamicEntities.models, &sourceEntityModels, &sourceFxModels, &sourcePartModels})
         for (const SourceStaticModel &model : models->models)
             for (const SourceStaticModelLod &lod : model.lods)
                 for (const Surface &surface : lod.surfaces)
@@ -9168,7 +9612,6 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         std::vector<StaticModelLightingInput> presetInputs(presets.size());
         std::size_t nearLocalLight = 0;
         const unsigned sunLight = world.at("sun_primary_light_index").get<unsigned>();
-        const auto &sourceLights = commonWorld.at("primary_lights");
         // IW3 Com_CullBoxFromPrimaryLight (com_math CullBoxFromSphere /
         // CullBoxFromConicSectionOfSphere), ported.
         const auto culledByLight = [&](const std::size_t light, const EntityPreset &preset) {
@@ -9295,11 +9738,16 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         const auto presetVolumes =
             SampleStaticModelLighting(exportRoot, sourceAsset, presetInputs, gridLights, sightBlocked);
         unsigned presetStart = 0, presetCount = 0;
-        if (!presetVolumes.empty())
+        const std::size_t presetFirst = (std::size_t(grid->paletteStart) + grid->paletteColors * 56 + 3) / 4 * 4;
+        if (!presetVolumes.empty() &&
+            (presetFirst + presets.size() * 68 + grid->width - 1) / grid->width > 4096)
+            zt::warn("iw3: %zu entity lighting preset(s) do not fit the 4096-row entity grid image; entities "
+                     "use the runtime grid lookup",
+                     presets.size());
+        else if (!presetVolumes.empty())
         {
             presetCount = static_cast<unsigned>(presets.size());
-            presetStart = static_cast<unsigned>(
-                (std::size_t(grid->paletteStart) + grid->paletteColors * 56 + 3) / 4 * 4);
+            presetStart = static_cast<unsigned>(presetFirst);
             const std::size_t total = std::size_t(presetStart) + std::size_t(presetCount) * 68;
             grid->height = static_cast<unsigned>((total + grid->width - 1) / grid->width);
             grid->pixels.resize(std::size_t(grid->width) * grid->height * 4, 0);
@@ -9521,6 +9969,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     replayrender::StaticModels unusedFxTables;
     BuildPreparedStaticModels(sourceFxModels, renderPlan, options.map, "fxmodel",
                               result.xmodels, unusedFxTables, true, true, true);
+    BuildPreparedStaticModels(sourcePartModels, renderPlan, options.map, "partmodel",
+                              result.xmodels, unusedFxTables, true, true, true);
     zt::info("iw3: converted %zu FX-referenced XModels through native model/material closure",
              sourceFxModels.models.size());
     timing.lap("prepare models");
@@ -9645,6 +10095,11 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
             soundAliases = std::move(sounds->aliases);
             result.soundBank = std::move(sounds->bank);
         }
+        for (const auto &[alias, looping] : soundAliases)
+            ledger::Use("sound", alias);
+        if (options.style == MapStyle::iw8)
+            for (const auto &sound : kIw8StyleSounds)
+                ledger::Use("sound:stock", sound.iw3);
         zt::info("iw3: converted %zu of %zu requested IW3 sound alias(es)", soundAliases.size(),
                  requestedSounds.size());
     }
@@ -9875,7 +10330,7 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     std::set<std::string> emittedRawFiles;
     for (const auto &rawFile : result.rawFiles)
         emittedRawFiles.insert(rawFile.name);
-    AuditSourceAssetDeclarations(exportRoot, emittedFx, emittedRawFiles, localLinearLightDef);
+    AuditSourceAssetDeclarations(exportRoot, emittedFx, emittedRawFiles, localLinearLightDef, sourceMap);
     result.dynamicEntities.reserve(sourceDynamicEntities.definitionModels.size() +
                                    sourceDynamicEntities.brushes.size());
     for (std::size_t index = 0; index < sourceDynamicEntities.definitionModels.size(); ++index)

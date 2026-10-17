@@ -1405,6 +1405,17 @@ std::optional<EntityLightGrid> BuildEntityLightGrid(const std::filesystem::path 
     grid.paletteStart = static_cast<unsigned>((entryTexels + grid.width - 1) / grid.width * grid.width);
     grid.paletteColors = colorCount;
     const std::size_t total = grid.paletteStart + colorCount * 56;
+    // One texel per point of the grid's box: a resident RGBA8 image holds at
+    // most 4096 rows. Greenband's IW3 grid spans 1379x1300x247 points with
+    // 0.12% populated (a 108106-row image); such maps keep the earlier entity
+    // lighting (no MAP_ENTITY_GRID).
+    if ((total + grid.width - 1) / grid.width > 4096)
+    {
+        zt::warn("iw3: entity light grid %ux%ux%u points needs %zu image rows (Replay allows 4096); entities "
+                 "use the lighting without the IW3 grid",
+                 grid.dims[0], grid.dims[1], grid.dims[2], (total + grid.width - 1) / grid.width);
+        return std::nullopt;
+    }
     grid.height = static_cast<unsigned>((total + grid.width - 1) / grid.width);
     grid.pixels.assign(std::size_t(grid.width) * grid.height * 4, 0);
     for (const Cell &cell : cells)

@@ -655,6 +655,7 @@ iw3compat_vehicle_think()
     self endon( "death" );
     self iw3compat_make_damageable();
     self iw3compat_vehicle_parts_init();
+    self iw3compat_vehicle_physics_parts();
     self.mw120r_destroyed_model = iw3compat_destroyed_model( self.destructible_type );
     self.mw120r_stage = 0;
     self.mw120r_damage = 0;
@@ -672,6 +673,7 @@ iw3compat_vehicle_think()
         kind = iw3compat_damage_kind( type );
         if ( isdefined( attacker ) )
             self.mw120r_attacker = attacker;
+        self.mw120r_hitpoint = point;
         if ( kind == "splash" )
         {
             self iw3compat_vehicle_parts_splash( amount, point );
@@ -837,6 +839,7 @@ iw3compat_vehicle_explode()
          isdefined( level.mw120r_destroyanim[self.destructible_type] ) )
         self scriptmodelplayanim( level.mw120r_destroyanim[self.destructible_type] );
     self thread iw3compat_vehicle_explode_hop();
+    self thread iw3compat_vehicle_explode_parts();
 
     // IW3's own explosion carries its fire; the stock stand-in needs a burn.
     if ( iw3compat_slot_stock( "veh_explosion" ) )
@@ -1022,6 +1025,7 @@ iw3compat_vehicle_break_part( part )
         part.visible = undefined;
     }
     part.stage = 2;
+    self iw3compat_vehicle_break_launch( part.tag );
     if ( isdefined( part.fx ) )
     {
         fx = level.mw120r_fx["glass_shatter"];
@@ -1122,4 +1126,190 @@ iw3compat_tv_think()
     playfx( level.mw120r_fx["sparks"], point );
     if ( isdefined( self.mw120r_destroyed_model ) )
         self setmodel( self.mw120r_destroyed_model );
+}
+
+// ---------------------------------------------------------------------------
+// Vehicle physics parts (IW3 _destructible physics_launch). The converter
+// generates level.mw120r_vehicle_physics[destructible_type] from IW3's
+// _destructible_types: each part's tag, its own model, the explosion velocity
+// scale (physicsOnExplosion; 0 = it stays on the wreck), whether breaking the
+// part launches it (destructible_physics), and the mass and bulletForceScale
+// of the part model's physics preset.
+// ---------------------------------------------------------------------------
+iw3compat_physics_part( tag, model, scale, onbreak, mass, forcescale )
+{
+    part = spawnstruct();
+    part.tag = tag;
+    part.model = model;
+    part.scale = scale;
+    part.onbreak = onbreak;
+    part.mass = mass;
+    part.forcescale = forcescale;
+    return part;
+}
+
+// This vehicle's own copies, so a launched part stays launched per vehicle.
+iw3compat_vehicle_physics_parts()
+{
+    self.mw120r_physparts = [];
+    if ( !isdefined( level.mw120r_vehicle_physics ) || !isdefined( self.destructible_type ) ||
+         !isdefined( level.mw120r_vehicle_physics[self.destructible_type] ) )
+        return;
+    foreach ( source in level.mw120r_vehicle_physics[self.destructible_type] )
+        self.mw120r_physparts[self.mw120r_physparts.size] =
+            iw3compat_physics_part( source.tag, source.model, source.scale, source.onbreak, source.mass,
+                                    source.forcescale );
+}
+
+// IW3 physics_launch(): hide the tag and spawn the part model at its pose as a
+// physics prop, launched with IW3's impulse: the force times the preset's
+// bulletForceScale. (The wreck model binds all its geometry to tag_body, so on
+// the wreck the hide shows nothing, as in IW3: the clean part flies off it.)
+// The client-side launch (physicslaunchclient) left every part where it
+// spawned (owner test 2026-10-17), so the server simulates the parts: Replay's
+// G_ScrMoverCmd_PhysicsLaunchServer creates the part's Havok body and applies
+// the impulse in game units (velocity = impulse / mass, as in IW3). A part
+// that has not moved a quarter second later got no body; it flies IW3's arc
+// by script instead. At most 25 live at once (destructibleSpawnedEntsLimit);
+// the oldest is removed first.
+iw3compat_vehicle_launch_part( part, point, force )
+{
+    if ( isdefined( part.launched ) )
+        return;
+    part.launched = 1;
+    origin = self gettagorigin( part.tag, 1 );
+    if ( !isdefined( origin ) )
+        return;
+    angles = self gettagangles( part.tag );
+    self hidepart( part.tag );
+    prop = iw3compat_physics_prop( origin, angles, part.model );
+    impulse = force * part.forcescale;
+    prop thread iw3compat_part_physics( point, impulse );
+    prop thread iw3compat_part_flight( origin, impulse / part.mass );
+}
+
+iw3compat_physics_prop( origin, angles, model )
+{
+    kept = [];
+    if ( isdefined( level.mw120r_physics_props ) )
+    {
+        foreach ( prop in level.mw120r_physics_props )
+            if ( isdefined( prop ) )
+                kept[kept.size] = prop;
+    }
+    if ( kept.size >= 25 )
+    {
+        kept[0] delete();
+        rest = [];
+        for ( i = 1; i < kept.size; i++ )
+            rest[rest.size] = kept[i];
+        kept = rest;
+    }
+    prop = spawn( "script_model", origin );
+    prop.angles = angles;
+    prop setmodel( model );
+    kept[kept.size] = prop;
+    level.mw120r_physics_props = kept;
+    return prop;
+}
+
+// Its own thread: a launch that cannot create the body raises a script error,
+// which ends only this thread.
+iw3compat_part_physics( point, impulse )
+{
+    self endon( "death" );
+    self physicslaunchserver( point, impulse );
+}
+
+// The scripted stand-in for a part without a physics body: a fresh script
+// model on the launch arc (g 800, as g_gravity), tumbling, until the arc meets
+// geometry or 3 s pass. The first 0.2 s skip the trace so the part clears the
+// wreck it starts inside.
+iw3compat_part_flight( start, velocity )
+{
+    self endon( "death" );
+    wait 0.25;
+    if ( distancesquared( self.origin, start ) > 1 )
+        return;
+    prop = iw3compat_physics_prop( start, self.angles, self.model );
+    self delete();
+    gravity = 800;
+    time = 3;
+    landing = undefined;
+    previous = start;
+    for ( step = 1; step <= 60; step++ )
+    {
+        t = step * 0.05;
+        next = start + velocity * t - ( 0, 0, 0.5 * gravity * t * t );
+        if ( step > 4 )
+        {
+            stop = physicstrace( previous, next );
+            if ( distancesquared( stop, next ) > 0.01 )
+            {
+                landing = stop;
+                fraction = 1;
+                segment = distance( previous, next );
+                if ( segment > 0 )
+                    fraction = distance( previous, stop ) / segment;
+                time = ( step - 1 + fraction ) * 0.05;
+                break;
+            }
+        }
+        previous = next;
+    }
+    if ( !isdefined( landing ) )
+        landing = previous;
+    if ( time < 0.05 )
+        time = 0.05;
+    spin = ( randomfloatrange( 180, 540 ), randomfloatrange( -360, 360 ), randomfloatrange( 180, 540 ) );
+    prop movegravity( velocity, time );
+    prop rotatevelocity( spin, time );
+    wait time;
+    if ( isdefined( prop ) )
+        prop.origin = landing;
+}
+
+// IW3 destructible_update_part() with a physics state: the part leaves along
+// the shot, normalize( point - attacker origin ) * 200, from the hit point.
+iw3compat_vehicle_break_launch( tag )
+{
+    if ( !isdefined( self.mw120r_physparts ) )
+        return;
+    foreach ( part in self.mw120r_physparts )
+    {
+        if ( part.tag != tag || !part.onbreak )
+            continue;
+        point = self.mw120r_hitpoint;
+        if ( !isdefined( point ) )
+            point = self gettagorigin( tag, 1 );
+        if ( !isdefined( point ) )
+            return;
+        force = ( 0, 0, 0 );
+        if ( isdefined( self.mw120r_attacker ) )
+            force = vectornormalize( point - self.mw120r_attacker.origin ) * 200;
+        self iw3compat_vehicle_launch_part( part, point, force );
+        return;
+    }
+}
+
+// IW3 explode(): a frame after the wreck swap, every part with a velocity
+// scale flies off away from the explosion origin (the vehicle origin: the base
+// part has no tag) at randomfloatrange( 4000, 5000 ) * scale (every IW3 vehicle
+// uses destructible_explode( 4000, 5000, ... )).
+iw3compat_vehicle_explode_parts()
+{
+    self endon( "death" );
+    if ( !isdefined( self.mw120r_physparts ) || !self.mw120r_physparts.size )
+        return;
+    wait 0.05;
+    foreach ( part in self.mw120r_physparts )
+    {
+        if ( part.scale <= 0 )
+            continue;
+        point = self gettagorigin( part.tag, 1 );
+        if ( !isdefined( point ) )
+            continue;
+        force = vectornormalize( point - self.origin ) * ( randomfloatrange( 4000, 5000 ) * part.scale );
+        self iw3compat_vehicle_launch_part( part, point, force );
+    }
 }

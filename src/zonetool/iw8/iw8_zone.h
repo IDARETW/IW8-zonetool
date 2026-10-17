@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace iw8
@@ -26,11 +27,24 @@ class ZoneWriter
     };
     void add(IW8_XAssetType type, const std::string &name, AssetWriteFn body)
     {
+        registered_.insert(assetKey(type, name));
         entries_.push_back({type, name, std::move(body)});
+    }
+    bool has(IW8_XAssetType type, const std::string &name) const
+    {
+        return registered_.contains(assetKey(type, name));
     }
     size_t assetCount() const
     {
         return entries_.size();
+    }
+    std::vector<std::pair<IW8_XAssetType, std::string>> assetList() const
+    {
+        std::vector<std::pair<IW8_XAssetType, std::string>> list;
+        list.reserve(entries_.size());
+        for (const auto &entry : entries_)
+            list.emplace_back(entry.type, entry.name);
+        return list;
     }
 
     // ---- low-level stream API forwarded to the underlying ZoneBuffer
@@ -139,6 +153,7 @@ class ZoneWriter
 
     ZoneBuffer zb_;
     std::vector<Entry> entries_;
+    std::unordered_set<std::string> registered_;
     std::unordered_map<std::string, uint64_t> assetAliases_;
     std::vector<std::string> scriptStrings_;
     bool scriptStringsWritten_ = false;

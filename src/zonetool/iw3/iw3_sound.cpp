@@ -1,4 +1,5 @@
 #include "iw3_sound.h"
+#include "iw3_ledger.h"
 
 #include "common/fs_util.h"
 #include "common/json.hpp"
@@ -932,6 +933,7 @@ std::optional<iw8::sound::Curve> ReadIw3Curve(const std::filesystem::path &expor
     if (name.empty() || name.find_first_of("/\\.") != std::string::npos ||
         !zt::read_file_str((exportRoot / "soundaliases" / (name + ".vfcurve")).string(), text))
         return std::nullopt;
+    ledger::Use("soundcurve", name);
     std::istringstream input(text);
     std::string magic;
     std::size_t count = 0;
@@ -1085,6 +1087,7 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
             missing[path] = true;
             return nullptr;
         }
+        ledger::Use("loadedsound", path);
         iw8::sound::Sample sample;
         std::string stem = path.ends_with(".wav") || path.ends_with(".mp3")
                                ? path.substr(0, path.size() - 4)

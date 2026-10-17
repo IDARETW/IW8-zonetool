@@ -293,7 +293,16 @@ Image LoadImageDefinition(const std::string &path, const nlohmann::json &source,
         image.mipCount > 14 || (image.format != 6 && image.format != 7 && !blocks) ||
         mapType != expectedMapType || std::filesystem::path(pixels).filename() != pixels ||
         pixels.find("..") != std::string::npos)
-        throw std::runtime_error("Invalid resident Replay image definition");
+        throw std::runtime_error("Invalid resident Replay image definition: " + image.name +
+                                 " (format " + std::to_string(image.format) + ", " +
+                                 std::to_string(width) + "x" + std::to_string(height) + ", " +
+                                 std::to_string(image.mipCount) + " mips, flags 0x" +
+                                 [&] {
+                                     char text[16];
+                                     std::snprintf(text, sizeof(text), "%X", image.flags);
+                                     return std::string(text);
+                                 }() +
+                                 ")");
     if (cubemap && (width != height || depth != 1 || numElements != 1))
         throw std::runtime_error("Replay reflection image must be one square cubemap");
     if (array && (width != height || depth != 1 || numElements < 1))
@@ -358,6 +367,7 @@ Material LoadMaterial(const std::string &path, const nlohmann::json &j,
 {
     Material m;
     m.material = j.at("material").get<std::string>();
+    m.source = j.value("source", std::string{});
     constexpr std::string_view effectPrefix = "elcq/mw120r_fx_";
     const bool ownedEffect = auxiliaryEffect && m.material.starts_with(effectPrefix) &&
                              m.material.size() <= 128 &&

@@ -56,6 +56,19 @@ void WriteModules(ZoneWriter &writer, const std::vector<Module> &modules)
     for (const auto &module : modules)
     {
         auto record = module.native;
+        if (module.imported)
+        {
+            // Shipped layout: only the pointer slots change (counts stay).
+            for (const auto &child : module.importedChildren)
+            {
+                if (child.offset + 16 > sizeof(record))
+                    throw std::runtime_error("Replay VFX imported child lies outside its module");
+                const bool any = child.curve ? !child.points.empty() : !child.entries.empty();
+                StorePointer(&record, child.offset, any ? PTR_FOLLOWS : PTR_NULL);
+            }
+            writer.writeT(record);
+            continue;
+        }
         if (record.moduleType != static_cast<uint16_t>(iw8_focus::ParticleModuleType::initRunner) &&
             record.moduleType != static_cast<uint16_t>(iw8_focus::ParticleModuleType::testBirth) &&
             record.moduleType != static_cast<uint16_t>(iw8_focus::ParticleModuleType::testImpact) &&
@@ -304,6 +317,40 @@ void WriteModules(ZoneWriter &writer, const std::vector<Module> &modules)
 
     for (const auto &module : modules)
     {
+        if (module.imported)
+        {
+            // Load order: each child in member order; a curve's points 16-aligned;
+            // a list's entries 8-aligned, then each entry's inline strings
+            // (Preload_ParticleLinkedAssetDef: INIT_SOUND reads a TempString).
+            for (const auto &child : module.importedChildren)
+            {
+                if (child.curve)
+                {
+                    if (child.points.empty())
+                        continue;
+                    writer.align(15);
+                    writer.write(child.points.data(),
+                                 child.points.size() * sizeof(iw8_focus::ParticleCurveControlPointDef));
+                    continue;
+                }
+                if (child.entries.empty())
+                    continue;
+                writer.align(7);
+                for (const auto &entry : child.entries)
+                {
+                    auto bytes = entry.native;
+                    for (const auto &[offset, asset] : entry.assets)
+                        StorePointer(bytes.data(), offset, writer.assetAlias(asset.first, asset.second));
+                    for (const auto &[offset, text] : entry.strings)
+                        StorePointer(bytes.data(), offset, PTR_FOLLOWS);
+                    writer.write(bytes.data(), bytes.size());
+                }
+                for (const auto &entry : child.entries)
+                    for (const auto &[offset, text] : entry.strings)
+                        writer.writeStr(text);
+            }
+            continue;
+        }
         switch (static_cast<iw8_focus::ParticleModuleType>(module.native.moduleType))
         {
         case iw8_focus::ParticleModuleType::initSpawn:
@@ -411,7 +458,11 @@ void WriteBody(ZoneWriter &writer, const Effect &effect)
     if (effect.name.empty())
         throw std::runtime_error("Replay VFX has no asset name");
     auto root = effect.native;
-    root.version = 23;
+    // Converted effects use the current format; imported stock effects keep
+    // their shipped version (14, 15, 17 and 23 all ship), which Replay's
+    // loader and postload interpret.
+    if (!root.version)
+        root.version = 23;
     root.numEmitters = Count(effect.emitters);
     root.numScriptedInputNodes = 0;
     StorePointer(&root, offsetof(iw8_focus::ParticleSystemDef, name), PTR_FOLLOWS);

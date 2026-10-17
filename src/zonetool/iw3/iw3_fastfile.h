@@ -40,6 +40,9 @@ struct ImportOptions
 
 struct PreparedXModel
 {
+    // IW3 source model and the conversion role it took (smodel, dynmodel,
+    // entitymodel, fxmodel, partmodel), for the output ledger.
+    std::string source, role;
     convert::xmodel::Iw8XModelRecord model;
     std::vector<conv_xsurf::Iw8Surfs> lods;
     iw8::havok::PhysicsAsset physicsAsset;
@@ -244,6 +247,11 @@ struct PreparedMap
     std::vector<std::uint8_t> gradingClutPixels;
     // Converted IW3 sound aliases (always-loaded map bank), when any convert.
     std::optional<iw8::sound::Bank> soundBank;
+    // Map-intro chyron (localize mp_chyron/<map>_<team>_<1..4> in eng_<map>):
+    // line 2's clock, which the game follows with the running seconds
+    // ("Day 1 10:30:"), and each team's unit (allies, axis; stock IW8 names).
+    std::string chyronClock;
+    std::array<std::string, 2> chyronUnits;
 
     PreparedMap() = default;
     PreparedMap(const PreparedMap &) = delete;

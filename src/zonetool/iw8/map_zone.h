@@ -1012,7 +1012,6 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
     const auto staticCollisionPlan = strings.staticCollisionPlan;
     const bool hasLadders = !collision.ladders.empty();
     const bool hasLinearLightDef = strings.hasLinearLightDef;
-    const uint32_t lightDefNameStringIndex = strings.lightDefNameStringIndex;
 
     if (hasLadders)
         writer.add(ASSET_TYPE_EDGELIST, assetName, [&collision](ZoneWriter &output) {
@@ -1094,20 +1093,20 @@ inline void registerMapWorldAssets(ZoneWriter &writer, const MapWorldStrings &st
                });
 
     // Shipped Replay Rust carries this definition beside its ComWorld. The target
-    // type-34 loader reads a 0x20 body in stream 1; its name is the script string
-    // already written at the start of the VIRTUAL stream.
+    // type-34 loader reads a 0x20 body in stream 1. Its name follows inline: an
+    // alias into the zone's script-string block went stale once other assets
+    // interned strings (Discovery's read "ry_8/smodel_330").
     if (hasLinearLightDef && !lightDefInZone)
     {
-        uint64_t offset = spawns->strings.size() * sizeof(uint64_t);
-        for (uint32_t index = 1; index < lightDefNameStringIndex; ++index)
-            offset += spawns->strings[index].size() + 1;
-        const uint64_t nameAlias = packOffset(XFILE_BLOCK_VIRTUAL, offset);
-        writer.add(ASSET_TYPE_LIGHTDEF, "light_point_linear", [nameAlias](ZoneWriter &output) {
+        writer.add(ASSET_TYPE_LIGHTDEF, "light_point_linear", [](ZoneWriter &output) {
             uint8_t lightDef[iw8sz::LIGHTDEF]{};
-            stamp64(lightDef, 0x00, nameAlias);
+            stamp64(lightDef, 0x00, PTR_FOLLOWS);
             output.pushStream(XFILE_BLOCK_TEMP_PRELOAD);
             output.align(7);
             output.write(lightDef, sizeof(lightDef));
+            output.pushStream(XFILE_BLOCK_VIRTUAL);
+            output.writeStr("light_point_linear");
+            output.popStream();
             output.popStream();
         });
     }

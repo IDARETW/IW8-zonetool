@@ -8,6 +8,7 @@
 #include "dumpsrc/material_dumpsrc.h"
 #include "dumpsrc/xmodel_dump.h"
 #include "iw3/iw3_fastfile.h"
+#include "iw3/iw3_ledger.h"
 #include "iw3/iw3_vision.h"
 #include "iw3/iw3_scripts.h"
 #include "iw7/iw7_fastfile.h"
@@ -18,6 +19,7 @@
 #include "iw8/replay_dynentity.h"
 #include "iw8/replay_havok.h"
 #include "iw8/replay_heightfield.h"
+#include "iw8/replay_ies.h"
 #include "iw8/replay_locallights.h"
 #include "iw8/replay_xanim.h"
 #include "iw8/replay_impact.h"
@@ -26,6 +28,7 @@
 #include "iw8/replay_grading.h"
 #include "iw8/replay_render.h"
 #include "iw8/replay_script.h"
+#include "iw8/replay_stock.h"
 #include "iw8/replay_vfx.h"
 #include "iw8/write_xsurface.h"
 #include "iw8/write_weapon.h"
@@ -41,6 +44,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string_view>
 #include <regex>
@@ -72,6 +76,8 @@ struct Args
     bool iw3ModeAssets = true;
     std::string style = "iw3";
     std::string gscTool;
+    std::string actsExecutable;
+    std::string stockCache;
 };
 
 struct MapMetadata
@@ -107,6 +113,8 @@ void printUsage()
                 "  iw8-zonetool inspect-iw7 <file.ff>\n"
                 "  iw8-zonetool inspect <file.ff>\n"
                 "  iw8-zonetool validate-output <map_output> <map>\n"
+                "  iw8-zonetool build-stock -o <output> --replay <exe> --acts <acts.exe>\n"
+                "      (diagnostic: zones holding only the stock copy, for ACTS load checks)\n"
                 "  iw8-zonetool translate-iw3-script <maps/mp dir> <map> -o <out dir> [--gsc-tool <exe>]\n"
                 "options:\n"
                 "  --replay <game_dx12_ship_replay.exe>\n"
@@ -123,6 +131,9 @@ void printUsage()
                 "                    tonemapping, reflections, shadows and stock effects)\n"
                 "  --no-navigation  (skip generated bot aipaths/navmesh/tacgraph)\n"
                 "  --gsc-tool <gsc-tool.exe>  (compile converted IW3 map scripts; or IW8_GSC_TOOL)\n"
+                "  --acts <acts.exe>  (copy the stock surface-fx table `void` and the CODCaster\n"
+                "                      images from the game install; or IW8_ACTS)\n"
+                "  --stock-cache <dir>  (ACTS export cache; default <output>/../_stock_cache)\n"
                 "  -v  -q\n");
 }
 
@@ -194,6 +205,14 @@ bool parseArgs(const int argc, char **argv, Args &args)
         else if (value == "--gsc-tool" && index + 1 < argc)
         {
             args.gscTool = argv[++index];
+        }
+        else if (value == "--acts" && index + 1 < argc)
+        {
+            args.actsExecutable = argv[++index];
+        }
+        else if (value == "--stock-cache" && index + 1 < argc)
+        {
+            args.stockCache = argv[++index];
         }
         else if (value == "--no-navigation")
         {
@@ -679,14 +698,16 @@ bool validatePackage(const std::string &packageDirectory, const std::string &map
             err("validate: map render definitions must reside in the techset zone and images in the main zone");
             valid = false;
         }
-        for (size_t index = 2; index < 4; ++index)
+        // eng_<map> carries the map's English strings (LocalizeEntry) and the
+        // stock CODCaster image stock packs there; ww_<map> only the worldwide
+        // CODCaster images (section 19).
+        const auto &english = validation[2].typeCounts;
+        const auto &worldwide = validation[3].typeCounts;
+        if (validation[2].assetCount != english[ASSET_TYPE_LOCALIZE] + english[ASSET_TYPE_IMAGE] ||
+            validation[3].assetCount != worldwide[ASSET_TYPE_IMAGE])
         {
-            if (validation[index].assetCount)
-            {
-                err("validate: generated localization companions must be empty");
-                valid = false;
-                break;
-            }
+            err("validate: eng_ may hold only localized strings and images, ww_ only images");
+            valid = false;
         }
     }
     if (valid)
@@ -1091,6 +1112,191 @@ iw8::havok::BakeResult loadCollision(const Args &args, const std::string &dumpDi
     return collision;
 }
 
+// Output side of the per-asset ledger (checklist section 20): every asset the
+// map's zones register, with where it came from. Origins come from the render
+// materials (their IW3 source, textures, techsets and shaders), the prepared
+// IW3 models, effects and other prepared data, and fixed rules for the world and
+// generated assets. Anything else is UNEXPLAINED.
+struct OutputLedgerRow
+{
+    std::string zone, type, name, origin;
+};
+
+std::vector<OutputLedgerRow> outputLedgerRows(
+    const std::string &zone, const std::vector<std::pair<IW8_XAssetType, std::string>> &assets,
+    const replayrender::Mesh &mesh, const iw3::PreparedMap *prepared, const std::string &map,
+    const iw8::stock::Copier *stock)
+{
+    std::map<std::pair<int, std::string>, std::string> origins;
+    const auto set = [&](const int type, const std::string &name, const std::string &origin) {
+        if (!name.empty())
+            origins.emplace(std::pair{type, name}, origin);
+    };
+    const auto addMaterial = [&](const replayrender::Material &m) {
+        const std::string what = m.material + (m.source.empty() ? std::string(" (generated variant)")
+                                                                : " (IW3 " + m.source + ")");
+        set(ASSET_TYPE_MATERIAL, m.material,
+            m.source.empty() ? "generated material variant" : "IW3 material " + m.source);
+        set(ASSET_TYPE_TECHSET, m.techset, "techset of material " + what);
+        for (const auto &shader : m.shaders)
+            set(shader.type, shader.name, "shader of material " + what);
+        for (const auto &image : m.imageDefinitions)
+            set(ASSET_TYPE_IMAGE, image.name, "texture of material " + what);
+        set(ASSET_TYPE_DECAL_VOLUME_MATERIAL, m.decalVolumeMaterial, "decal volume of material " + what);
+    };
+    addMaterial(mesh);
+    for (const auto &m : mesh.additionalMaterials)
+        addMaterial(m);
+    for (const auto &m : mesh.assetMaterials)
+        addMaterial(m);
+    set(ASSET_TYPE_IMAGE, mesh.reflectionProbeArrayImage.name, "IW3 reflection probes (GfxWorld)");
+    for (const auto &name : mesh.stockMaterials)
+        set(ASSET_TYPE_MATERIAL, name,
+            "name-only reference to the stock common-zone material (loaded with the common zones)");
+    if (prepared)
+    {
+        for (const auto &model : prepared->xmodels)
+        {
+            const std::string origin = model.role + " from IW3 model " + model.source;
+            set(ASSET_TYPE_XMODEL, model.model.name, origin);
+            for (const auto &lod : model.lods)
+                set(ASSET_TYPE_XMODELSURFS, lod.name, "LOD of " + origin);
+            set(ASSET_TYPE_PHYSICSASSET, model.physicsAsset.name, "physics of " + origin);
+        }
+        for (const auto &effect : prepared->vfxEffects)
+            set(ASSET_TYPE_VFX, effect.name, "IW3 effect");
+        for (const auto &anim : prepared->xanims)
+            set(ASSET_TYPE_XANIM, anim.name, "IW3 xanim");
+        for (const auto &raw : prepared->rawFiles)
+            set(ASSET_TYPE_RAWFILE, raw.name,
+                raw.name.starts_with("vision/") ? "IW3 vision (converted, layer 17)"
+                : raw.name.starts_with("sun/")  ? "IW3 sun (layer 17)"
+                                                : "IW3 map-local raw file");
+        if (prepared->soundBank)
+            set(ASSET_TYPE_SOUNDBANK, prepared->soundBank->name, "IW3 sound aliases (map bank)");
+        if (!prepared->gradingClutName.empty())
+        {
+            set(ASSET_TYPE_GRADINGCLUT, prepared->gradingClutName, "IW3 film grade (layer 17)");
+            set(ASSET_TYPE_IMAGE, "gradingclut" + prepared->gradingClutName, "IW3 film grade (layer 17)");
+        }
+        if (!prepared->vfxLightDef.empty())
+            set(ASSET_TYPE_LIGHTDEF, prepared->vfxLightDef, "light of IW3 effects / local lights");
+    }
+    if (stock)
+        for (const auto &[key, origin] : stock->Origins())
+            origins.emplace(key, origin);
+
+    std::vector<OutputLedgerRow> rows;
+    for (const auto &[type, name] : assets)
+    {
+        std::string origin;
+        if (const auto found = origins.find({static_cast<int>(type), name}); found != origins.end())
+            origin = found->second;
+        else
+            switch (type)
+            {
+            case ASSET_TYPE_GFX_MAP:
+            case ASSET_TYPE_GFX_MAP_TRZONE:
+            case ASSET_TYPE_COL_MAP:
+            case ASSET_TYPE_COM_MAP:
+            case ASSET_TYPE_GLASS_MAP:
+            case ASSET_TYPE_FX_MAP:
+            case ASSET_TYPE_MAP_ENTS:
+                origin = "IW3 world (gfxworld, clipmap, comworld, mapents)";
+                break;
+            case ASSET_TYPE_AIPATHS:
+            case ASSET_TYPE_NAVMESH:
+            case ASSET_TYPE_TACGRAPH:
+                origin = "bot navigation generated from the converted collision";
+                break;
+            case ASSET_TYPE_EDGELIST:
+                origin = "IW3 ladders (clipmap)";
+                break;
+            case ASSET_TYPE_DYNENTITYLIST:
+                origin = "IW3 dynamic entities";
+                break;
+            case ASSET_TYPE_IMPACT_FX:
+                origin = "impact table (IW3 impacts or Replay's, per --style)";
+                break;
+            case ASSET_TYPE_NET_CONST_STRINGS:
+                origin = "level string tables (models, effects, anims the zone uses)";
+                break;
+            case ASSET_TYPE_SCRIPTFILE:
+                origin = "IW3 map GSC, translated";
+                break;
+            case ASSET_TYPE_LOCALIZE:
+                origin = "map-intro chyron (generated, section 19)";
+                break;
+            case ASSET_TYPE_STREAMKEY:
+                if (prepared && prepared->soundBank)
+                    origin = "IW3 sound aliases (map bank SAB)";
+                break;
+            case ASSET_TYPE_RAWFILE:
+                if (name == map || name == map + "_load")
+                    origin = "zone marker";
+                break;
+            case ASSET_TYPE_LIGHTDEF:
+                if (name == "flashlight" || name == "light_ies_nvg_flashlight")
+                    origin = "stock IES light (section 19)";
+                else if (name == "light_point_linear")
+                    origin = "IW3 local lights (comworld)";
+                break;
+            case ASSET_TYPE_IMAGE:
+                if (name == iw8::heightfield::kHeightmapName || name == iw8::heightfield::kOutdoorName)
+                    origin = "generated from the converted world (heightfield)";
+                else if (name == iw8::ies::kLookupName)
+                    origin = "stock IES profiles (section 19)";
+                else if (name == "compass_map_" + map)
+                    origin = "IW3 minimap image";
+                break;
+            case ASSET_TYPE_MATERIAL:
+                if (name == "compass_map_" + map)
+                    origin = "minimap material for the IW3 minimap image";
+                break;
+            case ASSET_TYPE_PHYSICSASSET:
+                if (name.starts_with("mw120r_glasschunk"))
+                    origin = "glass shard physics (IW3 glass)";
+                break;
+            default:
+                break;
+            }
+        rows.push_back({zone, iw8sz::type_name(type), name, origin.empty() ? "UNEXPLAINED" : origin});
+    }
+    return rows;
+}
+
+void writeOutputLedger(const std::vector<OutputLedgerRow> &rows)
+{
+    std::filesystem::path path = iw3::ledger::Report();
+    if (path.empty())
+        return;
+    std::string text = path.string();
+    if (text.ends_with(".iw3-assets.tsv"))
+        text.replace(text.size() - 15, 15, ".iw8-assets.tsv");
+    std::ofstream output(text, std::ios::binary | std::ios::trunc);
+    output << "zone\ttype\tname\torigin\n";
+    std::map<std::string, std::size_t> unexplained;
+    std::map<std::pair<std::string, std::string>, std::size_t> counts;
+    for (const auto &row : rows)
+    {
+        output << row.zone << '\t' << row.type << '\t' << row.name << '\t' << row.origin << '\n';
+        ++counts[{row.zone, row.type}];
+        if (row.origin == "UNEXPLAINED")
+            ++unexplained[row.type];
+    }
+    info("build-map: output ledger: %zu asset(s) across %zu zone/type group(s) written to %s",
+         rows.size(), counts.size(), text.c_str());
+    for (const auto &[type, count] : unexplained)
+    {
+        std::string examples;
+        for (const auto &row : rows)
+            if (row.type == type && row.origin == "UNEXPLAINED" && examples.size() < 160)
+                examples += (examples.empty() ? "" : ", ") + row.name;
+        warn("build-map: output ledger: %zu %s asset(s) are UNEXPLAINED: %s", count, type.c_str(),
+             examples.c_str());
+    }
+}
+
 int writeMapPackage(const Args &args, const std::string &map, const std::string &outputDirectory,
                     const std::string &entities, const iw8::MapBounds &bounds,
                     const std::string &dumpDirectory, const MapMetadata &metadata,
@@ -1104,6 +1310,31 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
     }
 
     LapTimer timing("package");
+    std::vector<OutputLedgerRow> ledgerRows;
+    // Stock assets every shipped map carries and IW3 has no source for (section
+    // 19): surface-fx `void` with its effects, and the CODCaster images.
+    std::unique_ptr<iw8::stock::Copier> stockCopier;
+    {
+        std::string acts = args.actsExecutable;
+        if (acts.empty())
+            if (const char *value = std::getenv("IW8_ACTS"); value && *value)
+                acts = value;
+        if (acts.empty() || args.replayExecutable.empty())
+            warn("build-map: no --acts (or IW8_ACTS) and --replay: the stock surface-fx table `void` and the "
+                 "CODCaster images are not copied");
+        else
+        {
+            iw8::stock::Options options;
+            options.acts = acts;
+            options.replayExecutable = args.replayExecutable;
+            options.cacheDirectory =
+                args.stockCache.empty()
+                    ? std::filesystem::absolute(outputDirectory).parent_path() / "_stock_cache"
+                    : std::filesystem::path(args.stockCache);
+            stockCopier = std::make_unique<iw8::stock::Copier>(options);
+            timing.lap("stock exports");
+        }
+    }
     const std::string assetName = "maps/mp/" + map + ".d3dbsp";
     iw8::MapSun lighting = loadLighting(args, dumpDirectory, assetName);
     const std::string renderPath = path_join(dumpDirectory, assetName + ".render.json");
@@ -1309,6 +1540,8 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
                               prepared ? prepared->smallGlassEffect : std::string{},
                               prepared ? prepared->impactOverrides
                                        : iw8::impact::EffectOverrides{});
+        if (stockCopier)
+            stockCopier->RegisterSurfaceEffects(writer, techsets);
         if (!renderMesh.glassPanes.empty())
         {
             writer.add(ASSET_TYPE_FX_MAP, assetName,
@@ -1322,6 +1555,9 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             prepared ? prepared->staticModels : replayrender::StaticModels{};
         const std::array<float, 3> sunDirection{lighting.direction[0], lighting.direction[1],
                                                 lighting.direction[2]};
+        // The world's IES lookup strip and the stock IES LightDefs (flashlight,
+        // NVG illuminator), as shipped maps carry; registered before the world.
+        iw8::ies::Register(writer);
         // Native GfxWorld heightfield and outdoor mask (shipped worlds carry
         // both); the images precede the world that references them.
         std::optional<iw8::heightfield::Data> heightfield;
@@ -1524,6 +1760,11 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             result = 1;
         }
         timing.lap("zone write");
+        for (auto &row : outputLedgerRows(map, writer.assetList(), renderMesh, prepared, map, stockCopier.get()))
+            ledgerRows.push_back(std::move(row));
+        for (auto &row : outputLedgerRows("techsets_" + map, techsets.assetList(), renderMesh, prepared, map,
+                                          stockCopier.get()))
+            ledgerRows.push_back(std::move(row));
         info("build-map: main zone contains %zu assets", writer.assetCount());
         info("build-map: techset zone contains %zu assets", techsets.assetCount());
     }
@@ -1538,8 +1779,53 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
     };
     // Shipped srv_<map> zones hold only server extras; the world lives in the main zone.
     writeEmpty("srv_" + map + ".ff");
-    writeEmpty("eng_" + map + ".ff");
-    writeEmpty("ww_" + map + ".ff");
+    iw8::ZoneWriter english;
+    if (prepared && !prepared->chyronClock.empty())
+    {
+        // The map-intro chyron the MP HUD shows at match start (stock keeps
+        // every shipped map's in eng_code_post_gfx): per team, operation,
+        // clock (the game appends the running seconds), location, unit.
+        // IW3 maps name no location; "Classified" is the stock wording for one.
+        std::string operation = metadata.title.empty() ? map : metadata.title;
+        if (operation.ends_with(" (Classic)"))
+            operation.resize(operation.size() - 10);
+        const char *teams[]{"allies", "axis"};
+        for (size_t team = 0; team < 2; ++team)
+        {
+            const std::string prefix = "mp_chyron/" + map + "_" + teams[team] + "_";
+            const std::string lines[]{"Operation: " + operation, prepared->chyronClock,
+                                      "Classified", prepared->chyronUnits[team]};
+            for (size_t line = 0; line < 4; ++line)
+                iw8::localize::Register(english, prefix + std::to_string(line + 1), lines[line]);
+        }
+        info("build-map: eng_%s: map-intro chyron '%s' / '%s' / %s vs %s", map.c_str(),
+             operation.c_str(), prepared->chyronClock.c_str(), prepared->chyronUnits[0].c_str(),
+             prepared->chyronUnits[1].c_str());
+    }
+    iw8::ZoneWriter worldwide;
+    if (stockCopier)
+    {
+        stockCopier->RegisterEnglishImages(english);
+        stockCopier->RegisterWorldwideImages(worldwide);
+    }
+    // The language packs: eng_<map> (English strings and images), ww_<map>
+    // (worldwide images); empty zones when there is nothing to carry.
+    for (auto *zone : {&english, &worldwide})
+    {
+        const std::string name = (zone == &english ? "eng_" : "ww_") + map;
+        if (!zone->assetCount())
+        {
+            writeEmpty(name + ".ff");
+            continue;
+        }
+        zone->build();
+        if (!iw8_write(path_join(outputDirectory, name + ".ff"), zone->body(), writeParams(*zone)))
+            result = 1;
+        for (auto &row : outputLedgerRows(name, zone->assetList(), renderMesh, prepared, map, stockCopier.get()))
+            ledgerRows.push_back(std::move(row));
+        info("build-map: %s contains %zu assets", name.c_str(), zone->assetCount());
+    }
+    writeOutputLedger(ledgerRows);
 
     if (result == 0 && !writeMetadata(outputDirectory, metadata))
     {
@@ -1952,6 +2238,10 @@ int buildIw3(const Args &args)
         options.searchPaths.push_back(root / "main");
         options.searchPaths.push_back(root / "raw");
     }
+    // Per-asset IW3 ledger beside the package (the package itself may only
+    // hold the map's files): <output>.iw3-assets.tsv.
+    iw3::ledger::Clear();
+    iw3::ledger::SetReport(std::filesystem::absolute(requestedOutput).string() + ".iw3-assets.tsv");
     iw3::PreparedMap prepared = [&] {
         StageTimer timer("iw3 conversion");
         return iw3::PrepareFastfile(options);
@@ -2397,6 +2687,39 @@ int buildMapImages(const Args &args)
 
 } // namespace
 
+// Diagnostic: the stock copy alone, as mp_stocktest and its techsets/eng_/ww_
+// companions, so ACTS can load-check the copier without a map build.
+int buildStock(const Args &args)
+{
+    if (args.outputDirectory.empty() || args.replayExecutable.empty() || args.actsExecutable.empty())
+    {
+        printUsage();
+        return 2;
+    }
+    const std::filesystem::path output(args.outputDirectory);
+    std::filesystem::create_directories(output);
+    iw8::stock::Options options;
+    options.acts = args.actsExecutable;
+    options.replayExecutable = args.replayExecutable;
+    options.cacheDirectory = args.stockCache.empty() ? std::filesystem::absolute(output).parent_path() / "_stock_cache"
+                                                     : std::filesystem::path(args.stockCache);
+    const iw8::stock::Copier copier(options);
+    iw8::ZoneWriter main, techsets, english, worldwide;
+    copier.RegisterSurfaceEffects(main, techsets);
+    copier.RegisterEnglishImages(english);
+    copier.RegisterWorldwideImages(worldwide);
+    int result = 0;
+    for (const auto &[zone, name] : {std::pair{&main, "mp_stocktest"}, std::pair{&techsets, "techsets_mp_stocktest"},
+                                     std::pair{&english, "eng_mp_stocktest"}, std::pair{&worldwide, "ww_mp_stocktest"}})
+    {
+        zone->build();
+        if (!iw8_write((output / (std::string(name) + ".ff")).string(), zone->body(), writeParams(*zone)))
+            result = 1;
+        info("build-stock: %s holds %zu assets", name, zone->assetCount());
+    }
+    return result;
+}
+
 int main(const int argc, char **argv)
 try
 {
@@ -2451,6 +2774,10 @@ try
     if (args.command == "build-map-images")
     {
         return buildMapImages(args);
+    }
+    if (args.command == "build-stock")
+    {
+        return buildStock(args);
     }
     if (args.command == "inspect")
     {

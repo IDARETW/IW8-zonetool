@@ -1,6 +1,7 @@
 #include "iw8_structs.h"
 #include "iw8_zone.h"
 #include "maps_write.h"
+#include "replay_ies.h"
 #include "replay_lightgrid.h"
 #include "replay_render.h"
 
@@ -434,7 +435,8 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
     // R_SetLightScaleInfo (197CB93) multiplies secondary diffuse by this value.
     // Zero-initializing it disables indirect light, even with a valid grid.
     stampf(gw.data(), 0x37F0, 1.0f);
-    stamp64(gw.data(), 0x648 + 0xF0, PTR_FOLLOWS); // mandatory IES lookup image
+    // Mandatory IES lookup image: the map's own strip (iw8::ies::Register).
+    stamp64(gw.data(), 0x648 + 0xF0, zw.assetAlias(ASSET_TYPE_IMAGE, iw8::ies::kLookupName));
     stamp64(gw.data(), kGW_cellVisBits,
             PTR_FOLLOWS); // REQUIRED non-null (cellCount-gated memset, no own count)
     stamp64(gw.data(), 0x3EF8, PTR_FOLLOWS); // cellHasSunLitSurfsBits[cellWordCount]
@@ -572,18 +574,8 @@ void emitGfxMapBody(ZoneWriter &zw, const char *assetName, const std::string &me
                                              lightmap.images[0].height};
         zw.write(packed.data(), sizeof(packed));
     }
-    // Load_GfxWorldDraw D96710 loads iesLookupTexture before transient zones.
-    // With no authored local lights, native white gives a neutral IES lookup.
-    // Reference the existing image; no pixels or stock image data are copied.
-    zw.pushStream(XFILE_BLOCK_TEMP_PRELOAD);
-    zw.align(15);
-    uint8_t iesImage[0xE8]{};
-    stamp64(iesImage, 0, PTR_FOLLOWS);
-    zw.write(iesImage, sizeof(iesImage));
-    zw.pushStream(XFILE_BLOCK_VIRTUAL);
-    zw.writeStr(",$white");
-    zw.popStream();
-    zw.popStream();
+    // Load_GfxWorldDraw D96710 loads iesLookupTexture before transient zones;
+    // it aliases the "*ieslookup" image registered ahead of the world.
     // Load_GfxWorldDraw D96710 visits its 1536 inline asset pointers.
     // Load_GfxWorldTransientZonePtr D970B0: stream 1, alignment 7;
     // Load_GfxWorldTransientZone D96E90: 0x148 bytes, name in VIRTUAL.

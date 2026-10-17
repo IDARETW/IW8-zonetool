@@ -1323,6 +1323,12 @@ float4 main(Input input) : SV_TARGET0 {
     color = WaterColor(input.uv.xy, normalize(input.relativePosition), direction,
                        nativeSun ? sun : 0, screenPixel, input.position.w, input.relativePosition,
                        fixedProbe, waterLuminance);
+    // IW3's water_l_sun samples no shadow map and no AO (its pixel shader binds
+    // only the normal map and the probe), but every Replay lit forward+ pass must
+    // bind GTAO, the sun visibility and the light tiles. Keep them referenced with
+    // a factor that is 1 for every value they hold: saturated samples are never
+    // the all-ones NaN pattern, and the compiler cannot fold a bit test.
+    color *= asuint(visibility + gtao) != 0xFFFFFFFFu ? 1.0 : 0.0;
 #endif
     float alpha = kind == 2 ? texel.a : 1;
     // IW3 blended surfaces (glass, ground decals) draw ONE/INVSRCALPHA with a
