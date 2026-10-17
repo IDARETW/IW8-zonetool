@@ -224,6 +224,8 @@ struct PreparedMap
     std::vector<iw8::xanim::Anim> xanims;
     std::vector<PreparedFx> fxEffects;
     std::unordered_map<std::string, std::string> fxMaterialAliases;
+    // Replay Particle_MaterialData per IW3 FX material (feather, falloff, eye offset).
+    std::unordered_map<std::string, std::array<std::uint8_t, 192>> fxParticleMaterialData;
     std::vector<iw8::vfx::Effect> vfxEffects;
     std::string vfxLightDef;
     std::string smallGlassEffect;

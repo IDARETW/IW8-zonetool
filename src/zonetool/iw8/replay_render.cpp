@@ -29,7 +29,7 @@ template <class T> void append(std::vector<uint8_t> &b, T v)
 }
 std::vector<uint8_t> unhex(const std::string &s)
 {
-    if (s.size() % 2 || s.size() > 131072)
+    if (s.size() % 2 || s.size() > 8388608)
         throw std::runtime_error("Invalid material byte data");
     std::vector<uint8_t> b;
     for (size_t i = 0; i < s.size(); i += 2)
@@ -59,7 +59,14 @@ bool nativeEffectTechset(const std::string_view name)
            name ==
                "elcq/unlit_6_effect_bad_tca_802_4_0_1_0_0_0_100060023_0_0_3_0_0" ||
            name ==
-               "elcq/unlit_6_effect_bad_ta0_802_4_0_1_0_0_0_100020023_0_0_2_0_0";
+               "elcq/unlit_6_effect_bad_ta0_802_4_0_1_0_0_0_100020023_0_0_2_0_0" ||
+           name == "elcq/dist_10_distortion_rpl_ta1_0_12_0_0_0";
+}
+
+// Stock refraction (heat haze) techset of common_mp elcq/vfx_dist_heat_1.
+bool nativeDistortionEffectTechset(const std::string_view name)
+{
+    return name == "elcq/dist_10_distortion_rpl_ta1_0_12_0_0_0";
 }
 
 bool nativeSimpleAlphaEffectTechset(const std::string_view name)
@@ -565,7 +572,17 @@ Material LoadMaterial(const std::string &path, const nlohmann::json &j,
             const bool simpleAdditive = nativeSimpleAdditiveEffectTechset(m.techset);
             const bool oneBuffer = nativeSimpleAlphaEffectTechset(m.techset) ||
                                    nativeCloudEffectTechset(m.techset) || simpleAdditive;
-            if (materialType != 0x40200Cu || m.materialInfo[0x14] != 1 ||
+            // Distortion: stock vfx_dist_heat_1 metadata (sort 36, featherParms0 +
+            // distortionScale, one buffer).
+            if (nativeDistortionEffectTechset(m.techset))
+            {
+                if (materialType != 0x40200Cu || m.materialInfo[0x11] != 36 ||
+                    m.materialInfo[0x14] != 1 || m.materialInfo[0x15] != 2 ||
+                    m.materialInfo[0x16] != 1 || m.materialInfo[0x1A] != 1 ||
+                    m.materialInfo[0x1B] != 1)
+                    throw std::runtime_error("Replay distortion material has invalid metadata");
+            }
+            else if (materialType != 0x40200Cu || m.materialInfo[0x14] != 1 ||
                 (oneBuffer ? m.materialInfo[0x15] != (simpleAdditive ? 2 : 1) ||
                                   m.materialInfo[0x16] != 1 ||
                                   m.materialInfo[0x1A] != 1 || m.materialInfo[0x1B] != 1
@@ -685,7 +702,19 @@ Material LoadMaterial(const std::string &path, const nlohmann::json &j,
                 m.buffers.front()[3].empty() && m.buffers.back()[0].size() == 160 &&
                 m.buffers.back()[1].empty() && m.buffers.back()[2].empty() &&
                 m.buffers.back()[3].size() == 144;
-            if (!common || (oneBuffer ? !oneBufferBindings : !featherBuffers))
+            // Distortion: slot 0x9D (distortionMap); technique 30's buffer holds
+            // 16 vertex bytes (featherParms0) and 96 pixel bytes (row 5 distortionScale).
+            const bool distortion = nativeDistortionEffectTechset(m.techset);
+            const bool distortionBindings =
+                m.images.size() == 1 && m.textureHeaders.size() == 8 &&
+                m.textureHeaders[0] == 0x9D &&
+                std::all_of(m.textureHeaders.begin() + 1, m.textureHeaders.end(),
+                            [](const uint8_t value) { return value == 0; }) &&
+                m.buffers.size() == 1 && m.buffers.front()[0].size() == 16 &&
+                m.buffers.front()[1].empty() && m.buffers.front()[2].empty() &&
+                m.buffers.front()[3].size() == 96;
+            if (distortion ? !distortionBindings
+                           : (!common || (oneBuffer ? !oneBufferBindings : !featherBuffers)))
                 throw std::runtime_error("Replay effect material alias has invalid bindings");
         }
         if (ownedDecalCarrier &&
@@ -1647,10 +1676,16 @@ Mesh Load(const std::string &path)
         put(sf, 32, uint8_t(castsSunShadow | sunShadowMask |
                             (sky ? 0 : umbraOccluder)));
         auto *bounds = m.bounds.data() + 56 * i;
+        // Culling bounds. Translucent surfaces write no depth, so the GPU
+        // occlusion pass tests them against the wall they sit on: IW3 signs and
+        // decal quads 0-1.4 units off their wall culled out with view angle and
+        // distance (owner, Discovery round 89; inferred cause). A wider margin
+        // keeps them conservative.
+        const float margin = opaque ? 1.0f : 16.0f;
         for (unsigned k = 0; k < 3; ++k)
         {
             put(bounds, 4 * k, (mins[k] + maxs[k]) * 0.5f);
-            put(bounds, 12 + 4 * k, (maxs[k] - mins[k]) * 0.5f + 1.0f);
+            put(bounds, 12 + 4 * k, (maxs[k] - mins[k]) * 0.5f + margin);
         }
         auto *gpu = m.surfData.data() + 88 * i;
         put(gpu, 4, uint32_t(surfaceLayout == 3 ? 4 : surfaceLayout));

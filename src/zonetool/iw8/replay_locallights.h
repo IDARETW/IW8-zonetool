@@ -16,7 +16,7 @@ struct Light
     uint8_t type = 0; // 0 null, 1 sun, 2 spot, 3 omni
     bool canUseShadowMap = false;
     std::array<float, 3> origin{};
-    std::array<float, 3> direction{};
+    std::array<float, 3> direction{}; // emission axis (= -ComPrimaryLight dir)
     float radius = 0;
     float cosHalfFovOuter = 0;
 };

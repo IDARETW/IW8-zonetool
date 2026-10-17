@@ -799,6 +799,7 @@ struct MapSun
         float cosHalfFovInner = 0.0f;
         float rotationLimit = 0.0f;
         float translationLimit = 0.0f;
+        float intensity = 1.0f; // ComPrimaryLight +0x10 (local lights: see main CalibrateLocalLights)
         std::string definition;
     };
 
@@ -807,6 +808,8 @@ struct MapSun
     float direction[3]{-0.5795004963874817f, 0.4210316836833954f, 0.6977904438972473f};
     float up[3]{};
     uint32_t sunPrimaryLightIndex = 1;
+    // Stock light units per IW3 unit (--style iw8, iw3::LightUnitScale); 1 for iw3.
+    float lightUnitScale = 1.0f;
     std::vector<PrimaryLight> primaryLights;
 };
 
@@ -856,7 +859,7 @@ inline void emitComWorldBody(ZoneBuffer &zb, const char *assetName, const MapSun
         {
             light[1] = source->type;
             light[2] = source->canUseShadowMap ? 1 : 0;
-            stampf(light, 0x10, index == 0 ? 0.0f : 1.0f);
+            stampf(light, 0x10, index == 0 ? 0.0f : source->intensity);
             for (unsigned component = 0; component < 3; ++component)
             {
                 stampf(light, 0x20 + 4 * component, source->color[component]);

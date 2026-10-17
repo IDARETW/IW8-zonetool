@@ -202,6 +202,17 @@ iw3compat_soundexists( alias )
     return iw3compat_sound_kind( alias ) != 0;
 }
 
+// IW3 map setdvar. compassMaxRange (the minimap's world range, IW3 default
+// 2500) is Replay's MKPRSSNNRO; in MP GScr_SetDvar_Internal sets it without a
+// script error (the read-only check is SP-only, game-mode feature 0xBC). Every
+// other IW3 map dvar is a renderer setting the converter owns (vision, glow,
+// specular scale) and is ignored.
+iw3compat_setdvar( name, value )
+{
+    if ( tolower( name ) == "compassmaxrange" )
+        setdvar( "MKPRSSNNRO", value );
+}
+
 // IW3 ambientPlay is a 2D loop for everyone. Each player carries the converted
 // loop, so it plays at the listener at full volume (players who connect later
 // get it too).

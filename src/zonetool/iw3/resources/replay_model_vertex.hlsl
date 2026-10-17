@@ -74,6 +74,11 @@ struct Output {
     // Static placement index (GfxWorld instance order) for per-instance
     // lighting; 0xffffffff for entities.
     nointerpolation uint instance : INSTANCE0;
+#ifdef MAP_ENTITY
+    // Camera-relative lighting origin (the surface bounds centre through its
+    // bone), read by the entity grid lighting (map_surface_realtime MAP_ENTITY_GRID).
+    nointerpolation float3 lightingOrigin : LIGHTORIGIN0;
+#endif
 };
 
 float4 DecodePlacementQuaternion(uint xy, uint zw) {
@@ -178,6 +183,30 @@ Output main(uint id : SV_VertexID) {
     float3 modelTangent;
     float binormalSign;
     DecodeTangentFrame(attributes.y, modelNormal, modelTangent, binormalSign);
+#if defined(MAP_FLAG_WAVE) && !defined(MAP_ENTITY)
+    // IW3 flag cloth (mc_l_sm_flag_*, disassembled common_mp vs_3_0 flag
+    // shaders): with u = 1 - texcoord and t = gameTime.w seconds, the vertex
+    // moves along its model normal by d(u, t) and the normal tilts by 0.025 *
+    // (dd/du.x * T + dd/du.y * B), B = cross(N, T) * sign. Replay's static-model
+    // view constants carry the game time in row 4 .w (stock wind shaders read it).
+    {
+        float2 u = 1 - float2(f16tof32(attributes.z & 0xffff), f16tof32(attributes.z >> 16));
+        float t = replayView[4].w;
+        float3 phase = float3(19.577713 * u.x + 5.24583244 * u.y + 7.53982258 * t,
+                              3.62305188 * u.x + 0.25334847 * u.y + 5.6548667 * t,
+                              8.25030613 * u.x - 1.45475161 * u.y + 9.42477798 * t);
+        // IW3 wraps each phase to [-pi, pi) before sincos.
+        phase = frac(phase * 0.159154937 + 0.5) * 6.28318548 - 3.14159274;
+        float3 s, c;
+        sincos(phase, s, c);
+        float d = 1.7 * s.x + 7.5 * s.y + 3 * s.z;
+        float dx = 33.2821121 * c.x + 27.1728897 * c.y + 24.7509193 * c.z;
+        float dy = 8.91791534 * c.x + 1.90011346 * c.y - 4.36425447 * c.z;
+        float3 binormal = cross(modelNormal, modelTangent) * binormalSign;
+        local += d * modelNormal;
+        modelNormal = normalize(modelNormal + 0.025 * (dx * modelTangent + dy * binormal));
+    }
+#endif
 #ifdef MAP_ENTITY
     uint row = 2 + surface.x * MAP_BONE_ROWS;
     precise float4 relative =
@@ -265,6 +294,12 @@ Output main(uint id : SV_VertexID) {
         o.color *= saturate(viewDepth * nearFade);
 #ifdef MAP_ENTITY
     o.instance = 0xffffffff;
+    // IW3 lights a DObj once per entity, from its origin (CG_General: script
+    // models at origin + 4 up; dynents at the pose origin): the root bone (row 2,
+    // the entity transform). The pixel shader adds the class offset or finds the
+    // entity's precomputed IW3 volume by this position.
+    o.lightingOrigin =
+        EntityPosition(2, float3(0, 0, 0), asint(replayView[MAP_VIEW_ORIGIN].xyz)).xyz;
 #else
     o.instance = surface.x;
 #endif

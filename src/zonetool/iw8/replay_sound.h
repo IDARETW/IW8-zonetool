@@ -37,6 +37,8 @@ struct Alias
     float distMin{}, distMax{};
     float probability{1};
     float lfePercentage{};
+    float centerPercentage{};                       // +124
+    float envelopMin{}, envelopMax{}, envelopPercentage{}; // +152..+160 (IW3 envelope)
     float reverbMultiplier{1};
     float farReverbMultiplier{1};
     int32_t startDelay{};

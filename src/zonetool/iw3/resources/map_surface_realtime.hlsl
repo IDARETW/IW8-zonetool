@@ -6,6 +6,13 @@
 #ifndef MAP_INDIRECT_GAIN
 #define MAP_INDIRECT_GAIN 1.0
 #endif
+// --style iw8: the scene renders in stock Replay light units (iw3::LightUnitScale,
+// IW3 sun 1.3 -> Hovec Sawmill's 26.9). Shading stays in IW3 units: the engine's
+// sun and local-light records (already scaled) are read back / scale, and every
+// output is * scale.
+#ifndef MAP_LIGHT_UNIT_SCALE
+#define MAP_LIGHT_UNIT_SCALE 1.0
+#endif
 #ifndef MAP_UNBAKED_GAIN
 #define MAP_UNBAKED_GAIN 1.0
 #endif
@@ -45,6 +52,10 @@ struct Input {
 #endif
 #ifdef STATIC_MODEL
     nointerpolation uint instance : INSTANCE0;
+#endif
+#ifdef MAP_ENTITY_GRID
+    // Camera-relative lighting origin of the drawn surface (entity VS).
+    nointerpolation float3 lightingOrigin : LIGHTORIGIN0;
 #endif
 };
 #ifdef STATIC_MODEL
@@ -106,6 +117,15 @@ float3 DecodeSrgb(float3 value) {
 // IW3 detailMap, material texture slot 0x3E (models only; worlds use it for lightmaps).
 Texture2D<float4> detailMap : register(t10);
 #endif
+#ifndef MAP_TILE_SPAN_BITS
+#define MAP_TILE_SPAN_WORDS 1
+#define MAP_TILE_SPAN_BITS {0u}
+#endif
+static const uint kTileSpanBits[MAP_TILE_SPAN_WORDS] = MAP_TILE_SPAN_BITS;
+// Atlas cells a world tile spans per axis (1, or 2 for a 2x2 block).
+float TileSpan(uint tile) {
+    return tile / 32 < MAP_TILE_SPAN_WORDS && ((kTileSpanBits[tile / 32] >> (tile % 32)) & 1) ? 2 : 1;
+}
 float3
 SourceWorldNormal(Input input, uint flags, float2 atlasUV, float lod, out float3 tangentNormal) {
     tangentNormal = float3(0, 0, 1);
@@ -150,33 +170,6 @@ float3 SourceIndirect(float2 uv, float3 first, float3 tangentNormal) {
     float2 slope = raw * float2(4.08, 4.06451607) - float2(2.08, 2.06451607);
     float response = saturate(dot(normalize(float3(slope, 1)), tangentNormal));
     return first * tangentNormal.z + second * response;
-}
-float3 SourceSunSpecular(Input input,
-                         uint flags,
-                         float2 uv,
-                         float lod,
-                         float3 normal,
-                         float3 sunDirection,
-                         float3 sun,
-                         float visibility,
-                         float variance) {
-    if ((flags & 64) == 0 || visibility <= 0)
-        return 0;
-#ifdef STATIC_MODEL
-    float4 raw = sourceResponseAtlas.SampleBias(colorSampler, uv, replayView[7].y);
-#else
-    float4 raw = sourceResponseAtlas.SampleLevel(colorSampler, uv, lod);
-#endif
-    float3 view = normalize(-input.relativePosition);
-    float3 reflected = reflect(-view, normal);
-    float sourceExponent = exp2(raw.a * 9.3775177) + 7;
-    // A widened lobe keeps its energy: scale by the normalisation ratio.
-    float exponent = FilteredPower(sourceExponent, variance);
-    float lobe = saturate(exp((dot(reflected, sunDirection) - .99925) * exponent)) *
-                 (exponent + 2) / (sourceExponent + 2);
-    float fresnel = pow(saturate(1 - abs(dot(view, normal))), input.materialParameters.z);
-    float response = lerp(input.materialParameters.x, input.materialParameters.y, fresnel);
-    return raw.rgb * response * input.materialParameters.w * lobe * sun * visibility;
 }
 #endif
 
@@ -237,27 +230,39 @@ float BakedSunVisibility(float3 world, float3 normal) {
 #endif
 
 #ifdef MAP_INSTANCE_LIGHTING
-// IW3 lights static models from its light grid at the model's lighting origin.
-// The converter stores one ambient cube per placement (+X,-X,+Y,-Y,+Z,-Z, IW3
-// grid shading values / 2, 256 placements per row), indexed by the placement.
+// IW3 lights static models through its model-lighting volume: per placement a
+// 4x4x4 RGBA8 grid of light-grid colours (alpha = sun weight) that the lit model
+// shaders (ps_lp_*) sample with uvw = base + N / max|N| * 1.5 texels
+// (lightingLookupScale) and trilinear filtering; ambient = 2 * colour. The
+// converter writes each placement's volume as IW3 does (R_SetStaticModelLighting)
+// into a 16 x 5 block (texel (x, y, z) at (x + 4z, y)), 256 blocks per row.
 Texture2D<float4> instanceLighting : register(t6);
-float3 InstanceAmbient(uint instance, float3 n) {
-    int x = (instance % 256) * 6, y = instance / 256;
-    float3 square = n * n;
-    float3 ambient =
-        square.x * instanceLighting.Load(int3(x + (n.x >= 0 ? 0 : 1), y, 0)).rgb +
-        square.y * instanceLighting.Load(int3(x + (n.y >= 0 ? 2 : 3), y, 0)).rgb +
-        square.z * instanceLighting.Load(int3(x + (n.z >= 0 ? 4 : 5), y, 0)).rgb;
-    return ambient * 2;
+int2 InstanceBlock(uint instance) {
+    return int2((instance % 256) * 16, (instance / 256) * 5);
 }
-// IW3's baked sun visibility at the instance (light-grid primary light = sun).
+float4 InstanceTexel(int2 block, int3 t) {
+    return instanceLighting.Load(int3(block.x + t.x + 4 * t.z, block.y + t.y, 0));
+}
+float3 InstanceAmbient(uint instance, float3 n) {
+    int2 block = InstanceBlock(instance);
+    float3 c = n / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-6)) * 1.5 + 1.5;
+    int3 i = min((int3)floor(c), 2);
+    float3 f = c - i;
+    float3 x00 = lerp(InstanceTexel(block, i).rgb, InstanceTexel(block, i + int3(1, 0, 0)).rgb, f.x);
+    float3 x10 = lerp(InstanceTexel(block, i + int3(0, 1, 0)).rgb, InstanceTexel(block, i + int3(1, 1, 0)).rgb, f.x);
+    float3 x01 = lerp(InstanceTexel(block, i + int3(0, 0, 1)).rgb, InstanceTexel(block, i + int3(1, 0, 1)).rgb, f.x);
+    float3 x11 = lerp(InstanceTexel(block, i + int3(0, 1, 1)).rgb, InstanceTexel(block, i + int3(1, 1, 1)).rgb, f.x);
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z) * 2;
+}
+// IW3's sun weight for the instance (the model-lighting alpha).
 float InstanceSunVisibility(uint instance) {
-    return instanceLighting.Load(int3((instance % 256) * 6, instance / 256, 0)).a;
+    return InstanceTexel(InstanceBlock(instance), int3(0, 0, 0)).a;
 }
 // The instance's IW3 reflection probe as a converted slot (-1: none), stored
-// as slot + 1 in the alpha of face 1.
+// as slot + 1 in the alpha of block texel (0, 4).
 int InstanceReflectionProbe(uint instance) {
-    return (int)round(instanceLighting.Load(int3((instance % 256) * 6 + 1, instance / 256, 0)).a * 255) - 1;
+    int2 block = InstanceBlock(instance);
+    return (int)round(instanceLighting.Load(int3(block.x, block.y + 4, 0)).a * 255) - 1;
 }
 #endif
 
@@ -288,8 +293,113 @@ float3 LightVolumeAmbient(float3 world, float3 n) {
 }
 #endif
 
-#ifdef MAP_IW8_LIGHTING
-// --lighting-style iw8: Replay's clustered reflection probes, read the way the
+#ifdef MAP_ENTITY_GRID
+// Entities (DObjs) lit as IW3's R_GetLightingAtPoint + lit model shaders do:
+// trilinear corner weights of the IW3 light grid at the lighting origin
+// (entries missing at a corner are skipped; no entry at all -> palette colour 1,
+// R_ExtrapolateLightingAtPoint), the corners' 56-colour sets blended, then the
+// 4x4x4 model-lighting volume (R_SetLightGridColors layout) sampled by the
+// normal with lightingLookupScale's 1.5-texel reach; ambient = 2 * colour.
+// IW3's per-corner sight traces (CM_BoxSightTrace) are not reproduced.
+Texture2D<float4> entityGrid : register(t6);
+static const uint kModelLightingTexelColors[64] = {
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 0,  3,  21, 22, 12, 15, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 40, 43, 33, 34, 52, 55, 35, 36, 37, 38, 39,
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55};
+float4 EntityGridTexel(uint index) {
+    return entityGrid.Load(int3(index % MAP_ENTITY_GRID_WIDTH, index / MAP_ENTITY_GRID_WIDTH, 0));
+}
+#ifndef MAP_ENTITY_PRESET_COUNT
+#define MAP_ENTITY_PRESET_START 0u
+#define MAP_ENTITY_PRESET_COUNT 0u
+#endif
+// A raw float stored as an RGBA8 texel's bytes.
+float EntityGridFloat(uint index) {
+    uint4 b = (uint4)round(EntityGridTexel(index) * 255);
+    return asfloat(b.r | (b.g << 8) | (b.b << 16) | (b.a << 24));
+}
+// Entity presets (iw3_fastfile): per entity 68 texels — its root origin as three
+// floats, a spare texel, then IW3's 4x4x4 volume (texel x + 4y + 16z) computed
+// at its spawn origin with R_LightGridLookup's corner sight traces.
+int EntityPreset(float3 root) {
+    [loop] for (uint k = 0; k < MAP_ENTITY_PRESET_COUNT; ++k) {
+        uint base = MAP_ENTITY_PRESET_START + k * 68;
+        float3 origin = float3(EntityGridFloat(base), EntityGridFloat(base + 1), EntityGridFloat(base + 2));
+        if (all(abs(origin - root) < .5))
+            return (int)base + 4;
+    }
+    return -1;
+}
+// IW3's model-lighting sampler on a preset volume (as InstanceAmbient).
+float3 EntityPresetAmbient(uint volume, float3 n) {
+    float3 c = n / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-6)) * 1.5 + 1.5;
+    int3 i = min((int3)floor(c), 2);
+    float3 f = c - i;
+    float3 v[8];
+    [unroll] for (uint corner = 0; corner < 8; ++corner) {
+        int3 t = i + int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
+        v[corner] = EntityGridTexel(volume + (uint)t.x + 4 * (uint)t.y + 16 * (uint)t.z).rgb;
+    }
+    float3 x00 = lerp(v[0], v[1], f.x), x10 = lerp(v[2], v[3], f.x);
+    float3 x01 = lerp(v[4], v[5], f.x), x11 = lerp(v[6], v[7], f.x);
+    return lerp(lerp(x00, x10, f.y), lerp(x01, x11, f.y), f.z) * 2;
+}
+float3 EntityGridAmbient(float3 root, float3 n) {
+    int preset = EntityPreset(root);
+    if (preset >= 0)
+        return EntityPresetAmbient((uint)preset, n);
+    // Moved entity: the runtime lookup at the script-model lighting origin
+    // (root + 4 up), without IW3's corner sight traces.
+    float3 world = root + float3(0, 0, 4);
+    float3 g = (world + 131072) / float3(32, 32, 64);
+    int3 base = (int3)floor(g);
+    float3 f = g - base;
+    uint colors[8];
+    float weights[8];
+    float total = 0;
+    [unroll] for (uint corner = 0; corner < 8; ++corner) {
+        int3 p = base + int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1) - MAP_ENTITY_GRID_MIN;
+        float w = ((corner & 1) ? f.x : 1 - f.x) * ((corner & 2) ? f.y : 1 - f.y) *
+                  ((corner & 4) ? f.z : 1 - f.z);
+        uint color = 0;
+        if (all(p >= 0) && all(p < MAP_ENTITY_GRID_DIMS)) {
+            uint4 t = (uint4)round(EntityGridTexel(
+                (uint)p.x + (uint)MAP_ENTITY_GRID_DIMS.x * ((uint)p.y + (uint)MAP_ENTITY_GRID_DIMS.y * (uint)p.z)) * 255);
+            color = t.r + t.g * 256;
+        }
+        colors[corner] = color ? color - 1 : 0;
+        weights[corner] = color && w >= .001 ? w : 0; // EQUAL_EPSILON
+        total += weights[corner];
+    }
+    if (total <= 0) {
+        colors[0] = 1;
+        weights[0] = 1;
+        total = 1;
+        [unroll] for (uint other = 1; other < 8; ++other)
+            weights[other] = 0;
+    }
+    float3 c = n / max(max(abs(n.x), abs(n.y)), max(abs(n.z), 1e-6)) * 1.5 + 1.5;
+    int3 i = min((int3)floor(c), 2);
+    float3 fr = c - i;
+    float3 result = 0;
+    [loop] for (uint texel = 0; texel < 8; ++texel) {
+        int3 t = i + int3(texel & 1, (texel >> 1) & 1, (texel >> 2) & 1);
+        float tw = ((texel & 1) ? fr.x : 1 - fr.x) * ((texel & 2) ? fr.y : 1 - fr.y) *
+                   ((texel & 4) ? fr.z : 1 - fr.z);
+        uint sample = kModelLightingTexelColors[t.x + 4 * t.y + 16 * t.z];
+        float3 blended = 0;
+        [loop] for (uint corner2 = 0; corner2 < 8; ++corner2)
+            if (weights[corner2] > 0)
+                blended += weights[corner2] *
+                           EntityGridTexel(MAP_ENTITY_GRID_PALETTE + colors[corner2] * 56 + sample).rgb;
+        result += tw * blended;
+    }
+    return result / total * 2;
+}
+#endif
+
+// Replay's clustered reflection probes (both styles), read the way the
 // stock lit forward+ shaders read them (the engine binds these for every lit
 // pass): z-bin probe ranges t47, per-cluster probe bitmasks t46, probe
 // parameters t44 (camera-relative projection origin, image index, inverse
@@ -331,6 +441,13 @@ float2 ProbeOctahedral(float3 d) {
 // that probe alone, as IW3 did: the blend let large outdoor boxes darken the
 // Discovery ice cave with night sky until the reflection pointed at the snow
 // (owner test 2026-10-16).
+#ifdef MAP_PROBE_LEVELS
+// Per probe image slice: stored value x level = IW3's radiance (rgb * a, linear).
+static const float probeLevels[] = MAP_PROBE_LEVELS;
+#endif
+// Level of the last ProbeReflection blend (same weights).
+static float probeBlendLevel = 1;
+
 float3 ProbeReflection(float2 screenPixel, float viewDepth, float3 relativePosition,
                        float3 reflected, float gloss, int fixedProbe) {
     float mip = floor(5 - 5 * gloss);
@@ -342,6 +459,7 @@ float3 ProbeReflection(float2 screenPixel, float viewDepth, float3 relativePosit
     probeBoxes.GetDimensions(count, stride);
     float3 sum = 0;
     float total = 0;
+    float levelSum = 0;
     bool fixedSlot = fixedProbe >= 0 && (uint)fixedProbe < min(count, 256u);
     [loop] for (uint probe = fixedSlot ? (uint)fixedProbe : 0;
                 probe < (fixedSlot ? (uint)fixedProbe + 1 : min(count, 256u)); ++probe) {
@@ -382,8 +500,64 @@ float3 ProbeReflection(float2 screenPixel, float viewDepth, float3 relativePosit
         float3 b = probeImages.SampleLevel(probeSampler, float3(uv * scale.y + bias.y, slot), mip + 1).rgb;
         sum += lerp(a, b, blend) * weight;
         total += weight;
+#ifdef MAP_PROBE_LEVELS
+        levelSum += probeLevels[(uint)slot] * weight;
+#else
+        levelSum += weight;
+#endif
     }
+    probeBlendLevel = total > 0 ? levelSum / total : 1;
     return total > 0 ? sum / total : 0;
+}
+
+// IW3 probe radiance in its gamma space (rgb * a; probe images are stored as
+// linear luminance, MAP_PROBE_LEVELS restores the absolute level).
+float3 Iw3ProbeRadiance(float2 screenPixel, float viewDepth, float3 relativePosition,
+                        float3 reflected, float lod, int fixedProbe) {
+    // IW3's 64-texel cubes sampled at lod = 6 - 8 * gloss; the 256-texel
+    // octahedral array is two levels larger (ProbeReflection: mip = 5 - 5g).
+    float gloss = saturate((3 - lod) / 5);
+    float3 probe = ProbeReflection(screenPixel, viewDepth, relativePosition, reflected, gloss,
+                                   fixedProbe) * probeBlendLevel;
+    return pow(max(probe, 0), 1.0 / 2.2);
+}
+
+#if MAP_SOURCE_CHANNELS
+// --style iw3 specular (disassembled ps_lm_sun_r0c0s0 and kin): specular map x
+// lerp(envMapParms.x, .y, (1 - |N.V|)^.z) x (probe(rgb * a, lod 6 - 8 gloss)
+// + sunSpecular x envMapParms.w x lobe x shadow), in IW3's gamma space. The
+// probe term was missing before round 95: iw3-style surfaces reflected nothing.
+float3 SourceSunSpecular(Input input,
+                         uint flags,
+                         float2 uv,
+                         float lod,
+                         float3 normal,
+                         float3 sunDirection,
+                         float3 sun,
+                         float visibility,
+                         float variance,
+                         float2 screenPixel,
+                         int fixedProbe) {
+    if ((flags & 64) == 0)
+        return 0;
+#ifdef STATIC_MODEL
+    float4 raw = sourceResponseAtlas.SampleBias(colorSampler, uv, replayView[7].y);
+#else
+    float4 raw = sourceResponseAtlas.SampleLevel(colorSampler, uv, lod);
+#endif
+    float3 view = normalize(-input.relativePosition);
+    float3 reflected = reflect(-view, normal);
+    float sourceExponent = exp2(raw.a * 9.3775177) + 7;
+    // A widened lobe keeps its energy: scale by the normalisation ratio.
+    float exponent = FilteredPower(sourceExponent, variance);
+    float lobe = saturate(exp((dot(reflected, sunDirection) - .99925) * exponent)) *
+                 (exponent + 2) / (sourceExponent + 2);
+    float fresnel = pow(saturate(1 - abs(dot(view, normal))), input.materialParameters.z);
+    float response = lerp(input.materialParameters.x, input.materialParameters.y, fresnel);
+    float3 probe = Iw3ProbeRadiance(screenPixel, input.position.w, input.relativePosition,
+                                    reflected, 6 - 8 * raw.a, fixedProbe);
+    float3 sunTerm = visibility > 0 ? input.materialParameters.w * lobe * sun * visibility : 0;
+    return raw.rgb * response * (probe + sunTerm);
 }
 #endif
 
@@ -500,6 +674,84 @@ float3 GlassEnvironment(float3 d) {
 }
 #endif
 
+#ifdef MAP_WATER
+// IW3 wc_water (water_l_sun, disassembled shader_bin vs/ps; KisakCOD
+// r_water.cpp). IW3 rebuilt its 64x64 L8 wave map on the CPU every frame from
+// the material's FFT spectrum at the game time; the converter bakes it as a
+// looping flipbook: MAP_WATER_FRAMES frames over MAP_WATER_PERIOD seconds, 16 x 16
+// tiles of 64 texels with four consecutive frames in each texel's channels.
+// IW3 samples it bilinear, wrapped, without mips.
+Texture2D<float4> waterFlipbook : register(t10);
+
+float4 WaterTexels(int2 texel, uint frame) {
+    uint tile = frame >> 2;
+    return waterFlipbook.Load(int3(int2(tile & 15, tile >> 4) * 64 + (texel & 63), 0));
+}
+
+// Bilinear water-map height at uv for two consecutive frames.
+float2 WaterMap(float2 uv, uint frame, uint next) {
+    float2 p = uv * 64 - .5;
+    float2 base = floor(p);
+    float2 f = p - base;
+    int2 i = (int2)base;
+    bool sameTile = (frame >> 2) == (next >> 2);
+    float2 corner[4];
+    [unroll] for (uint k = 0; k < 4; ++k) {
+        int2 t = i + int2(k & 1, k >> 1);
+        float4 a = WaterTexels(t, frame);
+        float4 b = sameTile ? a : WaterTexels(t, next);
+        corner[k] = float2(a[frame & 3], b[next & 3]);
+    }
+    return lerp(lerp(corner[0], corner[1], f.x), lerp(corner[2], corner[3], f.x), f.y);
+}
+
+float WaterSample(float2 uv, uint frame, uint next, float blend) {
+    float2 h = WaterMap(uv, frame, next);
+    return lerp(h.x, h.y, blend);
+}
+
+// IW3: three octaves, uv x 3.7 and weight x .6 each.
+float WaterHeight(float2 uv, uint frame, uint next, float blend) {
+    return WaterSample(uv, frame, next, blend) + .6 * WaterSample(uv * 3.7, frame, next, blend) +
+           .36 * WaterSample(uv * 13.69, frame, next, blend);
+}
+
+// IW3 water_l_sun colour before fog, in IW3 light units. view: eye to point.
+// environment(R) is the probe radiance; IW3 read its cube at (R.xy, |R.z|) as
+// saturate(rgb * a * 4). Composition in IW3's gamma-encoded framebuffer.
+float3 WaterColor(float2 uv, float3 view, float3 sunDirection, float3 sun, float2 screenPixel,
+                  float viewDepth, float3 relativePosition, int fixedProbe, float luminance) {
+    // Game time: world view constants row 4 .w (stock world VS read cb2[4].w).
+    float position = frac(replayView[4].w / MAP_WATER_PERIOD) * MAP_WATER_FRAMES;
+    uint frame = min((uint)position, MAP_WATER_FRAMES - 1);
+    uint next = (frame + 1) % MAP_WATER_FRAMES;
+    float blend = position - floor(position);
+    float h = WaterSample(uv * .5, frame, next, blend);
+    float2 shifted = uv + (.5 - h) * view.xy * .0234375;
+    float h0 = WaterHeight(shifted, frame, next, blend);
+    float hx = WaterHeight(shifted + float2(1.0 / 256, 0), frame, next, blend);
+    float hy = WaterHeight(shifted + float2(0, 1.0 / 256), frame, next, blend);
+    float3 normal = normalize(float3(hx - h0, hy - h0, 1));
+    float facing = dot(view, normal);
+    float3 reflected = view - 2 * facing * normal;
+    float3 lookup = float3(reflected.xy, abs(reflected.z));
+    float3 probe = 0;
+#ifdef MAP_IW8_LIGHTING
+    probe = ProbeReflection(screenPixel, viewDepth, relativePosition, normalize(lookup), 1,
+                            fixedProbe) * luminance;
+#elif defined(MAP_GLASS_SH)
+    probe = GlassEnvironment(normalize(lookup));
+#endif
+    probe = saturate(probe);
+    float fresnel = saturate(lerp(MAP_WATER_ENV.x, MAP_WATER_ENV.y,
+                                  pow(saturate(1 - abs(facing)), MAP_WATER_ENV.z)));
+    float3 encoded = lerp(MAP_WATER_COLOR * normal.z, pow(probe, 1.0 / 2.2), fresnel);
+    float glint = pow(fresnel * max(dot(reflected, sunDirection) + .00075, 0), 64);
+    encoded += glint * pow(sun, 1.0 / 2.2) * MAP_WATER_ENV.w;
+    return pow(max(encoded, 0), 2.2);
+}
+#endif
+
 // Replay local lights (converted IW3 primary lights: spots and omnis), ported
 // from the stock lit forward+ pixel shader (techsets_mp_rust, 2026-10-15).
 // Lists: 8x8 screen tile x view-depth bin, as the probe clusters: t52[depth >> 5]
@@ -507,7 +759,7 @@ float3 GlassEnvironment(float3 d) {
 // t49 record (96 bytes): +0 colour, +16 spot axis (pointing back toward the
 // light), shadow slot in the low byte of +28, +28 flags (type at bits 8-9, 2 = spot) and line axis, +48
 // camera-relative origin and 1 / radius, +64 cone scale and bias, apex offset
-// and window, +92 the falloff curve range (two halves) into t122.
+// and window (1 / ComPrimaryLight distance falloff), +44 bulb radius, +92 the falloff curve range (two halves) into t122.
 // Shadows: the screen-space mask t94 when cb7[109].x is negative (bytes for
 // the first four shadowed lights in .x, then bits of .y); otherwise the spot
 // shadow array t93 through t41's 96-byte records (projection rows +32..+80,
@@ -625,13 +877,21 @@ void LocalLighting(float2 screenPixel, float viewDepth, float3 relativePosition,
                 }
                 shadow = lerp(1, shadow, spot ? 1 : spotFactor);
             }
-            float ndotl = saturate(dot(normal, direction));
-            float3 radiance = LocalLightFloat3(light, 0) * attenuation * shadow;
-            diffuse += radiance * ndotl;
+            // The record colour is sphere-light radiance (intensity * colour / bulb^2,
+            // 0x19A9020); the stock shader turns it into irradiance with this
+            // horizon-clipped sphere form factor (bulb radius at +44), ~ N.L * bulb^2 / d^2.
+            float ndotl = dot(normal, direction);
+            float sinSquared = LocalLightFloat(light, 44) / max(distance, 1e-4);
+            sinSquared *= sinSquared;
+            float h = ndotl * rsqrt(max(sinSquared, 1e-12));
+            float formFactor = h * h < 1 ? pow(saturate(sinSquared * (.5 * h + .5)), 1.5)
+                                         : saturate(ndotl * sinSquared);
+            float3 irradiance = LocalLightFloat3(light, 0) * attenuation * shadow * formFactor;
+            diffuse += irradiance;
             float3 halfway = normalize(view + direction);
             float distribution = (power + 2) * .5 * pow(saturate(dot(normal, halfway)), power);
             float3 fresnel = f0 + (1 - f0) * pow(1 - saturate(dot(view, halfway)), 5);
-            specular += fresnel * distribution * .25 * radiance * ndotl;
+            specular += fresnel * distribution * .25 * irradiance;
         }
     }
 }
@@ -668,9 +928,12 @@ float4 main(Input input) : SV_TARGET0 {
     texel.rgb = DecodeSrgb(max(gammaColor, 0));
 #endif
 #else
-    float2 cellSize = ATLAS_SIZE.0 / ATLAS_COLUMNS;
-    float2 tileOrigin = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * cellSize;
-    float maxLod = log2(cellSize.x) - 2;
+    // Tiles are one atlas cell, or a 2x2 block for sources twice the cell
+    // (MAP_TILE_SPAN_BITS); the atlas mip chain ends at the base cell's 4x4.
+    float2 baseCell = ATLAS_SIZE.0 / ATLAS_COLUMNS;
+    float2 cellSize = baseCell * TileSpan(tile);
+    float2 tileOrigin = float2(tile % ATLAS_COLUMNS, tile / ATLAS_COLUMNS) * baseCell;
+    float maxLod = log2(baseCell.x) - 2;
     // Derivatives must use the continuous UV, before frac introduces tile seams.
     float2 uvDx = ddx(mappedUv);
     float2 uvDy = ddy(mappedUv);
@@ -703,6 +966,26 @@ float4 main(Input input) : SV_TARGET0 {
         texel += sourceAtlas.SampleLevel(colorSampler, tapPixel / ATLAS_SIZE.0, colorLod);
     }
     texel /= taps;
+#ifdef MAP_WORLD_DETAIL_TILE
+    // IW3 world detail (wc_*d0*, disassembled ps_lm_sun_r0c0d0n0s0_sm3): colour +
+    // detail(uv * detailScale.xy) - 0.5 in IW3's gamma space, before the vertex
+    // colour. The detail image has its own colour-atlas tile.
+    {
+        float2 detailUv = mappedUv * MAP_DETAIL_SCALE;
+        float2 detailCell = baseCell * TileSpan(MAP_WORLD_DETAIL_TILE);
+        float2 detailOrigin = float2(MAP_WORLD_DETAIL_TILE % ATLAS_COLUMNS,
+                                     MAP_WORLD_DETAIL_TILE / ATLAS_COLUMNS) * baseCell;
+        float detailFootprint = max(length(uvDx * MAP_DETAIL_SCALE * detailCell),
+                                    length(uvDy * MAP_DETAIL_SCALE * detailCell));
+        float detailLod = clamp(log2(max(1.0, detailFootprint)), 0, maxLod);
+        float detailBorder = .5 * exp2(ceil(detailLod));
+        float2 detailPixel = detailOrigin + clamp(.5 + frac(detailUv) * (detailCell - 1), detailBorder,
+                                                  detailCell - detailBorder);
+        float3 detail = SourceData(
+            sourceAtlas.SampleLevel(colorSampler, detailPixel / ATLAS_SIZE.0, detailLod).rgb);
+        texel.rgb = DecodeSrgb(max(SourceData(texel.rgb) + detail - .5, 0));
+    }
+#endif
 #endif
     texel *= input.color;
     uint alphaTest = (flags >> 3) & 3;
@@ -739,7 +1022,7 @@ float4 main(Input input) : SV_TARGET0 {
         ApplyDecals(input.relativePosition, normalize(input.normal), screenUV, input.position.w,
                     texel.rgb, shadingNormal);
     float3 direction = replayLighting[56].xyz;
-    float3 sun = max(0, replayLighting[57].xyz);
+    float3 sun = max(0, replayLighting[57].xyz) / MAP_LIGHT_UNIT_SCALE;
     bool nativeSun = replayLighting[56].w != 0;
     float ndotl = nativeSun ? saturate(dot(shadingNormal, direction)) : 0;
     float visibility = 1;
@@ -819,6 +1102,11 @@ float4 main(Input input) : SV_TARGET0 {
         indirect = LightVolumeAmbient(input.relativePosition + replayView[4].xyz, shadingNormal) *
                    MAP_INDIRECT_GAIN;
 #endif
+#ifdef MAP_ENTITY_GRID
+    if (input.instance == 0xffffffff)
+        indirect = EntityGridAmbient(input.lightingOrigin + replayView[4].xyz, shadingNormal) *
+                   MAP_INDIRECT_GAIN;
+#endif
     if ((flags & 4) != 0) {
         float4 lm = sourceAtlas.SampleLevel(colorSampler, saturate(input.lightmapUV), 0);
         // Both styles keep IW3's baked sun visibility: native shadows alone
@@ -846,6 +1134,11 @@ float4 main(Input input) : SV_TARGET0 {
             indirect = baked * 2 * MAP_INDIRECT_GAIN;
 #endif
     }
+#ifdef MAP_WATER
+    // Probe scale for the water reflection: the baked irradiance luminance,
+    // as the lit surfaces' environment specular.
+    float waterLuminance = dot(indirect, float3(.2126, .7152, .0722));
+#endif
     // The shipped world forward shader scales baked irradiance by cb7[43].z and
     // occludes only that indirect term with GTAO, using the multi-bounce form
     // ao / (1 - min(albedo, .85) * (1 - ao)). Direct sun is never occluded by AO.
@@ -853,6 +1146,8 @@ float4 main(Input input) : SV_TARGET0 {
                                 replayLighting[47].y);
     float gtao = lerp(1.0, gtaoSample, replayLighting[47].x);
     float3 bounce = 1 - min(texel.rgb, .85) * (1 - gtao);
+    // --style iw8 window glass (blended glass, not decal or grime layers).
+    bool iw8Window = false;
 #ifdef MAP_IW8_LIGHTING
     // Stock environment specular: probe radiance scaled by the local baked
     // irradiance luminance (rough surfaces fall back to that irradiance,
@@ -889,6 +1184,18 @@ float4 main(Input input) : SV_TARGET0 {
         // highlight than IW3's.
         gloss = log2(exp2(response.a * 9.3775177) + 7) / 13;
         f90 = saturate(dot(f0, 16.5));
+    }
+#endif
+#ifdef MAP_IW8_LIGHTING
+    // --style iw8 window glass (blended glass, not decal or grime layers):
+    // reflection computed in the glass path below (IW3's strength, local
+    // probe), added unscaled by coverage (premultiplied). The "brown windows"
+    // were panes drawing atlas tile 0 (fixed in the converter, round 92).
+    if (kind == 2 && (flags & 2048) == 0 && !layer && !decalLayer) {
+        iw8Window = true;
+        f0 = .04;
+        f90 = 1;
+        gloss = max(gloss, .9);
     }
 #endif
     gloss = FilteredGloss(gloss, specularVariance);
@@ -960,7 +1267,7 @@ float4 main(Input input) : SV_TARGET0 {
         LocalLighting(screenPixel, input.position.w, input.relativePosition, shadingNormal,
                       normalize(-input.relativePosition), .04, .3, localDiffuse, localSpecular);
 #endif
-        color += texel.rgb * localDiffuse + localSpecular;
+        color += (texel.rgb * localDiffuse + localSpecular) / MAP_LIGHT_UNIT_SCALE;
     }
 #endif
 #if defined(MAP_IW8_LIGHTING) && defined(MAP_SUN_SPRITE) && MAP_DEBUG_MODE == 0
@@ -993,15 +1300,29 @@ float4 main(Input input) : SV_TARGET0 {
         specular = fresnel * distribution * visibilityTerm * ndotl * sun * visibility;
     }
     specular += environmentSpecular;
-    color += specular;
+    if (!iw8Window)
+        color += specular;
 #elif MAP_SOURCE_CHANNELS && MAP_DEBUG_MODE == 0
     // --style iw3: IW3 added its sun specular in the gamma-encoded framebuffer
     // (like its fog); added linearly it over-brightened dark surfaces.
-    if (!unlit && nativeSun) {
+    // Window glass reflects in the glass path below (unscaled by coverage).
+    if (!unlit && !(kind == 2 && !layer && !decalLayer)) {
+        int surfaceProbe = fixedProbe;
+#if defined(STATIC_MODEL) && defined(MAP_INSTANCE_LIGHTING)
+        if (input.instance != 0xffffffff)
+            surfaceProbe = InstanceReflectionProbe(input.instance);
+#endif
         specular = SourceSunSpecular(input, flags, sampleUV, lod, shadingNormal, direction,
-                                     pow(sun, 1.0 / 2.2), visibility, specularVariance);
+                                     nativeSun ? pow(sun, 1.0 / 2.2) : 0, visibility,
+                                     specularVariance, screenPixel, surfaceProbe);
         color = pow(pow(max(color, 0), 1.0 / 2.2) + specular, 2.2);
     }
+#endif
+#ifdef MAP_WATER
+    // IW3 water is unlit apart from its probe reflection and sun glint.
+    color = WaterColor(input.uv.xy, normalize(input.relativePosition), direction,
+                       nativeSun ? sun : 0, screenPixel, input.position.w, input.relativePosition,
+                       fixedProbe, waterLuminance);
 #endif
     float alpha = kind == 2 ? texel.a : 1;
     // IW3 blended surfaces (glass, ground decals) draw ONE/INVSRCALPHA with a
@@ -1010,29 +1331,32 @@ float4 main(Input input) : SV_TARGET0 {
     // a decal's transparent strip with the dark environment at grazing angles
     // (Nuketown's black curb strip, owner test 2026-10-15).
     float3 reflection = 0;
-#ifdef MAP_GLASS_SH
-    // Translucent surfaces get no deferred probe reflection in Replay, so
-    // evaluate the map's captured environment here.
+    // Window glass (blended glass, not decal or grime layers), both styles:
+    // IW3's reflection (lm_sun_b0c0s0, disassembled): specular map x
+    // lerp(envMapParms.x, .y, (1 - |N.V|)^.z) x probe (rgb * a, lod 6 - 8 gloss),
+    // in IW3's gamma space, added unscaled by coverage (premultiplied), from the
+    // pane's local probe at IW3's own radiance. History: rounds 90-92 drew no
+    // reflection (glass is not a surface-lit kind: "almost invisible"); round
+    // 93's map-average level washed panes white; before, the IW3 style used an
+    // approximation on the map-average SH.
     if (kind == 2 && !layer && !decalLayer)
     {
         float3 view = normalize(-input.relativePosition);
-        float fresnel = pow(1 - saturate(abs(dot(view, shadingNormal))),
+        float fresnel = pow(saturate(1 - abs(dot(view, shadingNormal))),
                             max(input.materialParameters.z, 1));
-        float response = 1;
+        float4 glassSpecular = 0;
 #if MAP_SOURCE_CHANNELS
+        // IW3 reflects only on materials with a specular map (s0 techsets).
         if ((flags & 64) != 0)
-            response = sourceResponseAtlas.SampleLevel(colorSampler, sampleUV, lod).g;
+            glassSpecular = sourceResponseAtlas.SampleLevel(colorSampler, sampleUV, lod);
 #endif
-        // IW3 reflects only on materials with a specular map (s0 techsets):
-        // blended decals, carpets and posters get no environment film.
-        if ((flags & 64) == 0)
-            response = 0;
-        float reflectivity = saturate(response * input.materialParameters.w * lerp(.08, 1, fresnel));
-        float3 environment =
-            GlassEnvironment(reflect(-view, shadingNormal)) * replayLighting[43].z * 2;
-        reflection = environment * reflectivity;
+        float3 probe = Iw3ProbeRadiance(screenPixel, input.position.w, input.relativePosition,
+                                        reflect(-view, shadingNormal), 6 - 8 * glassSpecular.a,
+                                        fixedProbe);
+        float3 strength = glassSpecular.rgb *
+                          lerp(input.materialParameters.x, input.materialParameters.y, fresnel);
+        reflection = pow(max(strength * probe, 0), 2.2);
     }
-#endif
     // IW3 setExpFog: saturate(exp(-density * (distance - start))), with density
     // ln2 / halfway. The sky is not fogged in IW3.
     float fogFactor = 1;
@@ -1065,7 +1389,8 @@ float4 main(Input input) : SV_TARGET0 {
     // hard-ended sheets without it (Gulag, owner test 2026-10-16). Additive
     // layers blend ONE/ONE, srcalpha-additive ones included.
     if ((flags & 256) != 0)
-        return float4(min(color * alpha * fogFactor * replayLighting[42].x, 32255.0), alpha);
+        return float4(min(color * alpha * fogFactor * MAP_LIGHT_UNIT_SCALE * replayLighting[42].x, 32255.0),
+                      alpha);
 #if defined(MAP_FOG) && MAP_DEBUG_MODE == 0
     // Blended toward the fog colour in CoD4's gamma-encoded framebuffer.
     if (!sky)
@@ -1074,7 +1399,9 @@ float4 main(Input input) : SV_TARGET0 {
         color = pow(lerp(MAP_FOG_COLOR, encoded, fogFactor), 2.2);
     }
 #endif
+    if (iw8Window)
+        reflection += specular;
     if (kind == 2)
         color = color * alpha + reflection * fogFactor;
-    return float4(min(color * replayLighting[42].x, 32255.0), alpha);
+    return float4(min(color * MAP_LIGHT_UNIT_SCALE * replayLighting[42].x, 32255.0), alpha);
 }

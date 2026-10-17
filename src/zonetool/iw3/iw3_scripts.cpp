@@ -57,7 +57,7 @@ const std::set<std::string> &DroppedBuiltins()
 {
     static const std::set<std::string> names{
         "setexpfog",          "setculldist",
-        "visionsetnaked",     "visionsetnight",    "setdvar",            "setsaveddvar",
+        "visionsetnaked",     "visionsetnight",    "setsaveddvar",
         "makedvarserverinfo", "setsunlight",       "resetsunlight",      "precacheshader",
         "precachestring",     "precacheitem",      "precacherumble",     "precacheturret",
         "precachevehicle",    "precachemenu",      "precacheheadicon",   "precachestatusicon",
@@ -83,6 +83,9 @@ std::string CompatBuiltin(const std::string &name)
         {"soundexists", "iw3compat_soundexists"},
         {"ambientplay", "iw3compat_ambientplay"},
         {"ambientstop", "iw3compat_ambientstop"},
+        // IW3 map dvars: those with a Replay counterpart are set, the rest
+        // (renderer settings the converter owns) are ignored.
+        {"setdvar", "iw3compat_setdvar"},
     };
     const auto found = names.find(name);
     return found != names.end() ? found->second : std::string{};

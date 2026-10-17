@@ -370,7 +370,7 @@ const std::array<std::array<double, 56>, 9> &LightGridProjection()
     return projection;
 }
 
-std::vector<Probe> BuildProbes(const std::vector<std::uint8_t> &palette)
+std::vector<Probe> BuildProbes(const std::vector<std::uint8_t> &palette, const float lightUnitScale = 1.0f)
 {
     std::vector<Probe> probes(palette.size() / 168);
     const auto &projection = LightGridProjection();
@@ -392,7 +392,7 @@ std::vector<Probe> BuildProbes(const std::vector<std::uint8_t> &palette)
                     value += projection[coefficient][sample] *
                              palette[probe * 168 + sample * 3 + channel];
                 probes[probe][channel][coefficient] =
-                    static_cast<float>(value * sourceScale);
+                    static_cast<float>(value * sourceScale * lightUnitScale);
             }
         }
     }
@@ -583,7 +583,7 @@ bool SparseTetrahedronContains(const std::array<std::int32_t, 3> &point,
 }
 
 std::vector<std::uint8_t> BuildPayload(std::vector<Cell> cells,
-                                       const std::vector<std::uint8_t> &palette)
+                                       const std::vector<std::uint8_t> &palette, const float lightUnitScale = 1.0f)
 {
     if (cells.empty() || cells.size() > 2'000'000 || palette.empty() || palette.size() % 168)
         throw std::runtime_error("invalid IW3 light-grid probe or palette count");
@@ -825,7 +825,7 @@ std::vector<std::uint8_t> BuildPayload(std::vector<Cell> cells,
         }
     }
 
-    const auto probes = BuildProbes(palette);
+    const auto probes = BuildProbes(palette, lightUnitScale);
     std::array<float, 32> fallback{};
     for (unsigned channel = 0; channel < 3; ++channel)
     {
@@ -922,7 +922,7 @@ std::vector<std::uint8_t> BuildPayload(std::vector<Cell> cells,
 
 bool PrepareNativeLightGrid(const std::filesystem::path &sourceRoot,
                             const std::string &sourceAsset,
-                            const std::filesystem::path &output)
+                            const std::filesystem::path &output, const float lightUnitScale)
 {
     const auto metadataPath =
         sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
@@ -944,7 +944,7 @@ bool PrepareNativeLightGrid(const std::filesystem::path &sourceRoot,
 
     std::vector<std::uint8_t> palette;
     const auto cells = ReadCells(sourceRoot, metadata, palette);
-    const auto payload = BuildPayload(cells, palette);
+    const auto payload = BuildPayload(cells, palette, lightUnitScale);
     if (!zt::write_file(output.string(), payload))
         throw std::runtime_error("cannot write temporary native Replay light grid");
     return true;
@@ -1067,6 +1067,373 @@ std::vector<std::array<std::array<float, 3>, 6>> SampleLightGridAmbientCubes(
              "outside the grid, %zu out of the sun)",
              points.size() - unlit, nearestFallbacks, unlit, shaded);
     return cubes;
+}
+
+namespace
+{
+// Com_CanPrimaryLightAffectPoint (light->dir points toward the light).
+bool CanPrimaryLightAffectPoint(const LightGridPrimaryLight &light, const std::array<float, 3> &point)
+{
+    const std::array<float, 3> delta{light.origin[0] - point[0], light.origin[1] - point[1],
+                                     light.origin[2] - point[2]};
+    const float distanceSquared = delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2];
+    if (distanceSquared >= light.radius * light.radius)
+        return false;
+    if (light.type == 3 || light.rotationLimit <= -light.cosHalfFovOuter)
+        return true;
+    const float spotDotTimesDistance = delta[0] * light.dir[0] + delta[1] * light.dir[1] + delta[2] * light.dir[2];
+    float cosHalfFov = light.cosHalfFovOuter;
+    if (light.rotationLimit != 1.0f)
+    {
+        // CosOfSumOfArcCos
+        cosHalfFov = light.cosHalfFovOuter * light.rotationLimit -
+                     std::sqrt(std::max(0.0f, (1 - light.cosHalfFovOuter * light.cosHalfFovOuter) *
+                                                  (1 - light.rotationLimit * light.rotationLimit)));
+        if (cosHalfFov <= 0.0f)
+            return spotDotTimesDistance <= cosHalfFov * light.radius;
+    }
+    return spotDotTimesDistance > 0.0f &&
+           cosHalfFov * cosHalfFov * distanceSquared <= spotDotTimesDistance * spotDotTimesDistance;
+}
+
+// R_SetLightGridColors: the 56 grid directions per texel of the 4x4x4 volume
+// (x fastest, then y, then z); the inner core repeats corner samples.
+constexpr std::array<std::uint8_t, 64> kModelLightingTexelColors{
+    0,  1,  2,  3,  4,  5,  6,  7,  8,  9,  10, 11, 12, 13, 14, 15,
+    16, 17, 18, 19, 20, 0,  3,  21, 22, 12, 15, 23, 24, 25, 26, 27,
+    28, 29, 30, 31, 32, 40, 43, 33, 34, 52, 55, 35, 36, 37, 38, 39,
+    40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55};
+} // namespace
+
+std::vector<std::array<std::uint8_t, 256>> SampleStaticModelLighting(
+    const std::filesystem::path &sourceRoot, const std::string &sourceAsset,
+    const std::vector<StaticModelLightingInput> &inputs,
+    const std::vector<LightGridPrimaryLight> &primaryLights, const LightGridSightBlocked &blocked)
+{
+    std::vector<std::array<std::uint8_t, 256>> volumes;
+    const auto metadataPath = sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
+    std::error_code error;
+    if (inputs.empty() || !std::filesystem::is_regular_file(metadataPath, error))
+        return volumes;
+    const Json metadata = ReadJson(metadataPath);
+    if (metadata.value("available", true) == false)
+        return volumes;
+    std::vector<std::uint8_t> palette;
+    const auto cells = ReadCells(sourceRoot, metadata, palette);
+    const std::size_t colorCount = palette.size() / 168;
+    if (cells.empty() || !colorCount)
+        return volumes;
+    const int rowAxis = metadata.at("row_axis").get<int>();
+    const int columnAxis = metadata.at("col_axis").get<int>();
+    const unsigned sun = metadata.at("sun_primary_light_index").get<unsigned>();
+    const bool hasLightRegions = metadata.value("has_light_regions", false);
+
+    // Grid points by integer coordinate (32 units in x/y, 64 in z, from -131072).
+    const auto key = [](const std::int64_t x, const std::int64_t y, const std::int64_t z) {
+        return static_cast<std::uint64_t>(x & 0xffff) | static_cast<std::uint64_t>(y & 0xffff) << 16 |
+               static_cast<std::uint64_t>(z & 0xffff) << 32;
+    };
+    std::unordered_map<std::uint64_t, Entry> grid;
+    std::unordered_map<std::uint64_t, std::int64_t> columnBottom;
+    grid.reserve(cells.size());
+    for (const Cell &cell : cells)
+    {
+        const std::int64_t x = (cell.position[0] + 131072) / 32, y = (cell.position[1] + 131072) / 32,
+                           z = (cell.position[2] + 131072) / 64;
+        grid.emplace(key(x, y, z), cell.entry);
+        auto [bottom, inserted] = columnBottom.try_emplace(key(x, y, 0), z);
+        if (!inserted)
+            bottom->second = std::min(bottom->second, z);
+    }
+    const auto light = [&](const unsigned index) -> const LightGridPrimaryLight * {
+        return index < primaryLights.size() ? &primaryLights[index] : nullptr;
+    };
+
+    volumes.resize(inputs.size());
+    std::size_t ground = 0, extrapolated = 0, traced = 0, suppressed = 0;
+    for (std::size_t index = 0; index < inputs.size(); ++index)
+    {
+        const StaticModelLightingInput &input = inputs[index];
+        auto &texels = volumes[index];
+        if (input.groundLit && input.groundLighting)
+        {
+            // R_SetModelGroundLighting: the packed colour in every texel (B, G, R, A).
+            for (unsigned texel = 0; texel < 64; ++texel)
+            {
+                texels[texel * 4 + 0] = static_cast<std::uint8_t>(input.groundLighting >> 16);
+                texels[texel * 4 + 1] = static_cast<std::uint8_t>(input.groundLighting >> 8);
+                texels[texel * 4 + 2] = static_cast<std::uint8_t>(input.groundLighting);
+                texels[texel * 4 + 3] = static_cast<std::uint8_t>(input.groundLighting >> 24);
+            }
+            ++ground;
+            continue;
+        }
+
+        // R_LightGridLookup.
+        const auto &sample = input.origin;
+        std::array<std::int64_t, 3> pos{(static_cast<std::int64_t>(std::floor(sample[0])) + 0x20000) >> 5,
+                                        (static_cast<std::int64_t>(std::floor(sample[1])) + 0x20000) >> 5,
+                                        (static_cast<std::int64_t>(std::floor(sample[2])) + 0x20000) >> 6};
+        const float lerpRow = (sample[rowAxis] + 131072.0f) * 0.03125f - static_cast<float>(pos[rowAxis]);
+        const float lerpColumn =
+            (sample[columnAxis] + 131072.0f) * 0.03125f - static_cast<float>(pos[columnAxis]);
+        const float lerpZ = (sample[2] + 131072.0f) * 0.015625f - static_cast<float>(pos[2]);
+        std::array<float, 8> weight{};
+        std::array<const Entry *, 8> entry{};
+        unsigned defaultEntry = 1;
+        for (unsigned corner = 0; corner < 8; ++corner)
+        {
+            weight[corner] = ((corner & 4) ? lerpRow : 1 - lerpRow) *
+                             ((corner & 2) ? lerpColumn : 1 - lerpColumn) * ((corner & 1) ? lerpZ : 1 - lerpZ);
+            std::array<std::int64_t, 3> p = pos;
+            p[rowAxis] += (corner >> 2) & 1;
+            p[columnAxis] += (corner >> 1) & 1;
+            p[2] += corner & 1;
+            const auto found = grid.find(key(p[0], p[1], p[2]));
+            entry[corner] = found == grid.end() ? nullptr : &found->second;
+        }
+        // R_GetLightGridSampleEntryQuad: below the data of either base column,
+        // extrapolation uses palette entry 0 instead of 1.
+        for (unsigned row = 0; row < 2; ++row)
+        {
+            std::array<std::int64_t, 3> p = pos;
+            p[rowAxis] += row;
+            const auto bottom = columnBottom.find(key(p[0], p[1], 0));
+            if (bottom != columnBottom.end() && pos[2] < bottom->second)
+                defaultEntry = 0;
+        }
+        std::uint8_t lookupPrimary = 0;
+        float bestWeight = 0;
+        bool honorSuppression = false;
+        for (unsigned corner = 0; corner < 8; ++corner)
+        {
+            const Entry *current = entry[corner];
+            if (!current)
+                continue;
+            if (weight[corner] < 0.001f) // EQUAL_EPSILON
+            {
+                entry[corner] = nullptr;
+                continue;
+            }
+            bool suppress = false;
+            if (current->traceMask & (1u << corner))
+            {
+                // R_IsValidLightGridSample: sight from the sample to the corner,
+                // nudged 0.01 toward the sample.
+                std::array<float, 3> gridPos{static_cast<float>(pos[0]) * 32.0f - 131072.0f,
+                                             static_cast<float>(pos[1]) * 32.0f - 131072.0f,
+                                             static_cast<float>(pos[2]) * 64.0f - 131072.0f};
+                gridPos[rowAxis] += (corner & 4) ? 32.0f : 0.0f;
+                gridPos[columnAxis] += (corner & 2) ? 32.0f : 0.0f;
+                gridPos[2] += (corner & 1) ? 64.0f : 0.0f;
+                std::array<float, 3> direction{sample[0] - gridPos[0], sample[1] - gridPos[1],
+                                               sample[2] - gridPos[2]};
+                const float length = std::sqrt(direction[0] * direction[0] + direction[1] * direction[1] +
+                                               direction[2] * direction[2]);
+                if (length > 0)
+                    for (float &component : direction)
+                        component /= length;
+                const std::array<float, 3> nudged{gridPos[0] + 0.01f * direction[0],
+                                                  gridPos[1] + 0.01f * direction[1],
+                                                  gridPos[2] + 0.01f * direction[2]};
+                ++traced;
+                suppress = blocked(sample, nudged);
+                suppressed += suppress;
+            }
+            if (suppress)
+            {
+                if (honorSuppression)
+                {
+                    entry[corner] = nullptr;
+                    continue;
+                }
+            }
+            else if (!honorSuppression)
+            {
+                honorSuppression = true;
+                bestWeight = weight[corner];
+                lookupPrimary = current->primaryLight;
+                for (unsigned previous = 0; previous < corner; ++previous)
+                    entry[previous] = nullptr;
+                continue;
+            }
+            const std::uint8_t candidate = current->primaryLight;
+            const bool take = lookupPrimary ? candidate && (lookupPrimary == 255 ||
+                                                            (candidate != 255 && weight[corner] > bestWeight))
+                                            : true;
+            if (take)
+            {
+                bestWeight = weight[corner];
+                lookupPrimary = candidate;
+            }
+        }
+
+        // R_GetLightingAtPoint.
+        unsigned primary = lookupPrimary;
+        if (primary == 255)
+            primary = sun;
+        else if (hasLightRegions && primary != sun)
+            primary = input.primaryLight;
+        std::array<std::uint16_t, 8> sampleColor{};
+        std::array<float, 8> sampleWeight{};
+        unsigned sampleCount = 0;
+        float maxWeight = 0, visible = 0, occluded = 0;
+        for (unsigned corner = 0; corner < 8; ++corner)
+        {
+            const Entry *current = entry[corner];
+            if (!current)
+                continue;
+            if (current->primaryLight == primary)
+                visible += weight[corner];
+            else if (!current->primaryLight || (current->primaryLight == 255 && primary))
+            {
+                // R_CanLightInfluenceLightGridCorner.
+                const LightGridPrimaryLight *primaryLight = light(primary);
+                bool influences = !primaryLight || primaryLight->type == 1;
+                if (!influences)
+                {
+                    std::array<float, 3> gridPos{std::floor(sample[0] * 0.03125f) * 32.0f,
+                                                 std::floor(sample[1] * 0.03125f) * 32.0f,
+                                                 std::floor(sample[2] * 0.015625f) * 64.0f};
+                    gridPos[rowAxis] += (corner & 4) ? 32.0f : 0.0f;
+                    gridPos[columnAxis] += (corner & 2) ? 32.0f : 0.0f;
+                    gridPos[2] += (corner & 1) ? 64.0f : 0.0f;
+                    influences = CanPrimaryLightAffectPoint(*primaryLight, gridPos);
+                }
+                if (influences)
+                    occluded += weight[corner];
+            }
+            maxWeight += weight[corner];
+            // R_AddLightGridSample
+            unsigned slot = 0;
+            while (slot < sampleCount && sampleColor[slot] != current->color)
+                ++slot;
+            if (slot == sampleCount)
+            {
+                sampleColor[sampleCount] = current->color;
+                sampleWeight[sampleCount++] = 0;
+            }
+            sampleWeight[slot] += weight[corner];
+        }
+
+        std::array<std::uint8_t, 168> colors{};
+        float primaryWeight = 1.0f;
+        if (sampleCount)
+        {
+            if (primary)
+                primaryWeight = occluded == 0 ? (visible != 0 ? 1.0f : 0.0f) : visible / (visible + occluded);
+            else
+                primaryWeight = 0;
+            if (sampleCount == 1)
+                std::memcpy(colors.data(), palette.data() + std::size_t(sampleColor[0]) * 168, 168);
+            else
+            {
+                // R_GetLightGridColorsFixedPointBlendWeights + R_FixedPointBlendLightGridColors.
+                const float scale = 1.0f / maxWeight;
+                std::array<std::uint16_t, 8> fixedWeight{};
+                std::uint16_t sum = 0;
+                unsigned largest = 0;
+                for (unsigned slot = 0; slot < sampleCount; ++slot)
+                {
+                    fixedWeight[slot] = static_cast<std::uint16_t>(static_cast<int>(scale * 256.0f * sampleWeight[slot] + 0.5f));
+                    sum = static_cast<std::uint16_t>(sum + fixedWeight[slot]);
+                    if (fixedWeight[largest] < fixedWeight[slot])
+                        largest = slot;
+                }
+                fixedWeight[largest] = static_cast<std::uint16_t>(fixedWeight[largest] + 256 - sum);
+                std::array<std::uint16_t, 168> accumulated{};
+                for (unsigned slot = 0; slot < sampleCount; ++slot)
+                    for (unsigned byte = 0; byte < 168; ++byte)
+                        accumulated[byte] = static_cast<std::uint16_t>(
+                            accumulated[byte] + fixedWeight[slot] * palette[std::size_t(sampleColor[slot]) * 168 + byte]);
+                for (unsigned byte = 0; byte < 168; ++byte)
+                    colors[byte] = static_cast<std::uint8_t>(static_cast<std::uint16_t>(accumulated[byte] + 127) >> 8);
+            }
+        }
+        else
+        {
+            // R_ExtrapolateLightingAtPoint (GFX_MODELLIGHT_EXTRAPOLATE).
+            const std::size_t fallback = colorCount <= defaultEntry ? colorCount - 1 : defaultEntry;
+            std::memcpy(colors.data(), palette.data() + fallback * 168, 168);
+            primary = sun;
+            ++extrapolated;
+        }
+        // The model's primary light gets the weight; only a sun primary lights the
+        // model with the sun (alpha = sun weight).
+        const auto alpha = static_cast<std::uint8_t>(
+            primary == sun ? static_cast<int>(primaryWeight * 255.0f + 0.5f) : 0);
+        for (unsigned texel = 0; texel < 64; ++texel)
+        {
+            const unsigned color = kModelLightingTexelColors[texel];
+            texels[texel * 4 + 0] = colors[color * 3 + 0];
+            texels[texel * 4 + 1] = colors[color * 3 + 1];
+            texels[texel * 4 + 2] = colors[color * 3 + 2];
+            texels[texel * 4 + 3] = alpha;
+        }
+    }
+    zt::info("iw3: lit %zu static model(s) as IW3 does (%zu ground-lit, %zu extrapolated; %zu grid "
+             "corner trace(s), %zu suppressed)",
+             inputs.size(), ground, extrapolated, traced, suppressed);
+    return volumes;
+}
+
+std::optional<EntityLightGrid> BuildEntityLightGrid(const std::filesystem::path &sourceRoot,
+                                                    const std::string &sourceAsset)
+{
+    const auto metadataPath = sourceRoot / "maps" / "mp" / (sourceAsset + ".lightgrid.json");
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(metadataPath, error))
+        return std::nullopt;
+    const Json metadata = ReadJson(metadataPath);
+    if (metadata.value("available", true) == false)
+        return std::nullopt;
+    std::vector<std::uint8_t> palette;
+    const auto cells = ReadCells(sourceRoot, metadata, palette);
+    const std::size_t colorCount = palette.size() / 168;
+    if (cells.empty() || !colorCount || colorCount >= 65535)
+        return std::nullopt;
+    EntityLightGrid grid;
+    std::array<int, 3> maximum{};
+    for (unsigned axis = 0; axis < 3; ++axis)
+    {
+        grid.minimum[axis] = metadata.at("mins").at(axis).get<int>();
+        maximum[axis] = metadata.at("maxs").at(axis).get<int>();
+        grid.dims[axis] = static_cast<unsigned>(maximum[axis] - grid.minimum[axis] + 1);
+    }
+    const std::size_t entryTexels = std::size_t(grid.dims[0]) * grid.dims[1] * grid.dims[2];
+    grid.width = 4096;
+    grid.paletteStart = static_cast<unsigned>((entryTexels + grid.width - 1) / grid.width * grid.width);
+    grid.paletteColors = colorCount;
+    const std::size_t total = grid.paletteStart + colorCount * 56;
+    grid.height = static_cast<unsigned>((total + grid.width - 1) / grid.width);
+    grid.pixels.assign(std::size_t(grid.width) * grid.height * 4, 0);
+    for (const Cell &cell : cells)
+    {
+        const std::array<int, 3> point{(cell.position[0] + 131072) / 32 - grid.minimum[0],
+                                       (cell.position[1] + 131072) / 32 - grid.minimum[1],
+                                       (cell.position[2] + 131072) / 64 - grid.minimum[2]};
+        if (point[0] < 0 || point[1] < 0 || point[2] < 0 || point[0] >= int(grid.dims[0]) ||
+            point[1] >= int(grid.dims[1]) || point[2] >= int(grid.dims[2]))
+            throw std::runtime_error("IW3 light-grid entry is outside its bounds");
+        const std::size_t texel =
+            (std::size_t(point[2]) * grid.dims[1] + point[1]) * grid.dims[0] + point[0];
+        const unsigned color = cell.entry.color + 1u;
+        grid.pixels[texel * 4 + 0] = static_cast<std::uint8_t>(color);
+        grid.pixels[texel * 4 + 1] = static_cast<std::uint8_t>(color >> 8);
+        grid.pixels[texel * 4 + 2] = cell.entry.primaryLight;
+        grid.pixels[texel * 4 + 3] = 255;
+    }
+    for (std::size_t color = 0; color < colorCount; ++color)
+        for (unsigned sample = 0; sample < 56; ++sample)
+        {
+            const std::size_t texel = grid.paletteStart + color * 56 + sample;
+            for (unsigned channel = 0; channel < 3; ++channel)
+                grid.pixels[texel * 4 + channel] = palette[color * 168 + sample * 3 + channel];
+            grid.pixels[texel * 4 + 3] = 255;
+        }
+    zt::info("iw3: entity light grid %ux%ux%u points, %zu palette colours (%ux%u image)", grid.dims[0],
+             grid.dims[1], grid.dims[2], colorCount, grid.width, grid.height);
+    return grid;
 }
 
 std::optional<LightGridVolume> BuildLightGridVolume(const std::filesystem::path &sourceRoot,

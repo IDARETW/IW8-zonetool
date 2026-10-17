@@ -112,6 +112,11 @@ struct SourceStaticModelInstance
     std::array<Vec3, 3> axis{};
     float scale{1.0f};
     std::uint16_t reflectionProbe{};
+    // R_SetStaticModelLighting inputs (absent in exports before the Unlinker added them).
+    std::optional<std::array<float, 3>> lightingOrigin; // avg(mins, maxs)
+    std::uint8_t primaryLight{};
+    bool groundLit{};
+    std::uint32_t groundLighting{};
 };
 
 struct SourceStaticModels
@@ -2867,6 +2872,17 @@ std::vector<BrushModel> ReadBrushModels(const Json &world, const std::filesystem
             throw std::runtime_error("IW3 static-model instance references an invalid reflection probe");
         converted.reflectionProbe = static_cast<std::uint16_t>(reflectionProbe);
         converted.origin = ReadVector<3>(instance.at("origin"));
+        if (instance.contains("mins") && instance.contains("maxs"))
+        {
+            const auto mins = ReadVector<3>(instance.at("mins"));
+            const auto maxs = ReadVector<3>(instance.at("maxs"));
+            converted.lightingOrigin = std::array<float, 3>{(mins[0] + maxs[0]) * 0.5f,
+                                                            (mins[1] + maxs[1]) * 0.5f,
+                                                            (mins[2] + maxs[2]) * 0.5f};
+            converted.primaryLight = instance.value("primary_light", std::uint8_t{0});
+            converted.groundLit = (instance.value("model_flags", 0u) & 1u) != 0;
+            converted.groundLighting = instance.value("ground_lighting", 0u);
+        }
         converted.scale = instance.at("scale").get<float>();
         if (!std::isfinite(converted.scale) || converted.scale <= 0.0f)
         {
@@ -2976,9 +2992,12 @@ unsigned MaterialIndex(const RenderPlan &plan, const MaterialPlan &material,
             throw std::runtime_error("IW3 render plan is missing a native world material");
         return material.worldMaterialIndex;
     }
-    if (material.kind == SurfaceKind::opaque && !material.depthBias)
+    if (material.kind == SurfaceKind::opaque && !material.depthBias && material.worldDetail < 0 &&
+        material.worldWater < 0)
         return 0;
-    const std::string suffix = material.kind == SurfaceKind::opaque ? "_opaque_bias"
+    const std::string suffix = material.worldWater >= 0 ? "_water" + std::to_string(material.worldWater)
+                               : material.worldDetail >= 0 ? "_detail" + std::to_string(material.worldDetail)
+                               : material.kind == SurfaceKind::opaque ? "_opaque_bias"
                                : material.kind == SurfaceKind::cutout
                                    ? "_" + CutoutVariantKind(material)
                                : material.kind == SurfaceKind::glass ? "_" + GlassVariantKind(material)
@@ -6447,11 +6466,29 @@ Json BuildLighting(const Json &world, const Json &commonWorld, const std::string
     {
         throw std::runtime_error("invalid IW3 worldspawn sun color");
     }
-    const float intensity =
+    float intensity =
         ParseEntityFloat(EntityValue(entities, "sunlight"), sun.at("intensity").get<float>());
+    Vec3 sunColor = color;
+    // IW3 shades with its compiled sun primary light: R_SetSunConstants passes
+    // that light's colour as sunDiffuse (r_scene.cpp). The worldspawn sunlight x
+    // suncolor it was compiled from is not that value (Nuketown: 1.3 x (1, .92,
+    // .88) against (.924, .879, .834), 40% bright). Intensity = the light's
+    // luminance, colour = the light / intensity, as stock ComWorld suns store it.
+    const auto &lights = commonWorld.at("primary_lights");
+    const auto sunIndex = world.at("sun_primary_light_index").get<std::size_t>();
+    if (sunIndex < lights.size() && lights.at(sunIndex).at("type").get<int>() == 1)
+    {
+        const Vec3 compiled = ReadVector<3>(lights.at(sunIndex).at("color"));
+        const float luminance = 0.2126f * compiled[0] + 0.7152f * compiled[1] + 0.0722f * compiled[2];
+        if (luminance > 0.0f)
+        {
+            intensity = luminance;
+            sunColor = Multiply(compiled, 1.0f / luminance);
+        }
+    }
     return {{"schema", 1},
             {"intensity", intensity},
-            {"color", color},
+            {"color", sunColor},
             {"direction", Unit(direction)},
             {"up", {0.0f, 0.0f, 0.0f}},
             {"sun_primary_light_index", world.at("sun_primary_light_index")},
@@ -7378,6 +7415,25 @@ iw8::vfx::Emitter ConvertFxElement(
             iw8_focus::ParticleModuleInitMaterial payload{};
             payload.base.type =
                 static_cast<std::uint16_t>(iw8_focus::ParticleModuleType::initMaterial);
+            // The IW3 material's feather, falloff and eye-offset terms become the
+            // module's Particle_MaterialData (one block per module: every visual
+            // of an IW3 element shares it, so they must agree).
+            const std::array<std::uint8_t, 192> *materialData = nullptr;
+            for (const auto &visual : source.visuals)
+            {
+                if (visual.kind != PreparedFxVisualKind::material || visual.names.size() != 1)
+                    continue;
+                const auto found = map.fxParticleMaterialData.find(visual.names.front());
+                const auto *data = found == map.fxParticleMaterialData.end() ? nullptr : &found->second;
+                if (&visual != &source.visuals.front() && data != materialData &&
+                    (!data || !materialData || *data != *materialData))
+                    zt::warn("iw3 fx: element visuals disagree on feather/falloff/eye offset; using the first (%s)",
+                             visual.names.front().c_str());
+                else if (&visual == &source.visuals.front())
+                    materialData = data;
+            }
+            if (materialData)
+                std::memcpy(payload.materialData, materialData->data(), materialData->size());
             module = VfxValueModule(iw8_focus::ParticleModuleType::initMaterial, payload);
             for (const auto &visual : source.visuals)
             {
@@ -7705,6 +7761,7 @@ PreparedMap::PreparedMap(PreparedMap &&other) noexcept
     , xanims(std::move(other.xanims))
     , fxEffects(std::move(other.fxEffects))
     , fxMaterialAliases(std::move(other.fxMaterialAliases))
+    , fxParticleMaterialData(std::move(other.fxParticleMaterialData))
     , vfxEffects(std::move(other.vfxEffects))
     , vfxLightDef(std::move(other.vfxLightDef))
     , smallGlassEffect(std::move(other.smallGlassEffect))
@@ -7740,6 +7797,7 @@ PreparedMap &PreparedMap::operator=(PreparedMap &&other) noexcept
         xanims = std::move(other.xanims);
         fxEffects = std::move(other.fxEffects);
         fxMaterialAliases = std::move(other.fxMaterialAliases);
+        fxParticleMaterialData = std::move(other.fxParticleMaterialData);
         vfxEffects = std::move(other.vfxEffects);
         vfxLightDef = std::move(other.vfxLightDef);
         smallGlassEffect = std::move(other.smallGlassEffect);
@@ -8275,6 +8333,23 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
         throw std::runtime_error(
             "IW3 world, collision, and common-world exports name different maps");
     }
+    // --style iw8 light units and exposure matched to the shipped maps from the
+    // compiled IW3 sun (iw3::MatchIw8Lighting); --style iw3 keeps IW3 units.
+    Iw8LightingMatch lightingMatch;
+    if (options.style == MapStyle::iw8)
+    {
+        const auto sunIndex = world.at("sun_primary_light_index").get<std::size_t>();
+        const auto &lights = commonWorld.at("primary_lights");
+        if (sunIndex < lights.size() && lights.at(sunIndex).at("type").get<int>() == 1)
+        {
+            lightingMatch = MatchIw8Lighting(ReadVector<3>(lights.at(sunIndex).at("color")));
+            zt::info("iw3: iw8 lighting matched to shipped maps: %s sun, intensity %.3f, x%.3f light "
+                     "units, exposure of %s",
+                     lightingMatch.night ? "night" : "day", lightingMatch.sunIntensity,
+                     lightingMatch.lightUnitScale,
+                     lightingMatch.exposure ? lightingMatch.exposure->map : "(none)");
+        }
+    }
     const auto &sourceLights = commonWorld.at("primary_lights");
     const auto primaryLightCount = world.at("primary_light_count").get<std::size_t>();
     const auto sunPrimaryLightIndex = world.at("sun_primary_light_index").get<std::size_t>();
@@ -8439,7 +8514,8 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     }
     {
         const std::string vision = BuildReplayVision(expFog, result.gradingClutName, options.style,
-                                                     SunDirection(world, entities));
+                                                     SunDirection(world, entities), lightingMatch.exposure,
+                                                     lightingMatch.lightUnitScale);
         result.rawFiles.push_back(
             {"vision/" + options.map + ".vision",
              std::vector<std::uint8_t>(vision.begin(), vision.end())});
@@ -8855,29 +8931,406 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     const auto mapDirectory = result.root / "maps" / "mp";
     std::filesystem::create_directories(mapDirectory);
     const std::vector<std::string> fxMaterials(fxMaterialNames.begin(), fxMaterialNames.end());
-    // Entities (script models, dynamic entities, FX models) read the IW3 light
-    // grid from a world-space volume, as IW3 lit them from the grid.
-    std::optional<EntityLightVolume> entityLightVolume;
-    if (const auto volume = BuildLightGridVolume(exportRoot, sourceAsset))
+    // IW3's light-grid lookups (static models, entity presets below) run its
+    // grid-corner sight traces (CM_BoxSightTrace, contents 0x2001), here against
+    // the exported collision:
+    // brushes (bounds + planes, inside = n.p <= d) and terrain triangles.
+    struct SightBrush
     {
+        Vec3 mins, maxs;
+        std::vector<std::array<float, 4>> planes;
+    };
+    std::vector<SightBrush> sightBrushes;
+    for (const auto &brush : collision.at("brushes"))
+    {
+        if ((brush.at("contents").get<std::uint32_t>() & 0x2001u) == 0)
+            continue;
+        SightBrush converted{ReadVector<3>(brush.at("mins")), ReadVector<3>(brush.at("maxs")), {}};
+        for (const auto &plane : brush.at("planes"))
+            converted.planes.push_back(ReadVector<4>(plane));
+        sightBrushes.push_back(std::move(converted));
+    }
+    std::vector<std::array<Vec3, 3>> sightTriangles;
+    {
+        const auto &vertices = collision.at("vertices");
+        const auto &triangles = collision.at("triangles");
+        const auto &contents = collision.at("triangle_contents");
+        for (std::size_t index = 0; index < triangles.size(); ++index)
+        {
+            if (index < contents.size() && (contents.at(index).get<std::uint32_t>() & 0x2001u) == 0)
+                continue;
+            std::array<Vec3, 3> triangle;
+            for (unsigned corner = 0; corner < 3; ++corner)
+                triangle[corner] =
+                    ReadVector<3>(vertices.at(triangles.at(index).at(corner).get<std::size_t>()));
+            sightTriangles.push_back(triangle);
+        }
+    }
+    const auto sightBlocked = [&](const Vec3 &start, const Vec3 &end) {
+        const Vec3 delta{end[0] - start[0], end[1] - start[1], end[2] - start[2]};
+        for (const SightBrush &brush : sightBrushes)
+        {
+            float enter = 0.0f, leave = 1.0f;
+            const auto clip = [&](const float n0, const float n1, const float n2, const float d) {
+                const float startSide = n0 * start[0] + n1 * start[1] + n2 * start[2] - d;
+                const float along = n0 * delta[0] + n1 * delta[1] + n2 * delta[2];
+                if (along == 0.0f)
+                    return startSide <= 0.0f;
+                const float t = -startSide / along;
+                if (along < 0.0f)
+                    enter = std::max(enter, t);
+                else
+                    leave = std::min(leave, t);
+                return enter <= leave;
+            };
+            bool inside = true;
+            for (unsigned axis = 0; axis < 3 && inside; ++axis)
+            {
+                std::array<float, 3> n{};
+                n[axis] = 1.0f;
+                inside = clip(n[0], n[1], n[2], brush.maxs[axis]);
+                if (inside)
+                {
+                    n[axis] = -1.0f;
+                    inside = clip(n[0], n[1], n[2], -brush.mins[axis]);
+                }
+            }
+            for (std::size_t plane = 0; plane < brush.planes.size() && inside; ++plane)
+                inside = clip(brush.planes[plane][0], brush.planes[plane][1], brush.planes[plane][2],
+                              brush.planes[plane][3]);
+            if (inside)
+                return true;
+        }
+        for (const auto &triangle : sightTriangles)
+        {
+            const Vec3 e1{triangle[1][0] - triangle[0][0], triangle[1][1] - triangle[0][1],
+                          triangle[1][2] - triangle[0][2]};
+            const Vec3 e2{triangle[2][0] - triangle[0][0], triangle[2][1] - triangle[0][1],
+                          triangle[2][2] - triangle[0][2]};
+            const Vec3 p{delta[1] * e2[2] - delta[2] * e2[1], delta[2] * e2[0] - delta[0] * e2[2],
+                         delta[0] * e2[1] - delta[1] * e2[0]};
+            const float det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+            if (std::abs(det) < 1e-9f)
+                continue;
+            const Vec3 t0{start[0] - triangle[0][0], start[1] - triangle[0][1], start[2] - triangle[0][2]};
+            const float u = (t0[0] * p[0] + t0[1] * p[1] + t0[2] * p[2]) / det;
+            if (u < 0.0f || u > 1.0f)
+                continue;
+            const Vec3 q{t0[1] * e1[2] - t0[2] * e1[1], t0[2] * e1[0] - t0[0] * e1[2],
+                         t0[0] * e1[1] - t0[1] * e1[0]};
+            const float v = (delta[0] * q[0] + delta[1] * q[1] + delta[2] * q[2]) / det;
+            if (v < 0.0f || u + v > 1.0f)
+                continue;
+            const float t = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det;
+            if (t >= 0.0f && t <= 1.0f)
+                return true;
+        }
+        return false;
+    };
+    std::vector<LightGridPrimaryLight> gridLights;
+    for (const auto &source : commonWorld.at("primary_lights"))
+    {
+        LightGridPrimaryLight converted;
+        converted.type = source.at("type").get<unsigned>();
+        converted.origin = ReadVector<3>(source.at("origin"));
+        converted.dir = ReadVector<3>(source.at("direction"));
+        converted.radius = source.at("radius").get<float>();
+        converted.cosHalfFovOuter = source.at("cos_half_fov_outer").get<float>();
+        converted.rotationLimit = source.at("rotation_limit").get<float>();
+        gridLights.push_back(converted);
+    }
+    // Entities (script models, dynamic entities, FX models): IW3 lit each from its
+    // light grid at the model's lighting origin through the 4x4x4 model-lighting
+    // volume; the entity pixel shader does the same lookup on the raw grid
+    // (iw3::EntityLightGrid), without IW3's per-corner sight traces.
+    std::optional<EntityLightVolume> entityLightVolume;
+    if (auto grid = BuildEntityLightGrid(exportRoot, sourceAsset))
+    {
+        // Entity presets: IW3 lights a DObj from one lighting origin per entity
+        // with R_LightGridLookup's corner sight traces (CG_General: script models
+        // at origin + 4 up; dynents at their pose origin, R_AllocModelLighting_
+        // PrimaryLight). Traces cannot run on the GPU, so each entity's IW3
+        // 4x4x4 volume at its spawn origin is computed here with the static-model
+        // port and appended to the grid image: per preset 68 texels, the root
+        // (entity) origin as three raw floats, a spare texel, then the volume as
+        // the static-model image stores it. The entity shader uses a preset when
+        // its root bone is at that origin and the runtime grid lookup otherwise
+        // (an entity that moved).
+        struct EntityPreset
+        {
+            Vec3 root{};
+            Vec3 sample{};
+            Vec3 boxMid{};
+            Vec3 boxHalf{};
+            bool dynent{};
+        };
+        std::vector<EntityPreset> presets;
+        // The entity's world box: LOD0 vertices through its rotation (row vectors
+        // x, y, z of the model axes in world space) plus its origin.
+        const auto worldBox = [&](const SourceStaticModel &model, const std::array<Vec3, 3> &axis,
+                                  const Vec3 &origin, EntityPreset &preset) {
+            Vec3 lo{origin}, hi{origin};
+            bool any = false;
+            if (!model.lods.empty())
+                for (const Surface &surface : model.lods.front().surfaces)
+                    for (const Vertex &vertex : surface.vertices)
+                    {
+                        Vec3 world{};
+                        for (unsigned row = 0; row < 3; ++row)
+                            world[row] = origin[row] + vertex.position[0] * axis[0][row] +
+                                         vertex.position[1] * axis[1][row] + vertex.position[2] * axis[2][row];
+                        for (unsigned k = 0; k < 3; ++k)
+                        {
+                            lo[k] = any ? std::min(lo[k], world[k]) : world[k];
+                            hi[k] = any ? std::max(hi[k], world[k]) : world[k];
+                        }
+                        any = true;
+                    }
+            for (unsigned k = 0; k < 3; ++k)
+            {
+                preset.boxMid[k] = (lo[k] + hi[k]) * 0.5f;
+                preset.boxHalf[k] = (hi[k] - lo[k]) * 0.5f;
+            }
+        };
+        // IW3 AnglesToAxis (pitch, yaw, roll in degrees): forward, left, up.
+        const auto anglesAxis = [](const Vec3 &angles) {
+            const float d = 3.14159265358979f / 180.0f;
+            const float sp = std::sin(angles[0] * d), cp = std::cos(angles[0] * d);
+            const float sy = std::sin(angles[1] * d), cy = std::cos(angles[1] * d);
+            const float sr = std::sin(angles[2] * d), cr = std::cos(angles[2] * d);
+            std::array<Vec3, 3> axis{};
+            axis[0] = {cp * cy, cp * sy, -sp};
+            axis[1] = {-(sr * sp * cy + cr * -sy), -(sr * sp * sy + cr * cy), -(sr * cp)};
+            axis[1] = {-axis[1][0], -axis[1][1], -axis[1][2]};
+            axis[2] = {cr * sp * cy + -sr * -sy, cr * sp * sy + -sr * cy, cr * cp};
+            return axis;
+        };
+        {
+            static const std::regex block("\\{([^{}]*)\\}");
+            static const std::regex pair("\"([^\"]+)\"\\s+\"([^\"]*)\"");
+            for (auto it = std::sregex_iterator(entities.begin(), entities.end(), block);
+                 it != std::sregex_iterator(); ++it)
+            {
+                const std::string body = (*it)[1].str();
+                std::string classname, model, origin, angles;
+                for (auto kv = std::sregex_iterator(body.begin(), body.end(), pair);
+                     kv != std::sregex_iterator(); ++kv)
+                {
+                    const std::string key = (*kv)[1].str();
+                    if (key == "classname")
+                        classname = (*kv)[2].str();
+                    else if (key == "model")
+                        model = (*kv)[2].str();
+                    else if (key == "origin")
+                        origin = (*kv)[2].str();
+                    else if (key == "angles")
+                        angles = (*kv)[2].str();
+                }
+                if (classname != "script_model" || model.empty() || origin.empty())
+                    continue;
+                const auto found = std::find_if(sourceEntityModels.models.begin(), sourceEntityModels.models.end(),
+                                                [&](const SourceStaticModel &source) { return source.name == model; });
+                if (found == sourceEntityModels.models.end())
+                    continue;
+                EntityPreset preset;
+                preset.root = ParseEntityVector(origin, Vec3{});
+                preset.sample = {preset.root[0], preset.root[1], preset.root[2] + 4.0f};
+                worldBox(*found, anglesAxis(ParseEntityVector(angles, Vec3{})), preset.root, preset);
+                presets.push_back(preset);
+            }
+        }
+        for (std::size_t index = 0; index < sourceDynamicEntities.origins.size(); ++index)
+        {
+            EntityPreset preset;
+            preset.root = sourceDynamicEntities.origins[index];
+            preset.sample = preset.root;
+            preset.dynent = true;
+            const std::size_t model = index < sourceDynamicEntities.definitionModels.size()
+                                          ? sourceDynamicEntities.definitionModels[index]
+                                          : SIZE_MAX;
+            std::array<Vec3, 3> axis{Vec3{1, 0, 0}, Vec3{0, 1, 0}, Vec3{0, 0, 1}};
+            if (index < sourceDynamicEntities.quaternions.size())
+            {
+                const auto &q = sourceDynamicEntities.quaternions[index];
+                const float x = q[0], y = q[1], z = q[2], w = q[3];
+                axis[0] = {1 - 2 * (y * y + z * z), 2 * (x * y + z * w), 2 * (x * z - y * w)};
+                axis[1] = {2 * (x * y - z * w), 1 - 2 * (x * x + z * z), 2 * (y * z + x * w)};
+                axis[2] = {2 * (x * z + y * w), 2 * (y * z - x * w), 1 - 2 * (x * x + y * y)};
+            }
+            if (model < sourceDynamicEntities.models.models.size())
+                worldBox(sourceDynamicEntities.models.models[model], axis, preset.root, preset);
+            else
+                preset.boxMid = preset.root;
+            presets.push_back(preset);
+        }
+        if (presets.size() > 512)
+            presets.resize(512);
+        std::vector<StaticModelLightingInput> presetInputs(presets.size());
+        std::size_t nearLocalLight = 0;
+        const unsigned sunLight = world.at("sun_primary_light_index").get<unsigned>();
+        const auto &sourceLights = commonWorld.at("primary_lights");
+        // IW3 Com_CullBoxFromPrimaryLight (com_math CullBoxFromSphere /
+        // CullBoxFromConicSectionOfSphere), ported.
+        const auto culledByLight = [&](const std::size_t light, const EntityPreset &preset) {
+            const auto &source = sourceLights.at(light);
+            const Vec3 origin = ReadVector<3>(source.at("origin"));
+            const float radius = source.at("radius").get<float>();
+            Vec3 deltaMid{}, outside{};
+            for (unsigned k = 0; k < 3; ++k)
+            {
+                deltaMid[k] = preset.boxMid[k] - origin[k];
+                outside[k] = std::max(std::abs(deltaMid[k]) - preset.boxHalf[k], 0.0f);
+            }
+            if (radius * radius < outside[0] * outside[0] + outside[1] * outside[1] + outside[2] * outside[2])
+                return true;
+            const float cosHalfFov = source.value("cos_half_fov_expanded", -1.0f);
+            if (source.at("type").get<int>() != 2 || cosHalfFov < 0.0f)
+                return false;
+            const Vec3 dir = ReadVector<3>(source.at("direction"));
+            Vec3 farCorner{};
+            for (unsigned k = 0; k < 3; ++k)
+                farCorner[k] = deltaMid[k] - preset.boxHalf[k] * (dir[k] < 0.0f ? -1.0f : 1.0f);
+            const float dist = farCorner[0] * dir[0] + farCorner[1] * dir[1] + farCorner[2] * dir[2];
+            if (dist >= 0.0f)
+                return true;
+            Vec3 perpendicular{};
+            for (unsigned k = 0; k < 3; ++k)
+                perpendicular[k] = farCorner[k] - dist * dir[k];
+            const float perpLenSq = perpendicular[0] * perpendicular[0] + perpendicular[1] * perpendicular[1] +
+                                    perpendicular[2] * perpendicular[2];
+            const float cosSq = cosHalfFov * cosHalfFov, sinSq = 1.0f - cosSq;
+            if (dist * dist * sinSq >= perpLenSq * cosSq)
+                return false;
+            const float scale = cosHalfFov / std::sqrt(perpLenSq * sinSq);
+            float separation = 0;
+            for (unsigned k = 0; k < 3; ++k)
+            {
+                const float axis = dir[k] + scale * perpendicular[k];
+                separation += axis * deltaMid[k] - std::abs(axis * preset.boxHalf[k]);
+            }
+            return separation >= 0.0f;
+        };
+        // IW3 R_CullBoxFromLightRegionHull (light-relative box vs a 9-axis
+        // k-DOP and extra axes); a light with hulls passes when any hull keeps
+        // the box. Extractions older than the Unlinker's light_regions export
+        // skip this test.
+        const bool haveRegions = world.contains("light_regions");
+        const auto culledByRegion = [&](const std::size_t light, const EntityPreset &preset) {
+            if (!haveRegions || light >= world.at("light_regions").size())
+                return false;
+            const auto &hulls = world.at("light_regions").at(light);
+            if (hulls.empty())
+                return false;
+            const Vec3 origin = ReadVector<3>(sourceLights.at(light).at("origin"));
+            const Vec3 mid{preset.boxMid[0] - origin[0], preset.boxMid[1] - origin[1],
+                           preset.boxMid[2] - origin[2]};
+            const Vec3 &half = preset.boxHalf;
+            const std::array<float, 9> mids{mid[0], mid[1], mid[2], mid[0] + mid[1], mid[0] - mid[1],
+                                            mid[0] + mid[2], mid[0] - mid[2], mid[1] + mid[2], mid[1] - mid[2]};
+            const std::array<float, 9> halves{half[0], half[1], half[2], half[0] + half[1], half[0] + half[1],
+                                              half[0] + half[2], half[0] + half[2], half[1] + half[2],
+                                              half[1] + half[2]};
+            for (const auto &hull : hulls)
+            {
+                const auto &kdopMid = hull.at("kdop_mid");
+                const auto &kdopHalf = hull.at("kdop_half");
+                bool culled = false;
+                for (unsigned k = 0; k < 9 && !culled; ++k)
+                    culled = std::abs(mids[k] - kdopMid.at(k).get<float>()) >=
+                             halves[k] + kdopHalf.at(k).get<float>();
+                for (const auto &axis : hull.at("axes"))
+                {
+                    if (culled)
+                        break;
+                    const Vec3 dir = ReadVector<3>(axis.at("dir"));
+                    const float along = mid[0] * dir[0] + mid[1] * dir[1] + mid[2] * dir[2];
+                    const float extent = half[0] * std::abs(dir[0]) + half[1] * std::abs(dir[1]) +
+                                         half[2] * std::abs(dir[2]);
+                    culled = std::abs(along - axis.at("mid").get<float>()) >=
+                             extent + axis.at("half").get<float>();
+                }
+                if (!culled)
+                    return false;
+            }
+            return true;
+        };
+        for (std::size_t index = 0; index < presets.size(); ++index)
+        {
+            presetInputs[index].origin = presets[index].sample;
+            // IW3's non-sun primary light: DObjs take the first spot/omni whose
+            // volume the entity box is not culled from (R_GetNonSunPrimaryLightForBox);
+            // dynents the closest such light (nonSunPrimaryLightForModelDynEnt).
+            // IW3 then also tests the light's region hulls, which the export
+            // lacks; the warning counts the entities this could affect.
+            float best = INFINITY;
+            for (std::size_t light = sunLight + 1; light < sourceLights.size(); ++light)
+            {
+                if (culledByLight(light, presets[index]) || culledByRegion(light, presets[index]))
+                    continue;
+                const Vec3 origin = ReadVector<3>(sourceLights.at(light).at("origin"));
+                const float dx = presets[index].boxMid[0] - origin[0], dy = presets[index].boxMid[1] - origin[1],
+                            dz = presets[index].boxMid[2] - origin[2];
+                const float distance = dx * dx + dy * dy + dz * dz;
+                if (!presets[index].dynent)
+                {
+                    presetInputs[index].primaryLight = static_cast<std::uint8_t>(light);
+                    break;
+                }
+                if (distance < best)
+                {
+                    best = distance;
+                    presetInputs[index].primaryLight = static_cast<std::uint8_t>(light);
+                }
+            }
+            nearLocalLight += presetInputs[index].primaryLight != 0;
+        }
+        if (nearLocalLight && !haveRegions)
+            zt::warn("iw3: %zu entity preset(s) lie in a local light's volume; this extraction has no "
+                     "light regions, so IW3's hull test is skipped for them (re-extract)",
+                     nearLocalLight);
+        else if (nearLocalLight)
+            zt::info("iw3: %zu entity preset(s) take a local light as primary (IW3 box, cone and "
+                     "light-region tests)",
+                     nearLocalLight);
+        const auto presetVolumes =
+            SampleStaticModelLighting(exportRoot, sourceAsset, presetInputs, gridLights, sightBlocked);
+        unsigned presetStart = 0, presetCount = 0;
+        if (!presetVolumes.empty())
+        {
+            presetCount = static_cast<unsigned>(presets.size());
+            presetStart = static_cast<unsigned>(
+                (std::size_t(grid->paletteStart) + grid->paletteColors * 56 + 3) / 4 * 4);
+            const std::size_t total = std::size_t(presetStart) + std::size_t(presetCount) * 68;
+            grid->height = static_cast<unsigned>((total + grid->width - 1) / grid->width);
+            grid->pixels.resize(std::size_t(grid->width) * grid->height * 4, 0);
+            for (std::size_t index = 0; index < presets.size(); ++index)
+            {
+                const std::size_t base = (presetStart + index * 68) * 4;
+                std::memcpy(grid->pixels.data() + base, presets[index].root.data(), 12);
+                std::memcpy(grid->pixels.data() + base + 16, presetVolumes[index].data(), 256);
+            }
+            zt::info("iw3: %u entity lighting preset(s) at spawn origins (IW3 grid lookup with traces)",
+                     presetCount);
+        }
         entityLightVolume.emplace();
-        entityLightVolume->image = "mw120r/" + options.map + "_light_volume";
-        entityLightVolume->file = options.map + "_light_volume.rgba";
-        entityLightVolume->width = volume->width;
-        entityLightVolume->height = volume->height;
-        if (!zt::write_file((mapDirectory / entityLightVolume->file).string(), volume->pixels))
-            throw std::runtime_error("cannot write the entity light-grid volume");
+        entityLightVolume->image = "mw120r/" + options.map + "_entity_light_grid";
+        entityLightVolume->file = options.map + "_entity_light_grid.rgba";
+        entityLightVolume->width = grid->width;
+        entityLightVolume->height = grid->height;
+        if (!zt::write_file((mapDirectory / entityLightVolume->file).string(), grid->pixels))
+            throw std::runtime_error("cannot write the entity light grid");
         char defines[512];
         std::snprintf(defines, sizeof(defines),
-                      "#define MAP_LIGHT_VOLUME 1\n"
-                      "#define MAP_LIGHT_VOLUME_ORIGIN float3(%.6g, %.6g, %.6g)\n"
-                      "#define MAP_LIGHT_VOLUME_CELL float3(%.6g, %.6g, %.6g)\n"
-                      "#define MAP_LIGHT_VOLUME_DIMS float3(%u, %u, %u)\n"
-                      "#define MAP_LIGHT_VOLUME_TILES %u\n"
-                      "#define MAP_LIGHT_VOLUME_SIZE float2(%u, %u)\n",
-                      volume->origin[0], volume->origin[1], volume->origin[2], volume->cell[0],
-                      volume->cell[1], volume->cell[2], volume->dims[0], volume->dims[1],
-                      volume->dims[2], volume->tilesPerRow, volume->width, volume->height);
+                      "#define MAP_ENTITY_GRID 1\n"
+                      "#define MAP_ENTITY_GRID_MIN int3(%d, %d, %d)\n"
+                      "#define MAP_ENTITY_GRID_DIMS int3(%u, %u, %u)\n"
+                      "#define MAP_ENTITY_GRID_WIDTH %u\n"
+                      "#define MAP_ENTITY_GRID_PALETTE %u\n"
+                      "#define MAP_ENTITY_PRESET_START %uu\n"
+                      "#define MAP_ENTITY_PRESET_COUNT %uu\n",
+                      grid->minimum[0], grid->minimum[1], grid->minimum[2], grid->dims[0],
+                      grid->dims[1], grid->dims[2], grid->width, grid->paletteStart, presetStart,
+                      presetCount);
         entityLightVolume->defines = defines;
     }
     RenderPlan renderPlan =
@@ -8885,11 +9338,14 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                             modelMaterialNames, entityMaterialNames, fxMaterials, shadowWorldMaterialNames,
                             shadowModelMaterialNames, options.searchPaths, mapDirectory,
                             options.map, options.scratchRoot / ".iw3-render-cache",
-                            FogShaderDefines(expFog, options.style, ReadMapSun(exportRoot, sourceMap)),
+                            FogShaderDefines(expFog, options.style, ReadMapSun(exportRoot, sourceMap),
+                                             lightingMatch.lightUnitScale),
                             static_cast<unsigned>(sourceStaticModels.instances.size()),
-                            entityLightVolume ? &*entityLightVolume : nullptr);
+                            entityLightVolume ? &*entityLightVolume : nullptr,
+                            lightingMatch.lightUnitScale, options.style == MapStyle::iw3);
     timing.lap("render assets");
     result.fxMaterialAliases = renderPlan.fxMaterialAliases;
+    result.fxParticleMaterialData = renderPlan.fxParticleMaterialData;
     for (auto &effect : result.fxEffects)
     {
         // IW3 heat-haze sprites draw with a stock Replay distortion material
@@ -8956,38 +9412,49 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
                     origin[row] += rotation[row][column] * mid[column] * instance.scale;
             origins.push_back(origin);
         }
-        // Alpha of face 0: IW3's baked sun visibility for the instance.
-        std::vector<float> sunVisibility;
-        auto cubes = SampleLightGridAmbientCubes(
-            exportRoot, sourceAsset, origins,
-            world.at("sun_primary_light_index").get<unsigned>(), &sunVisibility);
-        constexpr unsigned columns = 256;
-        const unsigned rows = (renderPlan.instanceLightingCount + columns - 1) / columns;
-        std::vector<std::uint8_t> pixels(std::size_t(columns) * 6 * rows * 4, 0);
+        // R_SetStaticModelLighting, ported (iw3::SampleStaticModelLighting): one
+        // 4x4x4 model-lighting volume per placement, sampled by the static-model
+        // shader as IW3's modelLightingSampler is (sight tester and grid primary
+        // lights built above, shared with the entity presets).
+        std::vector<StaticModelLightingInput> lightingInputs(origins.size());
+        std::size_t legacyOrigins = 0;
         for (std::size_t index = 0; index < origins.size(); ++index)
-            for (unsigned face = 0; face < 6; ++face)
+        {
+            const auto &source = sourceStaticModels.instances.at(index);
+            lightingInputs[index].origin = source.lightingOrigin.value_or(origins[index]);
+            legacyOrigins += !source.lightingOrigin;
+            lightingInputs[index].primaryLight = source.primaryLight;
+            lightingInputs[index].groundLit = source.groundLit;
+            lightingInputs[index].groundLighting = source.groundLighting;
+        }
+        if (legacyOrigins)
+            zt::warn("iw3: %zu static model(s) lack IW3 lighting inputs (old extraction); using bounds centres",
+                     legacyOrigins);
+        const auto volumes =
+            SampleStaticModelLighting(exportRoot, sourceAsset, lightingInputs, gridLights, sightBlocked);
+        // Image layout (map_surface_realtime InstanceAmbient): 256 placements per
+        // block row; each placement owns a 16 x 5 block: texel (x, y, z) of its
+        // volume at (x + 4z, y), and the IW3 reflection-probe tag (converted slot
+        // + 1, 0 for none) in the alpha of (0, 4).
+        constexpr unsigned columns = 256, blockWidth = 16, blockHeight = 5;
+        const unsigned blockRows = (renderPlan.instanceLightingCount + columns - 1) / columns;
+        const std::size_t width = std::size_t(columns) * blockWidth;
+        std::vector<std::uint8_t> pixels(width * blockRows * blockHeight * 4, 0);
+        for (std::size_t index = 0; index < origins.size(); ++index)
+        {
+            const std::size_t bx = (index % columns) * blockWidth, by = (index / columns) * blockHeight;
+            for (unsigned texel = 0; texel < 64; ++texel)
             {
-                // Values / 2 in RGBA8 UNORM (IW3 grid shading values peak near 1).
-                const std::size_t texel = (index / columns) * columns * 6 + (index % columns) * 6 + face;
-                for (unsigned channel = 0; channel < 3; ++channel)
-                {
-                    const float value = cubes.empty() ? 0.31f : cubes[index][face][channel];
-                    pixels[texel * 4 + channel] = static_cast<std::uint8_t>(
-                        std::lround(std::clamp(value * 0.5f, 0.0f, 1.0f) * 255.0f));
-                }
-                // Alpha of face 1: the instance's IW3 reflection probe tag
-                // (converted slot + 1, 0 for none).
-                pixels[texel * 4 + 3] =
-                    face == 0 && index < sunVisibility.size()
-                        ? static_cast<std::uint8_t>(
-                              std::lround(std::clamp(sunVisibility[index], 0.0f, 1.0f) * 255.0f))
-                    : face == 1
-                        ? static_cast<std::uint8_t>(ReflectionProbeTag(
-                              sourceStaticModels.instances.at(index).reflectionProbe,
-                              world.at("reflection_probes").size()))
-                        : 255;
+                const unsigned x = texel & 3, y = (texel >> 2) & 3, z = texel >> 4;
+                const std::size_t offset = ((by + y) * width + bx + x + 4 * z) * 4;
+                for (unsigned channel = 0; channel < 4; ++channel)
+                    pixels[offset + channel] =
+                        volumes.empty() ? (channel == 3 ? 255 : 40) : volumes[index][texel * 4 + channel];
             }
-        if (cubes.empty())
+            pixels[((by + 4) * width + bx) * 4 + 3] = static_cast<std::uint8_t>(ReflectionProbeTag(
+                sourceStaticModels.instances.at(index).reflectionProbe, world.at("reflection_probes").size()));
+        }
+        if (volumes.empty())
             zt::warn("iw3: no IW3 light grid; static models use a flat 0.31 ambient");
         if (!zt::write_file((mapDirectory / renderPlan.instanceLightingFile).string(), pixels))
             throw std::runtime_error("cannot write the static-model lighting image");
@@ -9587,11 +10054,18 @@ PreparedMap PrepareFastfile(const ImportOptions &options)
     WriteFootsteps(result.footsteps, brushModels, renderPlan);
 
     const std::string targetAsset = options.map + ".d3dbsp";
-    WriteJson(mapDirectory / (targetAsset + ".lighting.json"),
-              BuildLighting(world, commonWorld, entities));
+    // --style iw8 renders in stock light units (LightUnitScale): the ComWorld sun
+    // and local lights (main.cpp reads light_unit_scale) and the native light
+    // grid that stock-shaded players and weapons sample scale with it.
+    const float lightUnitScale = lightingMatch.lightUnitScale;
+    Json lighting = BuildLighting(world, commonWorld, entities);
+    if (options.style == MapStyle::iw8 && lightingMatch.sunIntensity > 0)
+        lighting["intensity"] = lightingMatch.sunIntensity;
+    lighting["light_unit_scale"] = lightUnitScale;
+    WriteJson(mapDirectory / (targetAsset + ".lighting.json"), lighting);
     timing.lap("render json write");
     PrepareNativeLightGrid(exportRoot, sourceAsset,
-                           mapDirectory / (targetAsset + ".gpulightgrid.native"));
+                           mapDirectory / (targetAsset + ".gpulightgrid.native"), lightUnitScale);
     timing.lap("light grid");
 
     const auto worldBounds = world.at("bounds");

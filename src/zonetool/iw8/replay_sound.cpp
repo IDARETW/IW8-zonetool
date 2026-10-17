@@ -777,6 +777,10 @@ void RegisterBank(ZoneWriter &writer, const Bank &source)
                 Store(head, 112, alias.flags);
                 Store(head, 116, alias.probability);
                 Store(head, 120, alias.lfePercentage);
+                Store(head, 124, alias.centerPercentage);
+                Store(head, 152, alias.envelopMin);
+                Store(head, 156, alias.envelopMax);
+                Store(head, 160, alias.envelopPercentage);
                 Store(head, 128, alias.startDelay);
                 Store(head, 132, alias.startDelayMax);
                 Store(head, 136, alias.volumeFalloffCurve ? alias.volumeFalloffCurve : kDefaultHash);

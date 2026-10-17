@@ -869,6 +869,7 @@ iw8::MapSun loadLighting(const Args &args, const std::string &dumpDirectory,
             throw std::runtime_error("invalid map lighting schema");
         }
         lighting.intensity = data.at("intensity").get<float>();
+        lighting.lightUnitScale = data.value("light_unit_scale", 1.0f);
 
         float directionLength = 0.0f;
         float upLength = 0.0f;
@@ -1007,6 +1008,65 @@ iw8::MapSun loadLighting(const Args &args, const std::string &dumpDirectory,
     return lighting;
 }
 
+// IW3 lights a surface with diffuse = color * r_diffuseColorScale (1) * falloff(d / radius),
+// in the units of the IW3 sun the world keeps (R_SetLightProperties; light_point_linear
+// samples falloff_linear = 1 - d/r). Replay's record builder (0x19A9020) turns ComPrimaryLight
+// intensity into sphere-light radiance intensity * color / bulb^2, and the stock forward+ shader
+// applies the sphere form factor ~ N.L * bulb^2 / d^2: irradiance = intensity * color * N.L / d^2,
+// inside a window that is 1 up to 80% of the radius (1 / distance falloff 0.2). Each IW3 spot or
+// omni gets the intensity that gives IW3's brightness where its axis meets the world (a spot's
+// lit surface), capped at half its radius.
+void calibrateLocalLights(iw8::MapSun &lighting, const std::vector<float> &solidTriangles)
+{
+    for (size_t index = 0; index < lighting.primaryLights.size(); ++index)
+    {
+        auto &light = lighting.primaryLights[index];
+        if (light.type < 2 || index == lighting.sunPrimaryLightIndex || light.radius <= 0.0f)
+            continue;
+        if (light.definition != "light_point_linear")
+            warn("local light %zu: IW3 light def '%s' falloff assumed linear", index,
+                 light.definition.c_str());
+        double reference = light.radius * 0.5;
+        if (light.type == 2)
+        {
+            // Emission axis = -ComPrimaryLight dir. Nearest triangle hit (Moller-Trumbore).
+            const double o[3]{light.origin[0], light.origin[1], light.origin[2]};
+            const double d[3]{-light.direction[0], -light.direction[1], -light.direction[2]};
+            double nearest = reference;
+            for (size_t t = 0; t + 9 <= solidTriangles.size(); t += 9)
+            {
+                const float *v = &solidTriangles[t];
+                const double e1[3]{v[3] - v[0], v[4] - v[1], v[5] - v[2]};
+                const double e2[3]{v[6] - v[0], v[7] - v[1], v[8] - v[2]};
+                const double p[3]{d[1] * e2[2] - d[2] * e2[1], d[2] * e2[0] - d[0] * e2[2],
+                                  d[0] * e2[1] - d[1] * e2[0]};
+                const double det = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+                if (std::abs(det) < 1e-9)
+                    continue;
+                const double s[3]{o[0] - v[0], o[1] - v[1], o[2] - v[2]};
+                const double u = (s[0] * p[0] + s[1] * p[1] + s[2] * p[2]) / det;
+                if (u < 0.0 || u > 1.0)
+                    continue;
+                const double q[3]{s[1] * e1[2] - s[2] * e1[1], s[2] * e1[0] - s[0] * e1[2],
+                                  s[0] * e1[1] - s[1] * e1[0]};
+                const double w = (d[0] * q[0] + d[1] * q[1] + d[2] * q[2]) / det;
+                if (w < 0.0 || u + w > 1.0)
+                    continue;
+                const double distance = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) / det;
+                if (distance > 1.0 && distance < nearest)
+                    nearest = distance;
+            }
+            reference = nearest;
+        }
+        reference = std::max(reference, 16.0);
+        const double falloff = 1.0 - reference / light.radius;
+        light.intensity = static_cast<float>(falloff * reference * reference) * lighting.lightUnitScale;
+        info("local light %zu: IW3 color %.3f %.3f %.3f, reference %.1f of radius %.0f -> intensity %.1f",
+             index, light.color[0], light.color[1], light.color[2], reference, light.radius,
+             light.intensity);
+    }
+}
+
 iw8::havok::BakeResult loadCollision(const Args &args, const std::string &dumpDirectory,
                                      const std::string &assetName)
 {
@@ -1045,7 +1105,7 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
 
     LapTimer timing("package");
     const std::string assetName = "maps/mp/" + map + ".d3dbsp";
-    const iw8::MapSun lighting = loadLighting(args, dumpDirectory, assetName);
+    iw8::MapSun lighting = loadLighting(args, dumpDirectory, assetName);
     const std::string renderPath = path_join(dumpDirectory, assetName + ".render.json");
     if (!file_exists(renderPath))
     {
@@ -1053,6 +1113,7 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
     }
     const auto renderMesh = replayrender::Load(renderPath);
     timing.lap("render load");
+    calibrateLocalLights(lighting, renderMesh.solidTriangles);
     // Use the final ComWorld sun vector, including any requested profile.
     // Replay rejects compressed shadows whose stored direction differs from
     // the active sun. Moving entities and breakable panes are not baked.
@@ -1287,8 +1348,11 @@ int writeMapPackage(const Args &args, const std::string &map, const std::string 
             light.type = source.type;
             light.canUseShadowMap = source.canUseShadowMap;
             std::copy(std::begin(source.origin), std::end(source.origin), light.origin.begin());
-            std::copy(std::begin(source.direction), std::end(source.direction),
-                      light.direction.begin());
+            // ComPrimaryLight dir points back toward the light (IW3 negates the
+            // angle vector, cg_ents_mp; shipped Replay spot volumes cover -dir:
+            // mp_hideout 42/42 unshadowed spots). The volumes need the emission axis.
+            for (size_t component = 0; component < 3; ++component)
+                light.direction[component] = -source.direction[component];
             light.radius = source.radius;
             light.cosHalfFovOuter = source.cosHalfFovOuter;
             localLightSources.push_back(light);

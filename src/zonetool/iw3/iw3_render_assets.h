@@ -41,6 +41,12 @@ struct MaterialPlan
     // stock ramp), packed into bits 10-15 of the model vertex metadata.
     unsigned falloffIndex{};
     unsigned worldMaterialIndex{};
+    // Atlas world surfaces with an IW3 detail map: row of RenderPlan::worldDetails
+    // (a "_detail<row>" world material variant), -1 for none.
+    int worldDetail{-1};
+    // IW3 wc_water world surfaces: row of RenderPlan::worldWaters (a
+    // "_water<row>" world material variant), -1 for none.
+    int worldWater{-1};
     std::string modelMaterial;
     // DObj-path (script, dynamic and effect XModel) material.
     std::string entityMaterial;
@@ -117,6 +123,9 @@ struct RenderPlan
 {
     std::unordered_map<std::string, MaterialPlan> materials;
     std::unordered_map<std::string, std::string> fxMaterialAliases;
+    // Replay Particle_MaterialData (ParticleModuleInitMaterial +0x20, 192 bytes)
+    // for IW3 FX materials with feather, falloff or eye-offset terms.
+    std::unordered_map<std::string, std::array<std::uint8_t, 192>> fxParticleMaterialData;
     // IW3 distortion materials. Their elements draw with a stock Replay
     // distortion material (common_mp, always loaded in MP) and the stock
     // distortion particle state.
@@ -134,6 +143,24 @@ struct RenderPlan
     unsigned instanceLightingCount{};
     std::vector<LightmapRectangle> lightmaps;
     std::array<std::size_t, 6> skyTiles{};
+    // IW3 world detail maps (wc_*d0*): the detail image's own colour-atlas tile
+    // and detailScale.xy, one world technique variant each.
+    struct WorldDetail
+    {
+        std::size_t tile{};
+        std::array<float, 2> scale{1, 1};
+    };
+    std::vector<WorldDetail> worldDetails;
+    // IW3 wc_water: the baked wave-map flipbook (material slot 0x3D, t10) and
+    // the water_l_sun constants, one world technique variant each.
+    struct WorldWater
+    {
+        std::string image;
+        std::string file;
+        std::array<float, 4> environment{};
+        std::array<float, 3> color{};
+    };
+    std::vector<WorldWater> worldWaters;
     unsigned columns{};
     // Pixel size of the square source atlas (ATLAS_SIZE in the shaders).
     unsigned atlasSize{4096};
@@ -173,7 +200,8 @@ RenderPlan PrepareRenderAssets(const std::filesystem::path &exportRoot,
                                const std::filesystem::path &cacheRoot = {},
                                const std::string &surfaceShaderDefines = {},
                                unsigned staticModelInstances = 0,
-                               const EntityLightVolume *entityLightVolume = nullptr);
+                               const EntityLightVolume *entityLightVolume = nullptr,
+                               float lightUnitScale = 1.0f, bool iw3Effects = false);
 
 // The map's IW3 loading-screen image (images/loadscreen_<map>, from its _load
 // zone or IWD) as a custom-map package preview: "MWRI", version 1, width,

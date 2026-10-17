@@ -373,8 +373,93 @@ std::optional<SunSprite> ReadMapSun(const std::filesystem::path &exportRoot,
     return sun;
 }
 
+namespace
+{
+// Shipped Replay 1.20 MP maps (ACTS dumps of each zone's ComWorld sun and
+// <map>.vision tonemap fields 63-76), ordered by sun intensity. Donetsk matches
+// Quarry and is left out; King and Emporium are the dark (interior / dusk) maps.
+constexpr Iw8LightingReference kIw8LightingReferences[] = {
+    {"mp_m_king", 1.55685f, {1.2781f, 0.952621f, 0.650445f}, {"3","1","1","6","0","-10","0","0.075","4.56","6.605912","8.57","-1.6","-0.279","1.28"}},
+    {"mp_emporium", 3.39796f, {1.4395f, 0.9178f, 0.520111f}, {"3","1","1","8.5","0","-10","0","0.075","5.6","8.229471","11.9","-2","-0.6758758","1.5"}},
+    {"mp_shipment", 8.63193f, {1.04877f, 0.993345f, 0.922306f}, {"3","1","1","10.5","0","-10","0.6","0.75","6.1","12.14071","15","-2","-0.3869346","1.5"}},
+    {"mp_village2", 11.0536f, {0.983046f, 1.00121f, 1.0379f}, {"3","1","1","10","0","-10","0","0.075","8","11","14","-1.5","0","1.5"}},
+    {"mp_br_quarry", 11.512f, {1.14193f, 0.976265f, 0.817178f}, {"3","1","1","12","0","-10","0","0.15","9","11.75","16","-1","0.15","2"}},
+    {"mp_rust", 11.6969f, {1.11411f, 0.989194f, 0.771041f}, {"3","1","1","10","0","-10","0","0.06","7.53","10.3","14","-3","-1","1.3"}},
+    {"mp_backlot2", 20.3368f, {0.98634f, 1.00452f, 0.995408f}, {"3","1","1","12","0","-10","-0.1","0.075","6.2","11.23978","16","-5","-0.9157199","3.2"}},
+    {"mp_m_fork", 23.7478f, {1.02338f, 0.996126f, 0.969523f}, {"3","1","1","11.5","0","-10","0","0.075","5.6","10.31878","14.5","-2.38","-1.024797","1.5"}},
+    {"mp_m_speed", 23.9449f, {0.97691f, 1.00372f, 1.03118f}, {"3","1","1","14","0","-10","0","0.075","7","11.34573","15.6","-1","0.05577891","1.6"}},
+    {"mp_aniyah_tac", 24.6499f, {0.994142f, 1.00325f, 0.985086f}, {"3","1","1","12","0","-10","0","0.075","8.6","12.49304","16.2","-3.2","-0.7722935","2.2"}},
+    {"mp_t_gun_course", 25.8181f, {1.13566f, 0.979416f, 0.804427f}, {"3","1","1","14","0","-10","0","0.1","11.5","13.25","15","-0.25","0.4","0.75"}},
+    {"mp_hideout", 26.9233f, {0.984644f, 1.00247f, 1.02072f}, {"3","1","1","12","0","-10","0","0.075","9","10.7015","15","-3","-0.9118453","2"}},
+    {"mp_m_speedball", 30.6723f, {1.00331f, 1.00331f, 0.95747f}, {"3","1","1","13","0","-10","0.65","0.075","10.8","13.21207","14.6","-0.5","0.04669083","1.5"}},
+};
+// Compiled CoD4 MP day suns (ComWorld sun light luminance, Rec. 709), ascending:
+// carentan citystreets bog crossfire strike bloc farm backlot crash overgrown
+// pipeline countdown vacant broadcast killhouse shipment creek convoy showdown.
+constexpr float kIw3DaySuns[] = {0.3817f, 0.4033f, 0.5596f, 0.683f, 0.693f, 0.7568f, 0.8413f,
+                                 0.8853f, 0.8951f, 0.9116f, 0.9564f, 1.0444f, 1.0755f, 1.1007f,
+                                 1.1443f, 1.1548f, 1.3165f, 1.3316f, 1.3633f};
+// Night (moonlight) suns: crash_snow, cargoship.
+constexpr float kIw3NightSuns[] = {0.0427f, 0.7542f};
+} // namespace
+
+Iw8LightingMatch MatchIw8Lighting(const std::array<float, 3> &sun)
+{
+    Iw8LightingMatch match;
+    const float luminance = 0.2126f * sun[0] + 0.7152f * sun[1] + 0.0722f * sun[2];
+    if (!(luminance > 0.0f))
+        return match;
+    match.night = sun[2] > 1.4f * std::max(sun[0], sun[1]);
+    constexpr std::size_t dayFirst = 2, dayCount = std::size(kIw8LightingReferences) - 2;
+    if (match.night)
+    {
+        // Log-log interpolation between the two night references.
+        const float t = std::clamp(std::log(luminance / kIw3NightSuns[0]) /
+                                       std::log(kIw3NightSuns[1] / kIw3NightSuns[0]),
+                                   0.0f, 1.0f);
+        match.sunIntensity = std::exp(std::lerp(std::log(kIw8LightingReferences[0].sunIntensity),
+                                                std::log(kIw8LightingReferences[1].sunIntensity), t));
+    }
+    else
+    {
+        // Quantile of the IW3 sun among CoD4's day suns -> the same quantile of the
+        // shipped day suns (piecewise linear in log intensity).
+        constexpr std::size_t n = std::size(kIw3DaySuns);
+        float rank = 0;
+        if (luminance >= kIw3DaySuns[n - 1])
+            rank = static_cast<float>(n - 1);
+        else if (luminance > kIw3DaySuns[0])
+            for (std::size_t i = 1; i < n; ++i)
+                if (luminance <= kIw3DaySuns[i])
+                {
+                    rank = static_cast<float>(i - 1) +
+                           (luminance - kIw3DaySuns[i - 1]) / (kIw3DaySuns[i] - kIw3DaySuns[i - 1]);
+                    break;
+                }
+        const float position = rank / static_cast<float>(n - 1) * static_cast<float>(dayCount - 1);
+        const std::size_t low = std::min(static_cast<std::size_t>(position), dayCount - 2);
+        const float f = position - static_cast<float>(low);
+        match.sunIntensity =
+            std::exp(std::lerp(std::log(kIw8LightingReferences[dayFirst + low].sunIntensity),
+                               std::log(kIw8LightingReferences[dayFirst + low + 1].sunIntensity), f));
+    }
+    match.lightUnitScale = match.sunIntensity / luminance;
+    // Exposure from the shipped map of the same class whose sun is nearest.
+    float best = INFINITY;
+    for (std::size_t i = match.night ? 0 : dayFirst; i < (match.night ? dayFirst : std::size(kIw8LightingReferences)); ++i)
+    {
+        const float distance = std::abs(std::log(kIw8LightingReferences[i].sunIntensity / match.sunIntensity));
+        if (distance < best)
+        {
+            best = distance;
+            match.exposure = &kIw8LightingReferences[i];
+        }
+    }
+    return match;
+}
+
 std::string FogShaderDefines(const std::optional<ExpFog> &fog, const MapStyle style,
-                             const std::optional<SunSprite> &sun)
+                             const std::optional<SunSprite> &sun, const float lightUnitScale)
 {
     // iw8: the surface shader adds Replay's probe reflections and sun specular
     // (MAP_IW8_LIGHTING) and draws the map's IW3 sun sprite and flare in the sky
@@ -382,6 +467,8 @@ std::string FogShaderDefines(const std::optional<ExpFog> &fog, const MapStyle st
     // without a sun file, such as Discovery's night, shows no sun). Both styles
     // bake IW3's own exponential fog.
     std::string lighting = style == MapStyle::iw8 ? "#define MAP_IW8_LIGHTING 1\n" : "";
+    if (style == MapStyle::iw8)
+        lighting += "#define MAP_LIGHT_UNIT_SCALE " + Number(lightUnitScale) + "\n";
     if (style == MapStyle::iw8 && sun)
         lighting += "#define MAP_SUN_SPRITE float4(" + Number(sun->direction[0]) + "," +
                     Number(sun->direction[1]) + "," + Number(sun->direction[2]) + "," +
@@ -432,7 +519,8 @@ std::vector<std::uint8_t> BuildGradingClutPixels(const Film &film)
 }
 
 std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut,
-                              const MapStyle style, const std::array<float, 3> &sunDirection)
+                              const MapStyle style, const std::array<float, 3> &sunDirection,
+                              const Iw8LightingReference *exposure, const float lightUnitScale)
 {
     std::map<std::string_view, std::string> overrides;
     if (style == MapStyle::iw8)
@@ -470,17 +558,24 @@ std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::strin
              {"MMQLTMKTPK", "NSKNLMKQSR", "MQMPKLKK", "NKKRQROOQK", "LKNNNKTPTM", "MQSQOLLMRM",
               "MQRSTPRORQ", "NPKPLTKRNS", "MLPOMNQPPK", "MTNSRNMTKN"})
             overrides.erase(token);
-        // Shipment's auto exposure (exposure 10.5, adjust curve, mid EV 12.1)
-        // is calibrated for stock HDR light levels. IW3 suns and skies are near
-        // 1, so it drove the image up: the sky clipped toward white around the
-        // sun and the rest flattened (owner tests 2026-10-14: too bright, then
-        // "saturated by the sun yet bland"). Exposure and the tonemap curve
-        // (fields 63-76) stay at the defaults --style iw3 uses: fixed exposure 10.
+        // Exposure: fixed, as --style iw3, compensated for the light-unit scale
+        // (tonemapExposure is EV-like: brighter shipped maps use higher values,
+        // King 6 .. Sawmill 12), so the image keeps the brightness IW3 units
+        // gave at exposure 10 while the scene is in the matched stock units.
+        // Stock auto exposure (the matched map's fields 63-76) over-brightened
+        // the converted scenes (owner test round 85, Nuketown): the stock maps'
+        // HDR skies hold metered exposure down; converted IW3 skies do not.
+        // The other tonemap fields (63-76) return to the fixed-exposure defaults
+        // as before the calibration: round 88 left Shipment's (template) auto
+        // exposure curve in place, which metered the scene up (owner round 93:
+        // "overall still too bright"; the pre-calibration look was right).
+        (void)exposure;
         for (const std::string_view token :
              {"LTTOTTRLTS", "NLMSSPLMPK", "MRKQQMPTKN", "LPKQPKSRKQ", "NOOTTPORTQ", "LTNRTLQOKQ",
               "NNRKNLLSQN", "MMQMQKSTS", "LSLPLPRQNO", "NLPRMSTSMM", "MOPORNQOTQ", "MTPSRMRRLP",
               "LRPSSPPPPT", "NMKNKNMKNN"})
             overrides.erase(token);
+        overrides["LPKQPKSRKQ"] = Number(10.0f + std::log2(std::max(lightUnitScale, 1e-3f))); // tonemapExposure
         // Fog: IW3's own, baked by the surface shader exactly as --style iw3
         // does it (below); the native fog pass stays off.
     }

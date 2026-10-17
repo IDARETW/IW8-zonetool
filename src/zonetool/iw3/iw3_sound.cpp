@@ -661,6 +661,9 @@ struct Iw3Alias
     float lfe{};
     int startDelay{};
     bool looping{};
+    float center{};
+    float envelopMin{}, envelopMax{}, envelopPercentage{};
+    unsigned channel{1}; // IW3 entity channel (flags bits 8-13, soundaliases/channels.def order)
     std::string secondary;
     std::string curve; // IW3 volume falloff curve (soundaliases/<curve>.vfcurve)
 };
@@ -701,6 +704,14 @@ std::map<std::string, std::vector<Iw3Alias>> ReadZoneAliases(const std::filesyst
             alias.lfe = source.value("lfe_percentage", 0.0f);
             alias.startDelay = source.value("start_delay", 0);
             alias.looping = (source.value("flags", 0) & 1) != 0;
+            alias.channel = (source.value("flags", 0u) >> 8) & 63u;
+            alias.center = source.value("center_percentage", 0.0f);
+            if (source.contains("envelope") && source.at("envelope").is_object())
+            {
+                alias.envelopMin = source.at("envelope").value("min", 0.0f);
+                alias.envelopMax = source.at("envelope").value("max", 0.0f);
+                alias.envelopPercentage = source.at("envelope").value("percentage", 0.0f);
+            }
             if (source.contains("secondary_alias") && source.at("secondary_alias").is_string())
                 alias.secondary = Lower(source.at("secondary_alias").get<std::string>());
             if (source.contains("volume_falloff_curve") && source.at("volume_falloff_curve").is_string())
@@ -839,6 +850,18 @@ std::map<std::string, std::vector<Iw3Alias>> ReadCsvAliases(const std::vector<st
                 alias.lfe = number("lfe percentage", 0.0f);
                 alias.startDelay = static_cast<int>(number("startdelay", 0.0f));
                 alias.looping = Lower(get("loop")).find("looping") != std::string::npos;
+                // The channel column by name, in soundaliases/channels.def order.
+                static constexpr std::array<std::string_view, 33> kIw3Channels{
+                    "physics",  "auto",    "auto2",       "autodog", "bulletimpact", "bulletwhizby",
+                    "element",  "auto2d",  "vehicle",     "vehiclelimited", "menu",  "body",
+                    "body2d",   "reload",  "reload2d",    "item",    "effects1",     "effects2",
+                    "weapon",   "weapon2d", "nonshock",   "voice",   "local",        "local2",
+                    "ambient",  "hurt",    "player1",     "player2", "music",        "musicnopause",
+                    "mission",  "announcer", "shellshock"};
+                const std::string channelName = Lower(get("channel"));
+                for (std::size_t channel = 0; channel < kIw3Channels.size(); ++channel)
+                    if (channelName == kIw3Channels[channel])
+                        alias.channel = static_cast<unsigned>(channel);
                 alias.secondary = Lower(get("secondaryaliasname"));
                 result[Lower(fields[0])].push_back(std::move(alias));
             }
@@ -1123,6 +1146,17 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
             if (!source.secondary.empty() && converted.contains(source.secondary))
                 alias.secondaryName = source.secondary;
             alias.flags = role.flags;
+            // IW3 plays 2D channels (channels.def: auto2d, menu, body2d, reload2d,
+            // weapon2d, local, local2, ambient, hurt, player1/2, music, announcer,
+            // shellshock) without spatialisation; the role templates' Replay channels
+            // are 3D, so a 2D IW3 alias takes a 2D Replay entchannel (SndGlobals:
+            // 125 amb_bed_2d for loops, 2 scn_fx_unres_2d otherwise; flags bits 10-17).
+            static constexpr std::array<bool, 33> kIw3Channel2d{
+                false, false, false, false, false, false, false, true,  false, false, true,
+                false, true,  false, true,  false, false, false, false, true,  false, false,
+                true,  true,  true,  true,  true,  true,  true,  true,  false, true,  true};
+            if (source.channel < kIw3Channel2d.size() && kIw3Channel2d[source.channel])
+                alias.flags = (alias.flags & ~(0xFFu << 10)) | ((source.looping ? 125u : 2u) << 10);
             alias.volModIndex = role.volModIndex;
             alias.volMin = std::clamp(source.volMin * role.gain, 0.0f, 1.0f);
             alias.volMax = std::clamp(std::max(source.volMax, source.volMin) * role.gain, 0.0f, 1.0f);
@@ -1132,8 +1166,15 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
             alias.distMax = std::max(source.distMax, alias.distMin + 1.0f);
             alias.probability = source.probability > 0 ? source.probability : 1.0f;
             alias.lfePercentage = std::clamp(source.lfe, 0.0f, 1.0f);
+            alias.centerPercentage = std::clamp(source.center, 0.0f, 1.0f);
+            alias.envelopMin = std::max(0.0f, source.envelopMin);
+            alias.envelopMax = std::max(alias.envelopMin, source.envelopMax);
+            alias.envelopPercentage = std::clamp(source.envelopPercentage, 0.0f, 1.0f);
             alias.startDelay = std::max(0, source.startDelay);
-            // The alias's own IW3 falloff curve when it converts, else the role's.
+            // The alias's own IW3 falloff curve, else IW3's linear default. Replay
+            // evaluates vfCurves exactly as IW3 does: piecewise-linear knots
+            // (0x141B75310) over t = (dist - distMin) / (distMax - distMin)
+            // clamped to [0, 1] (0x141B71959); the donut fade (flags bits 4-6) is off.
             auto found = iw3Curves.find(source.curve);
             if (!source.curve.empty() && found == iw3Curves.end())
                 found = iw3Curves.emplace(source.curve, ReadIw3Curve(exportRoot, source.curve)).first;
@@ -1141,8 +1182,10 @@ std::optional<ConvertedSounds> Convert(const std::filesystem::path &exportRoot,
                 alias.volumeFalloffCurve = iw8::sound::HashName(found->second->name);
             else
             {
-                alias.volumeFalloffCurve = iw8::sound::HashName(role.curve);
-                curves.insert(role.curve);
+                if (!source.curve.empty() && source.curve != "default")
+                    zt::warn("iw3 sound: %s falloff curve %s is unreadable; linear default",
+                             name.c_str(), source.curve.c_str());
+                alias.volumeFalloffCurve = iw8::sound::HashName("default");
             }
             alias.reverbMultiplier = role.reverb;
             alias.farReverbMultiplier = role.farReverb;

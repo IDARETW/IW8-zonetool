@@ -61,9 +61,35 @@ enum class MapStyle
     iw8,
 };
 
+// --style iw8 renders in stock Replay light units, matched to the shipped maps
+// (owner 2026-10-16: realistic lighting that matches shipped IW8 maps, not one
+// map's sun for all). The IW3 sun is the compiled ComWorld sun light (what IW3
+// shades with). Day suns: its quantile among CoD4's 19 stock day suns maps to
+// the same quantile of the 11 shipped Replay day suns; night (moonlight: blue >
+// 1.4 x red/green, CoD4 Cargoship and Crash Snow) interpolates toward the two
+// darkest shipped references (King, Emporium). Exposure: the tonemap fields
+// (vision 63-76) of the shipped map whose sun is nearest. Every IW3-unit term
+// scales by lightUnitScale = sunIntensity / IW3 sun luminance.
+struct Iw8LightingReference
+{
+    const char *map;
+    float sunIntensity;
+    std::array<float, 3> sunColor; // linear sRGB
+    std::array<const char *, 14> tonemap; // vision fields 63-76
+};
+struct Iw8LightingMatch
+{
+    float sunIntensity{};     // ComWorld sun intensity
+    float lightUnitScale{1};  // stock light units per IW3 unit
+    bool night{};
+    const Iw8LightingReference *exposure{};
+};
+Iw8LightingMatch MatchIw8Lighting(const std::array<float, 3> &iw3CompiledSun);
+
 // HLSL preamble for the converted world/static-model pixel shader; empty without fog.
 std::string FogShaderDefines(const std::optional<ExpFog> &fog, MapStyle style,
-                             const std::optional<SunSprite> &sun = std::nullopt);
+                             const std::optional<SunSprite> &sun = std::nullopt,
+                             float lightUnitScale = 1.0f);
 
 // Replay GfxGradingClut payload: 32^3 R16G16B16A16_UNORM texels (red fastest), each
 // the ST2084-encoded BT.2020 output for the ST2084-encoded BT.2020 input at its grid
@@ -74,5 +100,7 @@ std::vector<std::uint8_t> BuildGradingClutPixels(const Film &film);
 // Replay-format vision file (all 218 fields, engine defaults unless converted).
 // sunDirection points toward the sun (iw8 atmospheric scattering).
 std::string BuildReplayVision(const std::optional<ExpFog> &fog, const std::string &gradingClut,
-                              MapStyle style, const std::array<float, 3> &sunDirection);
+                              MapStyle style, const std::array<float, 3> &sunDirection,
+                              const Iw8LightingReference *exposure = nullptr,
+                              float lightUnitScale = 1.0f);
 } // namespace iw3
