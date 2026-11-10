@@ -1,3 +1,4 @@
+# ⚠️ This project's original purpose has been well superseded and is planned to be made specifically for IW8 and it's various versions. This project currently stands as an archive for an older project. If you ended up here expecting any different, you've been misled.
 # IW8-zonetool
 
 A map compiler that converts Call of Duty 4: Modern Warfare (**IW3**) multiplayer maps into native
